@@ -7,6 +7,7 @@ reviewers:
   - yizhaodev
   - j-mok-dev
   - RishabhSaini
+  - llm-d-team
 
 # List of usernames who may use /approve
 approvers:
@@ -15,3 +16,4 @@ approvers:
   - yizhaodev
   - j-mok-dev
   - RishabhSaini
+  - llm-d-team
