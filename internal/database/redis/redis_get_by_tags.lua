@@ -16,7 +16,7 @@
 
 -- Parse inputs.
 local tags = KEYS
-local getStatic = ARGV[1]
+local includeStatic = ARGV[1]
 local pattern = ARGV[2]
 local tagsCond = ARGV[3]
 local cursor = ARGV[4]
@@ -30,16 +30,16 @@ local result = {}
 for _, key in ipairs(scan_out[2]) do
 	-- Get the key's contents.
 	local contents
-	if getStatic == 'true' then
-		contents = redis.call('HMGET', key, "id", "expiry", "tags", "status", "spec")
+	if includeStatic == 'true' then
+		contents = redis.call('HMGET', key, "id", "tenantID", "expiry", "tags", "status", "spec")
 	else
-		contents = redis.call('HMGET', key, "id", "expiry", "tags", "status")
+		contents = redis.call('HMGET', key, "id", "tenantID", "expiry", "tags", "status")
 	end
 	-- Search for the tags.
 	local ofound = 0
 	if (#tags > 0) and (tagsCond == 'and' or tagsCond == 'or') then
 		for _, tag in ipairs(tags) do
-			local found = string.find(contents[3], tag, 0, true)
+			local found = string.find(contents[4], tag, 0, true)
 			if found ~= nil then
 				ofound = ofound + 1
 			end

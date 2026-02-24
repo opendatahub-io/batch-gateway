@@ -33,6 +33,7 @@ import (
 	"github.com/llm-d-incubation/batch-gateway/internal/apiserver/metrics"
 	"github.com/llm-d-incubation/batch-gateway/internal/apiserver/middleware"
 	"github.com/llm-d-incubation/batch-gateway/internal/apiserver/readiness"
+	"github.com/llm-d-incubation/batch-gateway/internal/database/api"
 	mockdb "github.com/llm-d-incubation/batch-gateway/internal/database/mock"
 	mockfiles "github.com/llm-d-incubation/batch-gateway/internal/files_store/mock"
 	"k8s.io/klog/v2"
@@ -175,7 +176,14 @@ func (s *Server) buildHandler() http.Handler {
 	mux := http.NewServeMux()
 
 	// TODO: change to actual implementation
-	dbClient := mockdb.NewMockBatchDBClient()
+	batchDBClient := mockdb.NewMockDBClient[api.BatchItem, api.BatchQuery](
+		func(b *api.BatchItem) string { return b.ID },
+		func(q *api.BatchQuery) *api.BaseQuery { return &q.BaseQuery },
+	)
+	fileDBClient := mockdb.NewMockDBClient[api.FileItem, api.FileQuery](
+		func(f *api.FileItem) string { return f.ID },
+		func(q *api.FileQuery) *api.BaseQuery { return &q.BaseQuery },
+	)
 	eventClient := mockdb.NewMockBatchEventChannelClient()
 	queueClient := mockdb.NewMockBatchPriorityQueueClient()
 	statusClient := mockdb.NewMockBatchStatusClient()
@@ -185,8 +193,8 @@ func (s *Server) buildHandler() http.Handler {
 	healthHandler := health.NewHealthApiHandler()
 	readinessHandler := readiness.NewReadinessApiHandler(s.serverReady)
 	metricsHandler := metrics.NewMetricsApiHandler()
-	fileHandler := file.NewFileApiHandler(s.config, dbClient, filesClient)
-	batchHandler := batch.NewBatchApiHandler(s.config, dbClient, queueClient, eventClient, statusClient)
+	fileHandler := file.NewFileApiHandler(s.config, fileDBClient, filesClient)
+	batchHandler := batch.NewBatchApiHandler(s.config, batchDBClient, queueClient, eventClient, statusClient)
 
 	handlers := []common.ApiHandler{
 		healthHandler,

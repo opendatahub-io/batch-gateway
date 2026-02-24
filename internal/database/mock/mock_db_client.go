@@ -14,119 +14,162 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// The file provides in-memory mock implementations for BatchDBClient.
+// The file provides in-memory mock implementations for DBClient.
 package mock
 
 import (
 	"context"
 	"fmt"
+	"reflect"
 	"sync"
 	"time"
 
 	"github.com/llm-d-incubation/batch-gateway/internal/database/api"
 )
 
-type MockBatchDBClient struct {
-	jobs sync.Map
+// MockDBClient is a generic in-memory implementation of api.DBClient[T, Q] for testing.
+type MockDBClient[T any, Q any] struct {
+	items           sync.Map
+	idGetter        func(*T) string
+	baseQueryGetter func(*Q) *api.BaseQuery
 }
 
-func NewMockBatchDBClient() *MockBatchDBClient {
-	return &MockBatchDBClient{}
+// NewMockDBClient creates a new mock DB client.
+// idGetter extracts the ID from the item pointer.
+// baseQueryGetter extracts the BaseQuery from the query pointer.
+func NewMockDBClient[T any, Q any](idGetter func(*T) string, baseQueryGetter func(*Q) *api.BaseQuery) *MockDBClient[T, Q] {
+	return &MockDBClient[T, Q]{
+		idGetter:        idGetter,
+		baseQueryGetter: baseQueryGetter,
+	}
 }
 
-func (m *MockBatchDBClient) DBStore(ctx context.Context, job *api.BatchItem) (string, error) {
-	m.jobs.Store(job.ID, job)
-	return job.ID, nil
+func (m *MockDBClient[T, Q]) DBStore(ctx context.Context, item *T) (err error) {
+	if item == nil {
+		return fmt.Errorf("item is nil")
+	}
+	id := m.idGetter(item)
+	if id == "" {
+		return fmt.Errorf("item has empty ID")
+	}
+	m.items.Store(id, item)
+	return nil
 }
 
-func (m *MockBatchDBClient) DBGet(
-	ctx context.Context, query *api.BatchDBQuery,
+func (m *MockDBClient[T, Q]) DBGet(
+	ctx context.Context, query *Q,
 	includeStatic bool, start, limit int) (
-	[]*api.BatchItem, int, bool, error) {
-	var allMatches []*api.BatchItem
+	items []*T, cursor int, expectMore bool, err error) {
+
+	bq := m.baseQueryGetter(query)
+	var allMatches []*T
 
 	// If IDs are specified, get by IDs
-	if len(query.IDs) > 0 {
-		for _, id := range query.IDs {
-			if value, ok := m.jobs.Load(id); ok {
-				if job, ok := value.(*api.BatchItem); ok {
-					allMatches = append(allMatches, job)
+	if len(bq.IDs) > 0 {
+		for _, id := range bq.IDs {
+			if value, ok := m.items.Load(id); ok {
+				if item, ok := value.(*T); ok {
+					if m.matchesFilters(*item, bq) {
+						allMatches = append(allMatches, item)
+					}
 				}
 			}
 		}
 	} else {
-		// Collect all items
-		m.jobs.Range(func(key, value any) bool {
-			if job, ok := value.(*api.BatchItem); ok {
-				// Filter by TagSelectors if specified
-				if len(query.TagSelectors) > 0 {
-					matches := true
-					for tagKey, tagValue := range query.TagSelectors {
-						if jobTagValue, ok := job.Tags[tagKey]; !ok || jobTagValue != tagValue {
-							matches = false
-							break
-						}
-					}
-					if !matches {
-						return true // Continue to next item
-					}
+		// Collect all items, applying filters
+		m.items.Range(func(key, value any) bool {
+			if item, ok := value.(*T); ok {
+				if m.matchesFilters(*item, bq) {
+					allMatches = append(allMatches, item)
 				}
-				allMatches = append(allMatches, job)
 			}
 			return true
 		})
 	}
 
 	// Handle pagination
-	totalMatches := len(allMatches)
-
-	// Skip items before start
-	if start >= totalMatches {
-		return []*api.BatchItem{}, start, false, nil
+	if start >= len(allMatches) {
+		return
 	}
 
 	allMatches = allMatches[start:]
 
-	// Apply limit
-	var results []*api.BatchItem
-	expectedMore := false
 	if limit > 0 && len(allMatches) > limit {
-		results = allMatches[:limit]
-		expectedMore = true
+		items = allMatches[:limit]
+		expectMore = true
 	} else {
-		results = allMatches
+		items = allMatches
 	}
 
-	// Calculate next cursor
-	nextCursor := start + len(results)
+	cursor = start + len(items)
 
-	return results, nextCursor, expectedMore, nil
+	return
 }
 
-func (m *MockBatchDBClient) DBUpdate(
-	ctx context.Context, job *api.BatchItem) error {
-	if _, ok := m.jobs.Load(job.ID); !ok {
-		return fmt.Errorf("cannot update job with ID '%s': job doesn't exist", job.ID)
+func (m *MockDBClient[T, Q]) DBUpdate(ctx context.Context, item *T) (err error) {
+	if item == nil {
+		return fmt.Errorf("item is nil")
 	}
-	m.jobs.Store(job.ID, job)
+	id := m.idGetter(item)
+	if id == "" {
+		return fmt.Errorf("item has empty ID")
+	}
+	if _, ok := m.items.Load(id); !ok {
+		return fmt.Errorf("cannot update item with ID '%s': item doesn't exist", id)
+	}
+	m.items.Store(id, item)
 	return nil
 }
 
-func (m *MockBatchDBClient) DBDelete(ctx context.Context, IDs []string) ([]string, error) {
-	var deleted []string
-	for _, id := range IDs {
-		if _, ok := m.jobs.LoadAndDelete(id); ok {
-			deleted = append(deleted, id)
+func (m *MockDBClient[T, Q]) DBDelete(ctx context.Context, ids []string) (deletedIDs []string, err error) {
+	for _, id := range ids {
+		if _, ok := m.items.LoadAndDelete(id); ok {
+			deletedIDs = append(deletedIDs, id)
 		}
 	}
-	return deleted, nil
+	return
 }
 
-func (m *MockBatchDBClient) GetContext(parentCtx context.Context, timeLimit time.Duration) (context.Context, context.CancelFunc) {
+func (m *MockDBClient[T, Q]) GetContext(parentCtx context.Context, timeLimit time.Duration) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(parentCtx, timeLimit)
 }
 
-func (m *MockBatchDBClient) Close() error {
-	m.jobs.Clear()
+func (m *MockDBClient[T, Q]) Close() error {
+	m.items.Clear()
 	return nil
+}
+
+// matchesFilters checks if an item matches the query filters.
+func (m *MockDBClient[T, Q]) matchesFilters(item T, query *api.BaseQuery) bool {
+	val := reflect.ValueOf(item)
+
+	// Filter by tenant if specified
+	if query.TenantID != "" {
+		tenantIDField := val.FieldByName("TenantID")
+		if tenantIDField.IsValid() && tenantIDField.Kind() == reflect.String {
+			if tenantIDField.String() != query.TenantID {
+				return false
+			}
+		}
+	}
+
+	// Filter by tag selectors if specified
+	if len(query.TagSelectors) > 0 {
+		tagsField := val.FieldByName("Tags")
+		if tagsField.IsValid() && tagsField.Kind() == reflect.Map {
+			itemTags, ok := tagsField.Interface().(api.Tags)
+			if !ok {
+				return false
+			}
+			for tagKey, tagValue := range query.TagSelectors {
+				if itemTagValue, ok := itemTags[tagKey]; !ok || itemTagValue != tagValue {
+					return false
+				}
+			}
+		} else {
+			return false
+		}
+	}
+
+	return true
 }

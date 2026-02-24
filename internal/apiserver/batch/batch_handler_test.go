@@ -28,14 +28,18 @@ import (
 	"time"
 
 	"github.com/llm-d-incubation/batch-gateway/internal/apiserver/common"
-	"github.com/llm-d-incubation/batch-gateway/internal/database/api"
+	dbapi "github.com/llm-d-incubation/batch-gateway/internal/database/api"
 	mockapi "github.com/llm-d-incubation/batch-gateway/internal/database/mock"
+	"github.com/llm-d-incubation/batch-gateway/internal/shared/converter"
 	"github.com/llm-d-incubation/batch-gateway/internal/shared/openai"
 )
 
 func setupBatchApiHandlerForTest() *BatchApiHandler {
 	config := &common.ServerConfig{}
-	dbClient := mockapi.NewMockBatchDBClient()
+	dbClient := mockapi.NewMockDBClient[dbapi.BatchItem, dbapi.BatchQuery](
+		func(b *dbapi.BatchItem) string { return b.ID },
+		func(q *dbapi.BatchQuery) *dbapi.BaseQuery { return &q.BaseQuery },
+	)
 	eventClient := mockapi.NewMockBatchEventChannelClient()
 	queueClient := mockapi.NewMockBatchPriorityQueueClient()
 	statusClient := mockapi.NewMockBatchStatusClient()
@@ -44,7 +48,6 @@ func setupBatchApiHandlerForTest() *BatchApiHandler {
 }
 
 func TestBatchHandler(t *testing.T) {
-
 	t.Run("CreateBatch", func(t *testing.T) {
 		t.Run("Basic", func(t *testing.T) {
 			handler := setupBatchApiHandlerForTest()
@@ -146,29 +149,31 @@ func TestBatchHandler(t *testing.T) {
 
 		// create a batch first
 		batchID := "batch-test-123"
-		specData, _ := json.Marshal(openai.BatchSpec{
-			InputFileID:      "file-abc123",
-			Endpoint:         openai.EndpointChatCompletions,
-			CompletionWindow: "24h",
-			CreatedAt:        time.Now().UTC().Unix(),
-		})
-		statusData, _ := json.Marshal(openai.BatchStatusInfo{
-			Status: openai.BatchStatusValidating,
-			RequestCounts: openai.BatchRequestCounts{
-				Total:     0,
-				Completed: 0,
-				Failed:    0,
+		batch := openai.Batch{
+			ID: batchID,
+			BatchSpec: openai.BatchSpec{
+				Object:           "batch",
+				InputFileID:      "file-abc123",
+				Endpoint:         openai.EndpointChatCompletions,
+				CompletionWindow: "24h",
+				CreatedAt:        time.Now().UTC().Unix(),
 			},
-		})
-		dbClient.DBStore(context.Background(), &api.BatchItem{
-			ID:       batchID,
-			TenantID: common.DefaultTenantID,
-			// SLO:    time.Now().UTC().Add(24 * time.Hour),
-			// TTL:    86400,
-			Tags:   map[string]string{},
-			Spec:   specData,
-			Status: statusData,
-		})
+			BatchStatusInfo: openai.BatchStatusInfo{
+				Status: openai.BatchStatusValidating,
+				RequestCounts: openai.BatchRequestCounts{
+					Total:     0,
+					Completed: 0,
+					Failed:    0,
+				},
+			},
+		}
+		item, err := converter.BatchToDBItem(&batch, common.DefaultTenantID, map[string]string{})
+		if err != nil {
+			t.Fatalf("Failed to convert batch to DB item: %v", err)
+		}
+		if err := dbClient.DBStore(context.Background(), item); err != nil {
+			t.Fatalf("Failed to store item: %v", err)
+		}
 
 		// get batch
 		req := httptest.NewRequest(http.MethodGet, "/v1/batches/"+batchID, nil)
@@ -182,16 +187,16 @@ func TestBatchHandler(t *testing.T) {
 		}
 		t.Logf("Response Body: %s", rr.Body.String())
 
-		var batch openai.Batch
-		if err := json.NewDecoder(rr.Body).Decode(&batch); err != nil {
+		var respBatch openai.Batch
+		if err := json.NewDecoder(rr.Body).Decode(&respBatch); err != nil {
 			t.Fatalf("Failed to decode response body: %v", err)
 		}
 
-		if batch.ID != batchID {
-			t.Errorf("Expected batch ID to be %s, got %s", batchID, batch.ID)
+		if respBatch.ID != batchID {
+			t.Errorf("Expected batch ID to be %s, got %s", batchID, respBatch.ID)
 		}
-		if batch.Status != openai.BatchStatusValidating {
-			t.Errorf("Expected status to be '%s', got %s", openai.BatchStatusValidating, batch.Status)
+		if respBatch.Status != openai.BatchStatusValidating {
+			t.Errorf("Expected status to be '%s', got %s", openai.BatchStatusValidating, respBatch.Status)
 		}
 	})
 
@@ -202,29 +207,31 @@ func TestBatchHandler(t *testing.T) {
 		// create two batches
 		for i := range 2 {
 			batchID := fmt.Sprintf("batch-test-%d", i)
-			specData, _ := json.Marshal(openai.BatchSpec{
-				InputFileID:      fmt.Sprintf("file-%d", i),
-				Endpoint:         openai.EndpointChatCompletions,
-				CompletionWindow: "24h",
-				CreatedAt:        time.Now().UTC().Unix(),
-			})
-			statusData, _ := json.Marshal(openai.BatchStatusInfo{
-				Status: openai.BatchStatusValidating,
-				RequestCounts: openai.BatchRequestCounts{
-					Total:     0,
-					Completed: 0,
-					Failed:    0,
+			batch := openai.Batch{
+				ID: batchID,
+				BatchSpec: openai.BatchSpec{
+					Object:           "batch",
+					InputFileID:      fmt.Sprintf("file-%d", i),
+					Endpoint:         openai.EndpointChatCompletions,
+					CompletionWindow: "24h",
+					CreatedAt:        time.Now().UTC().Unix(),
 				},
-			})
-			dbClient.DBStore(context.Background(), &api.BatchItem{
-				ID:       batchID,
-				TenantID: common.DefaultTenantID,
-				// SLO:    time.Now().UTC().Add(24 * time.Hour),
-				// TTL:    86400,
-				Tags:   map[string]string{},
-				Spec:   specData,
-				Status: statusData,
-			})
+				BatchStatusInfo: openai.BatchStatusInfo{
+					Status: openai.BatchStatusValidating,
+					RequestCounts: openai.BatchRequestCounts{
+						Total:     0,
+						Completed: 0,
+						Failed:    0,
+					},
+				},
+			}
+			item, err := converter.BatchToDBItem(&batch, common.DefaultTenantID, map[string]string{})
+			if err != nil {
+				t.Fatalf("Failed to convert batch to DB item: %v", err)
+			}
+			if err := dbClient.DBStore(context.Background(), item); err != nil {
+				t.Fatalf("Failed to store item: %v", err)
+			}
 		}
 
 		// list batches
@@ -271,29 +278,31 @@ func TestBatchHandler(t *testing.T) {
 
 		// create a batch first
 		batchID := "batch-test-cancel"
-		specData, _ := json.Marshal(openai.BatchSpec{
-			InputFileID:      "file-abc123",
-			Endpoint:         openai.EndpointChatCompletions,
-			CompletionWindow: "24h",
-			CreatedAt:        time.Now().UTC().Unix(),
-		})
-		statusData, _ := json.Marshal(openai.BatchStatusInfo{
-			Status: openai.BatchStatusInProgress,
-			RequestCounts: openai.BatchRequestCounts{
-				Total:     10,
-				Completed: 5,
-				Failed:    0,
+		batch := openai.Batch{
+			ID: batchID,
+			BatchSpec: openai.BatchSpec{
+				Object:           "batch",
+				InputFileID:      "file-abc123",
+				Endpoint:         openai.EndpointChatCompletions,
+				CompletionWindow: "24h",
+				CreatedAt:        time.Now().UTC().Unix(),
 			},
-		})
-		dbClient.DBStore(context.Background(), &api.BatchItem{
-			ID:       batchID,
-			TenantID: common.DefaultTenantID,
-			// SLO:    time.Now().UTC().Add(24 * time.Hour),
-			// TTL:    86400,
-			Tags:   map[string]string{},
-			Spec:   specData,
-			Status: statusData,
-		})
+			BatchStatusInfo: openai.BatchStatusInfo{
+				Status: openai.BatchStatusInProgress,
+				RequestCounts: openai.BatchRequestCounts{
+					Total:     10,
+					Completed: 5,
+					Failed:    0,
+				},
+			},
+		}
+		item, err := converter.BatchToDBItem(&batch, common.DefaultTenantID, map[string]string{})
+		if err != nil {
+			t.Fatalf("Failed to convert batch to DB item: %v", err)
+		}
+		if err := dbClient.DBStore(context.Background(), item); err != nil {
+			t.Fatalf("Failed to store item: %v", err)
+		}
 
 		req := httptest.NewRequest(http.MethodPost, "/v1/batches/"+batchID+"/cancel", nil)
 		req.SetPathValue("batch_id", batchID)
@@ -306,18 +315,18 @@ func TestBatchHandler(t *testing.T) {
 		}
 		t.Logf("Response Body: %s", rr.Body.String())
 
-		var batch openai.Batch
-		if err := json.NewDecoder(rr.Body).Decode(&batch); err != nil {
+		var respBatch openai.Batch
+		if err := json.NewDecoder(rr.Body).Decode(&respBatch); err != nil {
 			t.Fatalf("Failed to decode response body: %v", err)
 		}
 
-		if batch.ID != batchID {
-			t.Errorf("Expected batch ID to be %s, got %s", batchID, batch.ID)
+		if respBatch.ID != batchID {
+			t.Errorf("Expected batch ID to be %s, got %s", batchID, respBatch.ID)
 		}
-		if batch.Status != openai.BatchStatusCancelling {
-			t.Errorf("Expected status to be '%s', got %s", openai.BatchStatusCancelling, batch.Status)
+		if respBatch.Status != openai.BatchStatusCancelling {
+			t.Errorf("Expected status to be '%s', got %s", openai.BatchStatusCancelling, respBatch.Status)
 		}
-		if batch.CancellingAt == nil {
+		if respBatch.CancellingAt == nil {
 			t.Error("Expected cancelling_at to be set")
 		}
 	})
@@ -347,31 +356,32 @@ func BenchmarkBatchHandler(b *testing.B) {
 	})
 
 	b.Run("RetrieveBatch", func(b *testing.B) {
-
 		// Setup: create a batch first
 		batchID := "batch-benchmark-123"
-		specData, _ := json.Marshal(openai.BatchSpec{
-			InputFileID:      "file-abc123",
-			Endpoint:         openai.EndpointChatCompletions,
-			CompletionWindow: "24h",
-		})
-		statusData, _ := json.Marshal(openai.BatchStatusInfo{
-			Status: openai.BatchStatusValidating,
-			RequestCounts: openai.BatchRequestCounts{
-				Total:     0,
-				Completed: 0,
-				Failed:    0,
+		batch := openai.Batch{
+			ID: batchID,
+			BatchSpec: openai.BatchSpec{
+				Object:           "batch",
+				InputFileID:      "file-abc123",
+				Endpoint:         openai.EndpointChatCompletions,
+				CompletionWindow: "24h",
 			},
-		})
-		dbClient.DBStore(context.Background(), &api.BatchItem{
-			ID:       batchID,
-			TenantID: common.DefaultTenantID,
-			// SLO:    time.Now().UTC().Add(24 * time.Hour),
-			// TTL:    86400,
-			Tags:   map[string]string{},
-			Spec:   specData,
-			Status: statusData,
-		})
+			BatchStatusInfo: openai.BatchStatusInfo{
+				Status: openai.BatchStatusValidating,
+				RequestCounts: openai.BatchRequestCounts{
+					Total:     0,
+					Completed: 0,
+					Failed:    0,
+				},
+			},
+		}
+		item, err := converter.BatchToDBItem(&batch, common.DefaultTenantID, map[string]string{})
+		if err != nil {
+			b.Fatalf("Failed to convert batch to DB item: %v", err)
+		}
+		if err := dbClient.DBStore(context.Background(), item); err != nil {
+			b.Fatalf("Failed to store item: %v", err)
+		}
 
 		b.ResetTimer()
 		for b.Loop() {
@@ -383,33 +393,34 @@ func BenchmarkBatchHandler(b *testing.B) {
 	})
 
 	b.Run("ListBatches", func(b *testing.B) {
-
 		// Setup: create multiple batches
 		for i := range 10 {
 			batchID := fmt.Sprintf("batch-benchmark-%d", i)
-			specData, _ := json.Marshal(openai.BatchSpec{
-				InputFileID:      fmt.Sprintf("file-%d", i),
-				Endpoint:         openai.EndpointChatCompletions,
-				CompletionWindow: "24h",
-				CreatedAt:        time.Now().UTC().Unix(),
-			})
-			statusData, _ := json.Marshal(openai.BatchStatusInfo{
-				Status: openai.BatchStatusValidating,
-				RequestCounts: openai.BatchRequestCounts{
-					Total:     0,
-					Completed: 0,
-					Failed:    0,
+			batch := openai.Batch{
+				ID: batchID,
+				BatchSpec: openai.BatchSpec{
+					Object:           "batch",
+					InputFileID:      fmt.Sprintf("file-%d", i),
+					Endpoint:         openai.EndpointChatCompletions,
+					CompletionWindow: "24h",
+					CreatedAt:        time.Now().UTC().Unix(),
 				},
-			})
-			dbClient.DBStore(context.Background(), &api.BatchItem{
-				ID:       batchID,
-				TenantID: common.DefaultTenantID,
-				// SLO:    time.Now().UTC().Add(24 * time.Hour),
-				// TTL:    86400,
-				Tags:   map[string]string{},
-				Spec:   specData,
-				Status: statusData,
-			})
+				BatchStatusInfo: openai.BatchStatusInfo{
+					Status: openai.BatchStatusValidating,
+					RequestCounts: openai.BatchRequestCounts{
+						Total:     0,
+						Completed: 0,
+						Failed:    0,
+					},
+				},
+			}
+			item, err := converter.BatchToDBItem(&batch, common.DefaultTenantID, map[string]string{})
+			if err != nil {
+				b.Fatalf("Failed to convert batch to DB item: %v", err)
+			}
+			if err := dbClient.DBStore(context.Background(), item); err != nil {
+				b.Fatalf("Failed to store item: %v", err)
+			}
 		}
 
 		b.ResetTimer()
@@ -421,36 +432,36 @@ func BenchmarkBatchHandler(b *testing.B) {
 	})
 
 	b.Run("CancelBatch", func(b *testing.B) {
-
-		specData, _ := json.Marshal(openai.BatchSpec{
-			InputFileID:      "file-abc123",
-			Endpoint:         openai.EndpointChatCompletions,
-			CompletionWindow: "24h",
-			CreatedAt:        time.Now().UTC().Unix(),
-		})
-
 		b.ResetTimer()
 		for i := range b.N {
 			// Create a new batch for each iteration
 			b.StopTimer()
 			batchID := fmt.Sprintf("batch-benchmark-cancel-%d", i)
-			statusData, _ := json.Marshal(openai.BatchStatusInfo{
-				Status: openai.BatchStatusInProgress,
-				RequestCounts: openai.BatchRequestCounts{
-					Total:     10,
-					Completed: 5,
-					Failed:    0,
+			batch := openai.Batch{
+				ID: batchID,
+				BatchSpec: openai.BatchSpec{
+					Object:           "batch",
+					InputFileID:      "file-abc123",
+					Endpoint:         openai.EndpointChatCompletions,
+					CompletionWindow: "24h",
+					CreatedAt:        time.Now().UTC().Unix(),
 				},
-			})
-			dbClient.DBStore(context.Background(), &api.BatchItem{
-				ID:       batchID,
-				TenantID: common.DefaultTenantID,
-				// SLO:    time.Now().UTC().Add(24 * time.Hour),
-				// TTL:    86400,
-				Tags:   map[string]string{},
-				Spec:   specData,
-				Status: statusData,
-			})
+				BatchStatusInfo: openai.BatchStatusInfo{
+					Status: openai.BatchStatusInProgress,
+					RequestCounts: openai.BatchRequestCounts{
+						Total:     10,
+						Completed: 5,
+						Failed:    0,
+					},
+				},
+			}
+			item, err := converter.BatchToDBItem(&batch, common.DefaultTenantID, map[string]string{})
+			if err != nil {
+				b.Fatalf("Failed to convert batch to DB item: %v", err)
+			}
+			if err := dbClient.DBStore(context.Background(), item); err != nil {
+				b.Fatalf("Failed to store item: %v", err)
+			}
 			b.StartTimer()
 
 			req := httptest.NewRequest(http.MethodPost, "/v1/batches/"+batchID+"/cancel", nil)
