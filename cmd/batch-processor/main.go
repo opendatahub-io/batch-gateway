@@ -60,7 +60,7 @@ func run() error {
 
 	cfgFilePath := fs.String("config", "cmd/batch-processor/config.yaml", "Path to configuration file")
 	klog.InitFlags(fs)
-	fs.Parse(os.Args[1:])
+	_ = fs.Parse(os.Args[1:]) // ExitOnError mode will exit on error
 
 	if err := cfg.LoadFromYAML(*cfgFilePath); err != nil {
 		logger.Error(err, "Failed to load config file. Processor cannot start", "path", *cfgFilePath, "err", err)
@@ -81,7 +81,9 @@ func run() error {
 	defer func() {
 		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer shutdownCancel()
-		shutdownTracer(shutdownCtx)
+		if err := shutdownTracer(shutdownCtx); err != nil {
+			logger.Error(err, "Failed to shutdown tracer")
+		}
 	}()
 
 	// metrics setup
@@ -188,7 +190,7 @@ func startObservabilityServer(
 		m.Handle("/metrics", metrics.NewMetricsHandler())
 		m.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusOK)
-			w.Write([]byte("OK"))
+			_, _ = w.Write([]byte("OK"))
 		})
 		if os.Getenv("ENABLE_PPROF") == "true" {
 			m.HandleFunc("/debug/pprof/", pprof.Index)
@@ -202,11 +204,11 @@ func startObservabilityServer(
 		m.HandleFunc("/ready", func(w http.ResponseWriter, r *http.Request) {
 			if !ready.Load() {
 				w.WriteHeader(http.StatusServiceUnavailable)
-				w.Write([]byte("not ready"))
+				_, _ = w.Write([]byte("not ready"))
 				return
 			}
 			w.WriteHeader(http.StatusOK)
-			w.Write([]byte("OK"))
+			_, _ = w.Write([]byte("OK"))
 		})
 
 		server := &http.Server{
