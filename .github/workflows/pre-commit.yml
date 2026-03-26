@@ -4,22 +4,16 @@ on:
   push:
     branches:
       - main
-  pull_request_target:
+  pull_request:
 
 jobs:
   pre-commit:
     runs-on: ubuntu-latest
-    # Require approval for external contributors
-    environment:
-      name: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.head.repo.full_name != github.repository && 'external' || '' }}
     permissions:
       contents: read
 
     steps:
       - uses: actions/checkout@v6.0.2
-        with:
-          # For pull_request_target, check out the PR head commit
-          ref: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.head.sha || github.ref }}
 
       - name: Set up Go
         uses: actions/setup-go@v6
@@ -27,5 +21,13 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      - name: Run pre-commit
-        uses: j178/prek-action@v1
+      - name: Install Go tools (goimports, gosec)
+        run: make install-pre-commit-tools
+
+      - name: Run golangci-lint
+        uses: golangci/golangci-lint-action@v7
+        with:
+          version: v2.11.4
+
+      - name: Run pre-commit hooks
+        uses: pre-commit/action@v3.0.1

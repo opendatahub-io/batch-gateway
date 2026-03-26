@@ -24,10 +24,57 @@ import (
 	"testing"
 
 	"github.com/openai/openai-go/v3"
+	"github.com/openai/openai-go/v3/packages/param"
 )
 
 func testFiles(t *testing.T) {
 	t.Run("Lifecycle", doTestFileLifecycle)
+	t.Run("Create", func(t *testing.T) {
+		t.Run("DuplicateFilename", doTestDuplicateFileUpload)
+	})
+	t.Run("List", func(t *testing.T) {
+		t.Run("Pagination", doTestFilePagination)
+		t.Run("PurposeFilter", doTestFilePurposeFilter)
+	})
+}
+
+// doTestDuplicateFileUpload verifies that uploading two files with the same
+// filename under the same tenant succeeds. Each upload should get a unique
+// fileID and storage path. Reproduces https://github.com/llm-d-incubation/batch-gateway/issues/214
+func doTestDuplicateFileUpload(t *testing.T) {
+	t.Helper()
+
+	client := newClient()
+	filename := fmt.Sprintf("duplicate-%s.jsonl", testRunID)
+
+	// First upload — should succeed
+	fileID1 := mustCreateFileWithClient(t, client, filename, testJSONL)
+	t.Logf("first upload: fileID=%s, filename=%s", fileID1, filename)
+
+	// Second upload with the same filename — should also succeed with a different fileID
+	fileID2 := mustCreateFileWithClient(t, client, filename, testJSONL)
+	t.Logf("second upload: fileID=%s, filename=%s", fileID2, filename)
+
+	if fileID1 == fileID2 {
+		t.Errorf("expected different file IDs, both got %s", fileID1)
+	}
+
+	// Both files should be retrievable and preserve the original filename
+	got1, err := client.Files.Get(context.Background(), fileID1)
+	if err != nil {
+		t.Fatalf("retrieve first file failed: %v", err)
+	}
+	if got1.Filename != filename {
+		t.Errorf("first file: expected filename %q, got %q", filename, got1.Filename)
+	}
+
+	got2, err := client.Files.Get(context.Background(), fileID2)
+	if err != nil {
+		t.Fatalf("retrieve second file failed: %v", err)
+	}
+	if got2.Filename != filename {
+		t.Errorf("second file: expected filename %q, got %q", filename, got2.Filename)
+	}
 }
 
 // doTestFileLifecycle uploads a file, verifies list, retrieve, download, then deletes it.
@@ -61,12 +108,25 @@ func doTestFileLifecycle(t *testing.T) {
 	if got.Purpose != openai.FileObjectPurposeBatch {
 		t.Errorf("expected purpose %q, got %q", openai.FileObjectPurposeBatch, got.Purpose)
 	}
+	if got.Bytes != int64(len(testJSONL)) {
+		t.Errorf("expected bytes %d, got %d", len(testJSONL), got.Bytes)
+	}
+	if got.Status != openai.FileObjectStatusUploaded {
+		t.Errorf("expected status %q, got %q", openai.FileObjectStatusUploaded, got.Status)
+	}
 
 	// Download
 	resp, err := client.Files.Content(context.Background(), fileID)
 	if err != nil {
 		t.Fatalf("download file failed: %v", err)
 	}
+	// Verify download filename matches the original upload filename
+	cd := resp.Header.Get("Content-Disposition")
+	wantCD := fmt.Sprintf(`attachment; filename=%q`, filename)
+	if cd != wantCD {
+		t.Errorf("Content-Disposition mismatch\ngot:  %s\nwant: %s", cd, wantCD)
+	}
+
 	content, err := io.ReadAll(resp.Body)
 	resp.Body.Close()
 	if err != nil {
@@ -92,6 +152,116 @@ func doTestFileLifecycle(t *testing.T) {
 		var apiErr *openai.Error
 		if errors.As(err, &apiErr) && apiErr.StatusCode != http.StatusNotFound {
 			t.Errorf("expected 404 after deletion, got %d", apiErr.StatusCode)
+		}
+	}
+}
+
+// doTestFilePagination creates 3 files under an isolated tenant and verifies
+// that limit/after pagination returns correct pages with no duplicates.
+func doTestFilePagination(t *testing.T) {
+	t.Helper()
+
+	tenant := fmt.Sprintf("pagination-files-%s", testRunID)
+	client := newClientForTenant(tenant)
+	ctx := context.Background()
+
+	// Create 3 files under a dedicated tenant to avoid interference.
+	const count = 3
+	createdIDs := make([]string, count)
+	for i := range count {
+		filename := fmt.Sprintf("pagination-file-%d-%s.jsonl", i, testRunID)
+		fileID := mustCreateUniqueFileWithClient(t, client, filename, testJSONL)
+		createdIDs[i] = fileID
+		t.Logf("created file %d: %s", i, fileID)
+	}
+
+	// Page 1: limit=2, no after → expect 2 items, has_more=true
+	page1, err := client.Files.List(ctx, openai.FileListParams{
+		Limit: param.NewOpt(int64(2)),
+	})
+	if err != nil {
+		t.Fatalf("list files page 1 failed: %v", err)
+	}
+	if len(page1.Data) != 2 {
+		t.Fatalf("page 1: expected 2 items, got %d", len(page1.Data))
+	}
+	if !page1.HasMore {
+		t.Error("page 1: expected has_more=true")
+	}
+
+	page1IDs := make([]string, len(page1.Data))
+	for i, f := range page1.Data {
+		page1IDs[i] = f.ID
+	}
+	t.Logf("page 1 IDs: %v (has_more=%v)", page1IDs, page1.HasMore)
+
+	// Page 2: limit=2, after="2" (offset) → expect 1 item, has_more=false
+	page2, err := client.Files.List(ctx, openai.FileListParams{
+		Limit: param.NewOpt(int64(2)),
+		After: param.NewOpt("2"),
+	})
+	if err != nil {
+		t.Fatalf("list files page 2 failed: %v", err)
+	}
+	if len(page2.Data) != 1 {
+		t.Fatalf("page 2: expected 1 item, got %d", len(page2.Data))
+	}
+	if page2.HasMore {
+		t.Error("page 2: expected has_more=false")
+	}
+
+	page2IDs := make([]string, len(page2.Data))
+	for i, f := range page2.Data {
+		page2IDs[i] = f.ID
+	}
+	t.Logf("page 2 IDs: %v (has_more=%v)", page2IDs, page2.HasMore)
+
+	// Verify no overlap and full coverage.
+	allIDs := append(page1IDs, page2IDs...)
+	assertSliceEqual(t, createdIDs, allIDs)
+}
+
+// doTestFilePurposeFilter creates a file with purpose=batch, then lists with
+// purpose filter and verifies the file appears (or not) as expected.
+func doTestFilePurposeFilter(t *testing.T) {
+	t.Helper()
+
+	tenant := fmt.Sprintf("purpose-filter-%s", testRunID)
+	client := newClientForTenant(tenant)
+	ctx := context.Background()
+
+	// Create a file with purpose=batch
+	filename := fmt.Sprintf("purpose-filter-%s.jsonl", testRunID)
+	fileID := mustCreateUniqueFileWithClient(t, client, filename, testJSONL)
+
+	// List with purpose=batch → should contain our file
+	batchPage, err := client.Files.List(ctx, openai.FileListParams{
+		Purpose: param.NewOpt("batch"),
+	})
+	if err != nil {
+		t.Fatalf("list files with purpose=batch failed: %v", err)
+	}
+	found := false
+	for _, f := range batchPage.Data {
+		if f.ID == fileID {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("file %s not found when listing with purpose=batch", fileID)
+	}
+
+	// List with purpose=fine-tune → should NOT contain our file
+	ftPage, err := client.Files.List(ctx, openai.FileListParams{
+		Purpose: param.NewOpt("fine-tune"),
+	})
+	if err != nil {
+		t.Fatalf("list files with purpose=fine-tune failed: %v", err)
+	}
+	for _, f := range ftPage.Data {
+		if f.ID == fileID {
+			t.Errorf("file %s should not appear when listing with purpose=fine-tune", fileID)
 		}
 	}
 }

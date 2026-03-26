@@ -23,6 +23,7 @@ import (
 	"flag"
 	"fmt"
 	"net/http"
+	"net/http/pprof"
 	"os"
 	"sync/atomic"
 	"time"
@@ -36,7 +37,6 @@ import (
 	"github.com/llm-d-incubation/batch-gateway/internal/util/interrupt"
 	"github.com/llm-d-incubation/batch-gateway/internal/util/logging"
 	uotel "github.com/llm-d-incubation/batch-gateway/internal/util/otel"
-	uredis "github.com/llm-d-incubation/batch-gateway/internal/util/redis"
 )
 
 func main() {
@@ -60,7 +60,7 @@ func run() error {
 
 	cfgFilePath := fs.String("config", "cmd/batch-processor/config.yaml", "Path to configuration file")
 	klog.InitFlags(fs)
-	fs.Parse(os.Args[1:])
+	_ = fs.Parse(os.Args[1:]) // ExitOnError mode will exit on error
 
 	if err := cfg.LoadFromYAML(*cfgFilePath); err != nil {
 		logger.Error(err, "Failed to load config file. Processor cannot start", "path", *cfgFilePath, "err", err)
@@ -81,7 +81,9 @@ func run() error {
 	defer func() {
 		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer shutdownCancel()
-		shutdownTracer(shutdownCtx)
+		if err := shutdownTracer(shutdownCtx); err != nil {
+			logger.Error(err, "Failed to shutdown tracer")
+		}
 	}()
 
 	// metrics setup
@@ -112,7 +114,7 @@ func run() error {
 		logger.Error(err, "Failed to build processor clients")
 		return err
 	}
-	defer procClients.Close()
+	defer func() { _ = procClients.Close() }()
 
 	// init processor
 	logger.V(logging.INFO).Info("Initializing worker processor", "maxWorkers", cfg.NumWorkers)
@@ -131,15 +133,16 @@ func run() error {
 		logger.V(logging.INFO).Info("Processor exited gracefully")
 	}()
 
-	// start the main polling loop
-	// ready indicates the processor can actively run the polling loop.
-	ready.Store(true)
+	// ready flips to true only after processor pre-flight checks succeed and
+	// right before the polling loop begins accepting work.
 	go func() {
 		<-ctx.Done()
 		ready.Store(false)
 	}()
-	logger.V(logging.INFO).Info("Processor polling loop started", "pollInterval", cfg.PollInterval.String())
-	err = proc.Run(ctx)
+	err = proc.Run(ctx, func() {
+		ready.Store(true)
+		logger.V(logging.INFO).Info("Processor polling loop started", "pollInterval", cfg.PollInterval.String())
+	})
 	if cfg.TerminateOnObservabilityFailure {
 		// Give the observability goroutine a brief chance to publish the fatal cause,
 		// so we can prefer it over a derived context-cancel error from the polling loop.
@@ -188,17 +191,25 @@ func startObservabilityServer(
 		m.Handle("/metrics", metrics.NewMetricsHandler())
 		m.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusOK)
-			w.Write([]byte("ok"))
+			_, _ = w.Write([]byte("OK"))
 		})
+		if cfg.EnablePprof {
+			m.HandleFunc("/debug/pprof/", pprof.Index)
+			m.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+			m.HandleFunc("/debug/pprof/profile", pprof.Profile)
+			m.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+			m.HandleFunc("/debug/pprof/trace", pprof.Trace)
+			logger.V(logging.INFO).Info("pprof profiling enabled on observability server")
+		}
 		// ready endpoint - indicates the processor is ready to process requests
 		m.HandleFunc("/ready", func(w http.ResponseWriter, r *http.Request) {
 			if !ready.Load() {
 				w.WriteHeader(http.StatusServiceUnavailable)
-				w.Write([]byte("not ready"))
+				_, _ = w.Write([]byte("not ready"))
 				return
 			}
 			w.WriteHeader(http.StatusOK)
-			w.Write([]byte("ok"))
+			_, _ = w.Write([]byte("OK"))
 		})
 
 		server := &http.Server{
@@ -263,10 +274,8 @@ func waitObservabilityFatalError(ctx context.Context, obsFatalCh <-chan error, w
 func buildProcessorClients(ctx context.Context, cfg *config.ProcessorConfig) (*clientset.Clientset, error) {
 	logger := klog.FromContext(ctx)
 
-	redisCfg := &uredis.RedisClientConfig{
-		ServiceName:   "batch-processor",
-		EnableTracing: cfg.OTel.RedisTracing,
-	}
+	cfg.RedisCfg.ServiceName = "batch-processor"
+	cfg.RedisCfg.EnableTracing = cfg.OTel.RedisTracing
 
 	modelGatewaysConfigs, err := config.ResolveModelGateways(cfg.ModelGateways)
 	if err != nil {
@@ -278,7 +287,7 @@ func buildProcessorClients(ctx context.Context, cfg *config.ProcessorConfig) (*c
 		ctx,
 		cfg.DatabaseType,
 		&cfg.PostgreSQLCfg,
-		redisCfg,
+		&cfg.RedisCfg,
 		cfg.FileClientCfg.Type,
 		&cfg.FileClientCfg.FSConfig,
 		&cfg.FileClientCfg.S3Config,

@@ -31,8 +31,10 @@ import (
 const modelMapFileName = "model_map.json"
 
 type planRequestLine struct {
-	Body struct {
+	CustomID string `json:"custom_id"`
+	Body     struct {
 		Model    string `json:"model"`
+		Stream   *bool  `json:"stream,omitempty"`
 		Messages []struct {
 			Role    string `json:"role"`
 			Content string `json:"content"`

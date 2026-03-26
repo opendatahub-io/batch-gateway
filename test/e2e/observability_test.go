@@ -29,6 +29,7 @@ import (
 func testObservability(t *testing.T) {
 	t.Run("APIServer", func(t *testing.T) { doTestObservabilityEndpoints(t, testApiserverObsURL) })
 	t.Run("Processor", func(t *testing.T) { doTestObservabilityEndpoints(t, testProcessorObsURL) })
+	t.Run("Pprof", testPprof)
 	t.Run("OtelTraces", doTestOtelTraces)
 }
 
@@ -49,10 +50,7 @@ func doTestOtelTraces(t *testing.T) {
 	// Run a quick batch to generate traces
 	fileID := mustCreateFile(t, fmt.Sprintf("test-otel-%s.jsonl", testRunID), testJSONL)
 	batchID := mustCreateBatch(t, fileID)
-	finalBatch := waitForBatchCompletion(t, batchID)
-	if finalBatch.Status != openai.BatchStatusCompleted {
-		t.Fatalf("expected batch status %q, got %q", openai.BatchStatusCompleted, finalBatch.Status)
-	}
+	_, _ = waitForBatchStatus(t, batchID, 5*time.Minute, openai.BatchStatusCompleted)
 
 	// Give Jaeger a moment to index the traces
 	time.Sleep(3 * time.Second)
@@ -82,6 +80,44 @@ func doTestOtelTraces(t *testing.T) {
 	}
 
 	t.Logf("Jaeger returned %d trace(s) for service batch-gateway", len(result.Data))
+}
+
+// testPprof verifies that pprof endpoints are reachable on both observability
+// servers when enable_pprof is set to true in the config.
+func testPprof(t *testing.T) {
+	t.Helper()
+
+	for _, tc := range []struct {
+		name   string
+		obsURL string
+	}{
+		{"APIServer", testApiserverObsURL},
+		{"Processor", testProcessorObsURL},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			resp, err := http.Get(tc.obsURL + "/debug/pprof/")
+			if err != nil {
+				t.Skipf("pprof not reachable at %s (enable_pprof may not be set): %v", tc.obsURL, err)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode == http.StatusNotFound {
+				t.Skipf("pprof not enabled at %s (enable_pprof not set)", tc.obsURL)
+			}
+			if resp.StatusCode != http.StatusOK {
+				t.Errorf("expected 200 from /debug/pprof/, got %d", resp.StatusCode)
+			}
+
+			// Verify a specific profile endpoint is also accessible
+			heapResp, err := http.Get(tc.obsURL + "/debug/pprof/heap")
+			if err != nil {
+				t.Fatalf("GET /debug/pprof/heap failed: %v", err)
+			}
+			heapResp.Body.Close()
+			if heapResp.StatusCode != http.StatusOK {
+				t.Errorf("expected 200 from /debug/pprof/heap, got %d", heapResp.StatusCode)
+			}
+		})
+	}
 }
 
 // doTestObservabilityEndpoints verifies that the observability endpoints

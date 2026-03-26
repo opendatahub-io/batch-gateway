@@ -1,7 +1,12 @@
 # Batch Gateway
 
+[![Go Report Card](https://goreportcard.com/badge/github.com/llm-d-incubation/batch-gateway)](https://goreportcard.com/report/github.com/llm-d-incubation/batch-gateway)
 [![Go Version](https://img.shields.io/badge/Go-1.25-blue.svg)](https://golang.org/)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
+[![Join Slack](https://img.shields.io/badge/Join_Slack-blue?logo=slack)](https://llm-d.slack.com/archives/C0AA8772H7T)
+[![apiserver](https://ghcr-badge.egpl.dev/llm-d-incubation/batch-gateway-apiserver/latest_tag?trim=major&label=apiserver)](https://github.com/llm-d-incubation/batch-gateway/pkgs/container/batch-gateway-apiserver)
+[![processor](https://ghcr-badge.egpl.dev/llm-d-incubation/batch-gateway-processor/latest_tag?trim=major&label=processor)](https://github.com/llm-d-incubation/batch-gateway/pkgs/container/batch-gateway-processor)
+[![gc](https://ghcr-badge.egpl.dev/llm-d-incubation/batch-gateway-gc/latest_tag?trim=major&label=gc)](https://github.com/llm-d-incubation/batch-gateway/pkgs/container/batch-gateway-gc)
 
 ## Overview
 
@@ -104,13 +109,7 @@ User → API Server → PostgreSQL (metadata) + Redis (queue) + S3 (input file)
 
 ### Design Documents
 
-For detailed architecture information see:
-
-- [Batch Inference Architecture](docs/design/batch_inference_architecture.md) - Overall system design and requirements.
-- [Batch Processor Architecture](docs/design/batch_processor_architecture.md) - Detailed batch processor design.
-- [Batch Dispatcher](docs/design/batch-dispatcher.md) - Dispatch flow control mechanism.
-- [MaaS integration](docs/design/maas-integration.md) - Integration with the MaaS component.
-- [Resource Lifecycle](docs/design/resource-lifecycle.md) - Job and file state management.
+For detailed architecture information see the [design directory](docs/design/).
 
 ## Repository Structure
 
@@ -161,7 +160,7 @@ batch-gateway/
 - **`cmd/`**: Contains `main.go` entry points for the components' binaries.
 - **`internal/`**: All private application code, organized by component.
 - **`charts/`**: Helm chart for deploying the components in Kubernetes.
-- **`docs/design/`**: Detailed architecture documents with diagrams explaining the batch processing system.
+- **`docs/`**: Contains architecture documents and development / usage guides.
 - **`test/`**: Integration and E2E test suites for validating the full system.
 
 ## Getting Started
@@ -186,21 +185,25 @@ make build
 # Or build individually
 make build-apiserver
 make build-processor
+make build-gc
 ```
 
 #### 2. Run Tests
 
 ```bash
-# Run all unit tests
+# Run unit tests
 make test
 
-# Run with coverage
+# Run unit tests with coverage
 make test-coverage
 
 # Run integration tests
 make test-integration
 
-# Run E2E tests (requires running server)
+# Run unit tests and integration tests
+make test-all
+
+# Run E2E tests (requires a kind cluster)
 make test-e2e
 ```
 
@@ -215,14 +218,23 @@ make run-apiserver
 # Run processor (in another terminal)
 make run-processor
 
+# Run gc (in another terminal)
+make run-gc
+
 # Or with verbose logging
 make run-apiserver-dev
 make run-processor-dev
+make run-gc-dev
 ```
 
 ### Kubernetes Deployment
 
 #### Quick Start with Kind
+
+**Prerequisites:**
+
+- Docker or Podman
+- [kind](https://kind.sigs.k8s.io/) v0.20+ (Kubernetes in Docker)
 
 Deploy to a local Kind cluster for development:
 
@@ -256,12 +268,14 @@ make image-build
 # Or build individually
 make image-build-apiserver
 make image-build-processor
+make image-build-gc
 ```
 
 Images are published to:
 
 - `ghcr.io/llm-d-incubation/batch-gateway-apiserver`
 - `ghcr.io/llm-d-incubation/batch-gateway-processor`
+- `ghcr.io/llm-d-incubation/batch-gateway-gc`
 
 ## API Usage
 
@@ -318,6 +332,10 @@ See configuration example in `cmd/apiserver/config.yaml`.
 
 See configuration example in `cmd/batch-processor/config.yaml`.
 
+### Garbage Collector Configuration
+
+See configuration example in `cmd/batch-gc/config.yaml`.
+
 ## Monitoring
 
 ### Metrics
@@ -337,22 +355,52 @@ For a complete list of available metrics, see [docs/guides/metrics.md](docs/guid
 - Health: `GET /health` (port 9090).
 - Readiness: `GET /ready` (port 9090).
 
+### Profiling (pprof)
+
+Both the API server and processor support [Go pprof](https://go.dev/blog/pprof) profiling endpoints on their observability ports. Pprof is controlled by the `enable_pprof` config option (or `config.enablePprof` in Helm values) and is **disabled by default**.
+
+**Enable via Helm:**
+
+```yaml
+apiserver:
+  config:
+    enablePprof: true
+processor:
+  config:
+    enablePprof: true
+```
+
+**Usage (with dev-deploy port-forwards):**
+
+```bash
+# API Server (port 8081)
+go tool pprof http://localhost:8081/debug/pprof/profile?seconds=30  # CPU
+go tool pprof http://localhost:8081/debug/pprof/heap                # Heap
+go tool pprof http://localhost:8081/debug/pprof/allocs              # Allocs
+go tool pprof http://localhost:8081/debug/pprof/goroutine           # Goroutine
+
+# Processor (port 9090)
+go tool pprof http://localhost:9090/debug/pprof/profile?seconds=30  # CPU
+go tool pprof http://localhost:9090/debug/pprof/heap                # Heap
+go tool pprof http://localhost:9090/debug/pprof/allocs              # Allocs
+go tool pprof http://localhost:9090/debug/pprof/goroutine           # Goroutine
+```
+
+All pprof endpoints are served on the observability port (not the API port), so they are not exposed to external traffic.
+
 ## Development
 
 ### Code Quality
 
 ```bash
-# Format code
-make fmt
+# Run all pre-commit checks (formatting, linting, tests, security)
+make pre-commit
 
-# Run linter
-make lint
-
-# Run static analysis
-make vet
-
-# Run all checks
-make ci
+# Or run individual checks:
+make fmt   # Format code only
+make lint  # Run linter only (requires golangci-lint)
+make vet   # Run static analysis only
+make ci    # Run fmt + vet + lint + test
 ```
 
 ### Install Development Tools
@@ -364,6 +412,8 @@ make install-tools
 This installs:
 
 - `golangci-lint` - Linting and static analysis
+- `goimports` - Import formatting and organization
+- `gosec` - Security vulnerability scanner
 
 ### Project Structure Conventions
 
@@ -377,11 +427,11 @@ This installs:
 
 Contributions are welcome! Please ensure:
 
-1. All tests pass: `make test-all`.
-2. Code is formatted: `make fmt`.
-3. Linter passes: `make lint`.
-4. New features include tests and documentation.
-5. Commits follow conventional commit format.
+1. New features include tests and documentation.
+2. Pre-commit checks pass: `make pre-commit`.
+3. E2E tests pass: `make test-e2e`.
+4. Commits are signed off (`git commit -s`) and follow conventional commit format.
+5. Code follows project [contributing guidelines](CONTRIBUTING.md).
 
 ## Security
 
@@ -426,4 +476,4 @@ For help and support:
 
 - Open an issue on GitHub.
 - Review the [design documentation](docs/design/).
-- Check the [development guide](docs/guides/development.md).
+- Review the [development and usage guides](docs/guides/).

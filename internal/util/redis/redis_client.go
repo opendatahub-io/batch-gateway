@@ -39,20 +39,20 @@ const (
 )
 
 type RedisClientConfig struct {
-	Url             string
-	DbIdx           int
-	EnableTLS       bool
-	Insecure        bool
-	Certificates    *utls.Certificates
-	EnableTracing   bool
-	ServiceName     string
-	Timeout         time.Duration // Timeout for socket operations: dial, read, write.
-	MaxRetries      int           // Maximum number of retries before giving up. Default is 3 retries; -1 (not 0) disables retries.
-	MinRetryBackoff time.Duration // Minimum backoff between each retry. Default is 8 milliseconds; -1 disables backoff.
-	MaxRetryBackoff time.Duration // Maximum backoff between each retry. Default is 512 milliseconds; -1 disables backoff.
-	PoolTimeout     time.Duration // Amount of time client waits for connection if all connections are busy before returning an error. Default is ReadTimeout + 1 second.
-	ConnMaxIdleTime time.Duration // The maximum amount of time a connection may be idle. If <= 0, connections are not closed due to a connection's idle time. Default is 30 minutes. -1 disables idle timeout check.
-	ConnMaxLifetime time.Duration // The maximum amount of time a connection may be reused. If <= 0, connections are not closed due to a connection's age. Default is to not close idle connections.
+	Url             string             `yaml:"-"` // Resolved from K8s Secret at runtime
+	Certificates    *utls.Certificates `yaml:"-"` // Set programmatically for mTLS
+	EnableTracing   bool               `yaml:"-"` // Set from OTel config
+	ServiceName     string             `yaml:"-"` // Set per component (e.g. "batch-apiserver")
+	DB              int                `yaml:"db"`
+	EnableTLS       bool               `yaml:"enable_tls"`
+	Insecure        bool               `yaml:"insecure"`
+	Timeout         time.Duration      `yaml:"timeout"`            // Timeout for socket operations: dial, read, write.
+	MaxRetries      int                `yaml:"max_retries"`        // Maximum number of retries before giving up. Default is 3 retries; -1 (not 0) disables retries.
+	MinRetryBackoff time.Duration      `yaml:"min_retry_backoff"`  // Minimum backoff between each retry. Default is 8 milliseconds; -1 disables backoff.
+	MaxRetryBackoff time.Duration      `yaml:"max_retry_backoff"`  // Maximum backoff between each retry. Default is 512 milliseconds; -1 disables backoff.
+	PoolTimeout     time.Duration      `yaml:"pool_timeout"`       // Amount of time client waits for connection if all connections are busy before returning an error. Default is ReadTimeout + 1 second.
+	ConnMaxIdleTime time.Duration      `yaml:"conn_max_idle_time"` // The maximum amount of time a connection may be idle. If <= 0, connections are not closed due to a connection's idle time. Default is 30 minutes. -1 disables idle timeout check.
+	ConnMaxLifetime time.Duration      `yaml:"conn_max_lifetime"`  // The maximum amount of time a connection may be reused. If <= 0, connections are not closed due to a connection's age. Default is to not close idle connections.
 }
 
 func NewRedisClient(ctx context.Context, cnf *RedisClientConfig) (*gredis.Client, error) {
@@ -88,8 +88,8 @@ func NewRedisClient(ctx context.Context, cnf *RedisClientConfig) (*gredis.Client
 			redisOps.ClientName = fmt.Sprintf("%s-%d-%s", hostname, os.Getpid(), ucom.RandString(6))
 		}
 	}
-	if cnf.DbIdx >= 0 {
-		redisOps.DB = cnf.DbIdx
+	if cnf.DB >= 0 {
+		redisOps.DB = cnf.DB
 	}
 	if cnf.Timeout != 0 {
 		redisOps.DialTimeout = cnf.Timeout
@@ -147,7 +147,7 @@ func NewRedisClient(ctx context.Context, cnf *RedisClientConfig) (*gredis.Client
 	if cnf.EnableTracing {
 		if err := redisotel.InstrumentTracing(rds); err != nil {
 			logger.Error(err, "NewRedisClient: failed to instrument Redis tracing")
-			rds.Close()
+			_ = rds.Close()
 			return nil, err
 		}
 	}
@@ -156,7 +156,7 @@ func NewRedisClient(ctx context.Context, cnf *RedisClientConfig) (*gredis.Client
 	_, err = rds.Ping(ctx).Result()
 	if err != nil {
 		logger.Error(err, "NewRedisClient")
-		rds.Close()
+		_ = rds.Close()
 		return nil, err
 	}
 	logger.Info("NewRedisClient", "clientName", redisOps.ClientName)

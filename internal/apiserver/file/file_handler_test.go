@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime/multipart"
@@ -32,6 +33,7 @@ import (
 	"github.com/llm-d-incubation/batch-gateway/internal/apiserver/common"
 	dbapi "github.com/llm-d-incubation/batch-gateway/internal/database/api"
 	dbmock "github.com/llm-d-incubation/batch-gateway/internal/database/mock"
+	fsapi "github.com/llm-d-incubation/batch-gateway/internal/files_store/api"
 	fsclient "github.com/llm-d-incubation/batch-gateway/internal/files_store/fs"
 	"github.com/llm-d-incubation/batch-gateway/internal/shared/openai"
 	"github.com/llm-d-incubation/batch-gateway/internal/util/clientset"
@@ -131,7 +133,127 @@ func createTestFile(t *testing.T, handler *FileAPIHandler, ctx context.Context, 
 
 func doTestCreateFile(t *testing.T) {
 	t.Run("Success", doTestCreateFileSuccess)
+	t.Run("PurposeValidation", doTestCreateFilePurposeValidation)
 	t.Run("ExpiresAfterValidation", doTestCreateFileExpiresAfter)
+	t.Run("StoreValidationErrors", doTestCreateFileStoreValidationErrors)
+}
+
+// errStoreFileClient implements fsapi.BatchFilesClient and returns a fixed error from Store.
+type errStoreFileClient struct {
+	storeErr error
+}
+
+func (c *errStoreFileClient) Store(ctx context.Context, fileName, folderName string, fileSizeLimit, lineNumLimit int64, reader io.Reader) (*fsapi.BatchFileMetadata, error) {
+	_, _ = io.Copy(io.Discard, reader)
+	return nil, c.storeErr
+}
+
+func (c *errStoreFileClient) Retrieve(ctx context.Context, fileName, folderName string) (io.ReadCloser, *fsapi.BatchFileMetadata, error) {
+	return nil, nil, errors.New("not implemented")
+}
+
+func (c *errStoreFileClient) Delete(ctx context.Context, fileName, folderName string) error {
+	return nil
+}
+
+func (c *errStoreFileClient) Close() error {
+	return nil
+}
+
+func doTestCreateFileStoreValidationErrors(t *testing.T) {
+	ctx := context.Background()
+	dbClient := dbmock.NewMockDBClient[dbapi.FileItem, dbapi.FileQuery](
+		func(f *dbapi.FileItem) string { return f.ID },
+		func(q *dbapi.FileQuery) *dbapi.BaseQuery { return &q.BaseQuery },
+	)
+	// Use default max file size so the multipart request body is under the Content-Length
+	// pre-check; Store() errors are injected by errStoreFileClient.
+	config := &common.ServerConfig{
+		FileAPI: common.FileAPIConfig{
+			MaxSizeBytes:             common.DefaultMaxFileSizeBytes,
+			MaxLineCount:             10,
+			DefaultExpirationSeconds: 30 * 24 * 60 * 60,
+		},
+	}
+
+	buildCreateRequest := func(t *testing.T) *http.Request {
+		t.Helper()
+		body := &bytes.Buffer{}
+		writer := multipart.NewWriter(body)
+		fileWriter, err := writer.CreateFormFile("file", "test.jsonl")
+		if err != nil {
+			t.Fatalf("failed to create form file: %v", err)
+		}
+		if _, err := io.WriteString(fileWriter, `{"custom_id":"req-1","method":"POST","url":"/v1/chat/completions","body":{}}`+"\n"); err != nil {
+			t.Fatalf("failed to write file content: %v", err)
+		}
+		if err := writer.WriteField("purpose", "batch"); err != nil {
+			t.Fatalf("failed to write purpose field: %v", err)
+		}
+		if err := writer.Close(); err != nil {
+			t.Fatalf("failed to close multipart writer: %v", err)
+		}
+		req := httptest.NewRequest(http.MethodPost, "/v1/files", body)
+		req.Header.Set("Content-Type", writer.FormDataContentType())
+		return req.WithContext(ctx)
+	}
+
+	cases := []struct {
+		name        string
+		storeErr    error
+		wantStatus  int
+		wantMessage string
+	}{
+		{
+			name:        "file too large",
+			storeErr:    fsapi.ErrFileTooLarge,
+			wantStatus:  http.StatusBadRequest,
+			wantMessage: fmt.Sprintf("File size exceeds the maximum allowed size of %d bytes", common.DefaultMaxFileSizeBytes),
+		},
+		{
+			name:        "too many lines",
+			storeErr:    fsapi.ErrTooManyLines,
+			wantStatus:  http.StatusBadRequest,
+			wantMessage: "File exceeds the maximum allowed line count of 10",
+		},
+		{
+			name:        "file already exists",
+			storeErr:    fsapi.ErrFileExists,
+			wantStatus:  http.StatusConflict,
+			wantMessage: "A file with this name already exists",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			clients := &clientset.Clientset{
+				File:    &errStoreFileClient{storeErr: tc.storeErr},
+				FileDB:  dbClient,
+				BatchDB: nil,
+				Queue:   nil,
+				Event:   nil,
+				Status:  nil,
+			}
+			handler := NewFileAPIHandler(config, clients)
+			req := buildCreateRequest(t)
+			w := httptest.NewRecorder()
+			handler.CreateFile(w, req)
+
+			if w.Code != tc.wantStatus {
+				t.Fatalf("expected status %d, got %d, body: %s", tc.wantStatus, w.Code, w.Body.String())
+			}
+			var errResp openai.ErrorResponse
+			if err := json.Unmarshal(w.Body.Bytes(), &errResp); err != nil {
+				t.Fatalf("failed to parse error response: %v", err)
+			}
+			if errResp.Error.Code != tc.wantStatus {
+				t.Errorf("expected error code %d, got %d", tc.wantStatus, errResp.Error.Code)
+			}
+			if errResp.Error.Message != tc.wantMessage {
+				t.Errorf("expected message %q, got %q", tc.wantMessage, errResp.Error.Message)
+			}
+		})
+	}
 }
 
 func doTestCreateFileSuccess(t *testing.T) {
@@ -195,12 +317,12 @@ func doTestCreateFileSuccess(t *testing.T) {
 	}
 
 	// Verify file was actually uploaded to storage
-	fileName := fileObj.Filename
+	storageName := ucom.FileStorageName(fileObj.ID, fileObj.Filename)
 	folderName, err := ucom.GetFolderNameByTenantID(common.DefaultTenantID)
 	if err != nil {
 		t.Fatalf("failed to get folder name from tenant ID: %v", err)
 	}
-	fileReader, fileMeta, err := handler.clients.File.Retrieve(ctx, fileName, folderName)
+	fileReader, fileMeta, err := handler.clients.File.Retrieve(ctx, storageName, folderName)
 	if err != nil {
 		t.Fatalf("failed to retrieve file from storage: %v", err)
 	}
@@ -222,6 +344,53 @@ func doTestCreateFileSuccess(t *testing.T) {
 	if string(uploadedContent) != expectedStoredContent {
 		t.Errorf("uploaded content doesn't match expected.\nExpected:\n%s\nGot:\n%s",
 			expectedStoredContent, string(uploadedContent))
+	}
+}
+
+func doTestCreateFilePurposeValidation(t *testing.T) {
+	ctx := context.Background()
+	handler := setupTestHandler(t)
+
+	cases := []struct {
+		name    string
+		purpose string // empty string means omit the field
+	}{
+		{"MissingPurpose", ""},
+		{"InvalidPurpose", "invalid"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			body := &bytes.Buffer{}
+			writer := multipart.NewWriter(body)
+
+			fileWriter, err := writer.CreateFormFile("file", tc.name+".jsonl")
+			if err != nil {
+				t.Fatalf("failed to create form file: %v", err)
+			}
+			if _, err := io.WriteString(fileWriter, `{"custom_id":"req-1","method":"POST","url":"/v1/chat/completions","body":{}}`); err != nil {
+				t.Fatalf("failed to write file content: %v", err)
+			}
+			if tc.purpose != "" {
+				if err := writer.WriteField("purpose", tc.purpose); err != nil {
+					t.Fatalf("failed to write purpose field: %v", err)
+				}
+			}
+			if err := writer.Close(); err != nil {
+				t.Fatalf("failed to close multipart writer: %v", err)
+			}
+
+			req := httptest.NewRequest(http.MethodPost, "/v1/files", body)
+			req.Header.Set("Content-Type", writer.FormDataContentType())
+			req = req.WithContext(ctx)
+
+			w := httptest.NewRecorder()
+			handler.CreateFile(w, req)
+
+			if w.Code != http.StatusBadRequest {
+				t.Errorf("expected status %d, got %d, body: %s", http.StatusBadRequest, w.Code, w.Body.String())
+			}
+		})
 	}
 }
 
@@ -276,6 +445,10 @@ func doTestCreateFileExpiresAfter(t *testing.T) {
 		{"too large", "created_at", "2592001", http.StatusBadRequest},
 		{"negative", "created_at", "-1", http.StatusBadRequest},
 		{"zero", "created_at", "0", http.StatusBadRequest},
+		{"anchor only", "created_at", "", http.StatusBadRequest},
+		{"seconds only", "", "86400", http.StatusBadRequest},
+		{"non-numeric seconds", "created_at", "abc", http.StatusBadRequest},
+		{"invalid anchor", "updated_at", "86400", http.StatusBadRequest},
 	}
 
 	for _, tc := range tests {
@@ -485,6 +658,58 @@ func doTestListFiles(t *testing.T) {
 
 		if w.Code != http.StatusBadRequest {
 			t.Errorf("expected status %d for invalid after, got %d", http.StatusBadRequest, w.Code)
+		}
+	})
+
+	// Test 7: limit=0 (below minimum)
+	t.Run("LimitZero", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/v1/files?limit=0", nil)
+		req = req.WithContext(ctx)
+
+		w := httptest.NewRecorder()
+		handler.ListFiles(w, req)
+
+		if w.Code != http.StatusBadRequest {
+			t.Errorf("expected status %d for limit=0, got %d", http.StatusBadRequest, w.Code)
+		}
+	})
+
+	// Test 8: limit too large (above maximum)
+	t.Run("LimitTooLarge", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/v1/files?limit=99999", nil)
+		req = req.WithContext(ctx)
+
+		w := httptest.NewRecorder()
+		handler.ListFiles(w, req)
+
+		if w.Code != http.StatusBadRequest {
+			t.Errorf("expected status %d for limit=99999, got %d", http.StatusBadRequest, w.Code)
+		}
+	})
+
+	// Test 9: Invalid limit (non-integer)
+	t.Run("InvalidLimit", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/v1/files?limit=abc", nil)
+		req = req.WithContext(ctx)
+
+		w := httptest.NewRecorder()
+		handler.ListFiles(w, req)
+
+		if w.Code != http.StatusBadRequest {
+			t.Errorf("expected status %d for invalid limit, got %d", http.StatusBadRequest, w.Code)
+		}
+	})
+
+	// Test 9: Invalid order parameter
+	t.Run("InvalidOrder", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/v1/files?order=invalid", nil)
+		req = req.WithContext(ctx)
+
+		w := httptest.NewRecorder()
+		handler.ListFiles(w, req)
+
+		if w.Code != http.StatusBadRequest {
+			t.Errorf("expected status %d for invalid order, got %d", http.StatusBadRequest, w.Code)
 		}
 	})
 }
@@ -733,11 +958,12 @@ func doTestDeleteFile(t *testing.T) {
 		}
 
 		// Verify physical file is deleted from storage
+		storageName := ucom.FileStorageName(createdFile.ID, createdFile.Filename)
 		folderName, err := ucom.GetFolderNameByTenantID(common.DefaultTenantID)
 		if err != nil {
 			t.Fatalf("failed to get folder name from tenant ID: %v", err)
 		}
-		_, _, err = handler.clients.File.Retrieve(ctx, createdFile.Filename, folderName)
+		_, _, err = handler.clients.File.Retrieve(ctx, storageName, folderName)
 		if err == nil {
 			t.Errorf("expected physical file to be deleted, but still exists")
 		}

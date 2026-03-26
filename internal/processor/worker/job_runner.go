@@ -104,7 +104,9 @@ func (p *Processor) runJob(ctx context.Context, params *jobExecutionParams) {
 			bgCtx := klog.NewContext(context.Background(), klog.FromContext(ctx))
 			if enqErr := p.poller.enqueueOne(bgCtx, params.task); enqErr != nil {
 				logger.V(logging.ERROR).Error(enqErr, "Failed to re-enqueue the job to the queue")
-				metrics.RecordJobProcessed(metrics.ResultFailed, metrics.ReasonSystemError)
+				if failErr := p.handleFailed(bgCtx, params.updater, params.jobItem, nil); failErr != nil {
+					logger.V(logging.ERROR).Error(failErr, "Failed to mark job as failed after re-enqueue failure")
+				}
 			} else {
 				metrics.RecordJobProcessed(metrics.ResultReEnqueued, metrics.ReasonSystemError)
 			}
@@ -175,7 +177,7 @@ func (p *Processor) runJob(ctx context.Context, params *jobExecutionParams) {
 	}
 
 	// finalization: upload output, update status to completed
-	if err := p.finalizeJob(ctx, params.updater, params.jobItem, params.jobInfo, requestCounts); err != nil {
+	if err := p.finalizeJob(ctx, params.updater, params.jobItem, params.jobInfo, requestCounts, params.cancelRequested); err != nil {
 		logger.V(logging.ERROR).Error(err, "Failed to finalize job")
 		span.RecordError(err)
 		span.SetStatus(codes.Error, "finalize failed")

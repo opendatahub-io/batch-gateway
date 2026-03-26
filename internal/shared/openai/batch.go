@@ -62,6 +62,10 @@ func (s BatchStatus) IsFinal() bool {
 	return s == BatchStatusCompleted || s == BatchStatusFailed || s == BatchStatusExpired || s == BatchStatusCancelled
 }
 
+func (s BatchStatus) IsCancellable() bool {
+	return s == BatchStatusValidating || s == BatchStatusInProgress
+}
+
 type BatchSpec struct {
 	// required. The object type, which is always `batch`.
 	Object string `json:"object"`
@@ -275,6 +279,18 @@ func (r *CreateBatchRequest) Validate() error {
 
 	if r.InputFileID == "" {
 		return errors.New("input_file_id is required")
+	}
+
+	if len(r.Metadata) > 16 {
+		return fmt.Errorf("metadata: too many keys (max 16, got %d)", len(r.Metadata))
+	}
+	for k, v := range r.Metadata {
+		if len(k) > 64 {
+			return fmt.Errorf("metadata: key exceeds 64 characters")
+		}
+		if len(v) > 512 {
+			return fmt.Errorf("metadata: value for key %q exceeds 512 characters", k)
+		}
 	}
 
 	if r.OutputExpiresAfter != nil {

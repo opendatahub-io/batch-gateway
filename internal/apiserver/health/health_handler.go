@@ -28,6 +28,9 @@ const (
 	HealthPath = "/health"
 )
 
+// Compile-time check: HealthApiHandler implements common.ApiHandler.
+var _ common.ApiHandler = (*HealthApiHandler)(nil)
+
 type HealthApiHandler struct {
 }
 
@@ -53,5 +56,5 @@ func (c *HealthApiHandler) GetRoutes() []common.Route {
 func (c *HealthApiHandler) HealthHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
-	w.Write([]byte("OK"))
+	_, _ = w.Write([]byte("OK"))
 }

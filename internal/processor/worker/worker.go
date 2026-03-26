@@ -79,10 +79,17 @@ func NewProcessor(
 }
 
 // Run starts processor orchestration and enters the polling loop.
-func (p *Processor) Run(ctx context.Context) error {
+// If onReady is provided, it is called after pre-flight checks succeed and
+// right before the polling loop begins accepting work.
+func (p *Processor) Run(ctx context.Context, onReady func()) error {
 	if err := p.prepare(ctx); err != nil {
 		return err
 	}
+	if onReady != nil {
+		onReady()
+	}
+
+	p.recoverStaleJobs(ctx)
 
 	logger := klog.FromContext(ctx)
 	logger.V(logging.INFO).Info(
@@ -140,7 +147,7 @@ func (p *Processor) runPollingLoop(ctx context.Context) error {
 		jctx := klog.NewContext(ctx, jlogger)
 
 		// get job item from db
-		jobItem, err := p.poller.fetchJobItem(jctx, task)
+		jobItem, err := p.poller.fetchJobItemByID(jctx, task.ID)
 		if err != nil {
 			jlogger.Error(err, "Failed to fetch job item from DB")
 			p.releaseForNextPoll()
@@ -214,7 +221,19 @@ func (p *Processor) runPollingLoop(ctx context.Context) error {
 
 		// job is not in runnable state.
 		if !batch_utils.IsJobRunnable(jobInfo.BatchJob) {
-			jlogger.V(logging.INFO).Info("job is not in processible state. skipping this job.", "status", jobInfo.BatchJob.BatchStatusInfo.Status)
+			// If the batch was marked as "cancelling" between dequeue and this check,
+			// transition it to "cancelled" so it doesn't get stuck forever.
+			if jobInfo.BatchJob.Status == openai.BatchStatusCancelling {
+				jlogger.V(logging.INFO).Info("Job is in cancelling state after dequeue, transitioning to cancelled")
+				if err := p.updater.UpdateCancelledStatus(jctx, jobItem, nil, "", ""); err != nil {
+					jlogger.V(logging.ERROR).Error(err, "Failed to update job status to cancelled")
+				}
+				p.releaseForNextPoll()
+				metrics.RecordJobProcessed(metrics.ResultSuccess, metrics.ReasonNone)
+				continue
+			}
+
+			jlogger.V(logging.INFO).Info("job is not in processible state. skipping this job.", "status", jobInfo.BatchJob.Status)
 
 			// persistent status update is not needed.
 			// do not need to delete the task from the queue.

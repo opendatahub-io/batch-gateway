@@ -1,4 +1,4 @@
-.PHONY: help build build-apiserver build-processor run-apiserver run-processor run-apiserver-dev run-processor-dev test test-coverage test-coverage-func clean lint fmt vet tidy install-tools deps-get deps-verify bench check check-container-tool ci image-build image-build-apiserver image-build-processor test-integration test-all test-e2e dev-deploy
+.PHONY: help build build-apiserver build-processor build-gc run-apiserver run-processor run-gc run-apiserver-dev run-processor-dev run-gc-dev build-release package-release publish-helm-chart generate-release test test-coverage test-coverage-func clean lint fmt vet tidy install-tools deps-get deps-verify bench check check-container-tool ci image-build image-build-apiserver image-build-processor image-build-gc test-integration test-all test-e2e dev-deploy dev-clean dev-rm-cluster pre-commit
 
 SHELL := /usr/bin/env bash
 
@@ -8,14 +8,23 @@ TARGETARCH ?= $(shell go env GOARCH)
 DEV_VERSION ?= 0.0.1
 APISERVER_BINARY=batch-gateway-apiserver
 PROCESSOR_BINARY=batch-gateway-processor
+GC_BINARY=batch-gateway-gc
 APISERVER_PATH=./bin/$(APISERVER_BINARY)
 PROCESSOR_PATH=./bin/$(PROCESSOR_BINARY)
+GC_PATH=./bin/$(GC_BINARY)
 CMD_APISERVER=./cmd/apiserver
 CMD_PROCESSOR=./cmd/batch-processor
+CMD_GC=./cmd/batch-gc
+# Release binaries: name:cmd-path (single source of truth for create-release workflow)
+RELEASE_BINARIES := apiserver:$(CMD_APISERVER) processor:$(CMD_PROCESSOR) gc:$(CMD_GC)
+BINARIES_DIR ?= dist/binaries
+RELEASE_DIR ?= release
 APISERVER_IMAGE_TAG_BASE ?= ghcr.io/llm-d-incubation/$(APISERVER_BINARY)
 APISERVER_IMG = $(APISERVER_IMAGE_TAG_BASE):$(DEV_VERSION)
 PROCESSOR_IMAGE_TAG_BASE ?= ghcr.io/llm-d-incubation/$(PROCESSOR_BINARY)
 PROCESSOR_IMG = $(PROCESSOR_IMAGE_TAG_BASE):$(DEV_VERSION)
+GC_IMAGE_TAG_BASE ?= ghcr.io/llm-d-incubation/$(GC_BINARY)
+GC_IMG = $(GC_IMAGE_TAG_BASE):$(DEV_VERSION)
 GO=go
 GOFLAGS=
 LDFLAGS=-ldflags "-s -w"
@@ -48,9 +57,63 @@ build-processor:
 	$(GO) build $(GOFLAGS) $(LDFLAGS) -o $(PROCESSOR_PATH) $(CMD_PROCESSOR)
 	@echo "Binary built at $(PROCESSOR_PATH)"
 
+## build-gc: Build the garbage collector binary
+build-gc:
+	@echo "Building $(GC_BINARY)..."
+	@mkdir -p bin
+	$(GO) build $(GOFLAGS) $(LDFLAGS) -o $(GC_PATH) $(CMD_GC)
+	@echo "Binary built at $(GC_PATH)"
+
 ## build: Build all binaries
-build: build-apiserver build-processor
+build: build-apiserver build-processor build-gc
 	@echo "All binaries built successfully"
+
+## build-release: Build all release binaries for GOOS/GOARCH (e.g. GOOS=linux GOARCH=amd64 make build-release)
+build-release:
+	@if [ -z "$${GOOS}" ] || [ -z "$${GOARCH}" ]; then \
+	  echo "GOOS and GOARCH must be set (e.g. GOOS=linux GOARCH=amd64 make build-release)"; exit 1; \
+	fi
+	@mkdir -p bin
+	@for item in $(RELEASE_BINARIES); do \
+	  name=$$(echo $$item | cut -d: -f1); \
+	  cmd=$$(echo $$item | cut -d: -f2); \
+	  echo "Building batch-gateway-$$name-$${GOOS}-$${GOARCH}..."; \
+	  $(GO) build $(GOFLAGS) $(LDFLAGS) -o bin/batch-gateway-$$name-$${GOOS}-$${GOARCH} $$cmd; \
+	done
+	@echo "Release binaries built successfully"
+
+## package-release: Package binaries as .tar.gz with SHA256SUMS (BINARIES_DIR=dist/binaries RELEASE_DIR=release)
+package-release:
+	@mkdir -p $(RELEASE_DIR)
+	@cp $(BINARIES_DIR)/* $(RELEASE_DIR)/
+	@cd $(RELEASE_DIR) && \
+	  for f in batch-gateway-*; do \
+	    if [ -f "$$f" ]; then \
+	      chmod +x "$$f"; \
+	      tar czf "$$f.tar.gz" "$$f"; \
+	      rm -f "$$f"; \
+	    fi; \
+	  done && \
+	  sha256sum *.tar.gz > SHA256SUMS && \
+	  cat SHA256SUMS && \
+	  ls -la
+
+## publish-helm-chart: Patch chart for VERSION, package, append chart to SHA256SUMS, push to oci://ghcr.io/llm-d-incubation/charts (requires VERSION, yq, helm; GITHUB_TOKEN, GITHUB_ACTOR for push).
+publish-helm-chart:
+	@if [ -z "$(VERSION)" ]; then \
+	  echo "VERSION is required (e.g. VERSION=v1.0.0 make publish-helm-chart)"; exit 1; \
+	fi
+	@export VERSION="$(VERSION)"; \
+	export GITHUB_TOKEN="$(GITHUB_TOKEN)"; \
+	export GITHUB_ACTOR="$(GITHUB_ACTOR)"; \
+	./scripts/publish-helm-chart.sh
+
+## generate-release: Create and push a release tag from main (requires REL_VERSION, e.g. make generate-release REL_VERSION=0.0.1)
+generate-release:
+	@if [ -z "$(REL_VERSION)" ]; then \
+	  echo "Error: REL_VERSION is required. Example: make generate-release REL_VERSION=0.0.1"; exit 1; \
+	fi
+	@./scripts/generate-release.sh $(REL_VERSION)
 
 ## run-apiserver: Run the apiserver
 run-apiserver: build-apiserver
@@ -71,6 +134,16 @@ run-apiserver-dev: build-apiserver
 run-processor-dev: build-processor
 	@echo "Starting $(PROCESSOR_BINARY) in development mode..."
 	$(PROCESSOR_PATH) --v=5
+
+## run-gc: Run the garbage collector
+run-gc: build-gc
+	@echo "Starting $(GC_BINARY)..."
+	$(GC_PATH)
+
+## run-gc-dev: Run the garbage collector with verbose logging
+run-gc-dev: build-gc
+	@echo "Starting $(GC_BINARY) in development mode..."
+	$(GC_PATH) --v=5
 
 ## test: Run tests with summary
 test:
@@ -120,6 +193,12 @@ lint:
 	@which golangci-lint > /dev/null || (echo "golangci-lint not found. Run 'make install-tools' to install it." && exit 1)
 	golangci-lint run ./...
 
+## pre-commit: Run pre-commit on all files
+pre-commit:
+	@echo "Running pre-commit on all files..."
+	@which pre-commit > /dev/null || (echo "pre-commit not found. Install it with: pip install pre-commit" && exit 1)
+	pre-commit run --all-files
+
 ## fmt: Run go fmt on all files
 fmt:
 	@echo "Formatting code..."
@@ -142,11 +221,18 @@ clean:
 	@rm -f coverage.out coverage.html
 	@echo "Clean complete"
 
-## install-tools: Install development tools
-install-tools:
-	@echo "Installing development tools..."
-	$(GO) install github.com/golangci/golangci-lint/cmd/golangci-lint@latest
-	@echo "Tools installed"
+## install-pre-commit-tools: Install tools for pre-commit hooks (goimports, gosec)
+install-pre-commit-tools:
+	@echo "Installing pre-commit tools..."
+	$(GO) install golang.org/x/tools/cmd/goimports@v0.43.0
+	$(GO) install github.com/securego/gosec/v2/cmd/gosec@v2.25.0
+	@echo "Pre-commit tools installed"
+
+## install-tools: Install all development tools (includes pre-commit tools + golangci-lint)
+install-tools: install-pre-commit-tools
+	@echo "Installing additional development tools..."
+	$(GO) install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.11.4
+	@echo "All tools installed"
 
 ## check: Run fmt, vet, and test
 check: fmt vet test
@@ -180,8 +266,18 @@ image-build-processor: check-container-tool
 		-f docker/Dockerfile.processor \
 		-t $(PROCESSOR_IMG) .
 
+## image-build-gc: Build garbage collector Docker image
+image-build-gc: check-container-tool
+	@printf "\033[33;1m==== Building Docker image $(GC_IMG) ====\033[0m\n"
+	$(CONTAINER_TOOL) build \
+		--platform linux/$(TARGETARCH) \
+		--build-arg TARGETOS=linux \
+		--build-arg TARGETARCH=$(TARGETARCH) \
+		-f docker/Dockerfile.gc \
+		-t $(GC_IMG) .
+
 ## image-build: Build all Docker images
-image-build: image-build-apiserver image-build-processor
+image-build: image-build-apiserver image-build-processor image-build-gc
 
 ## deps-get: Download dependencies
 deps-get:
@@ -196,22 +292,35 @@ deps-verify:
 ## test-integration: Run integration tests (each test spawns its own mock server)
 test-integration:
 	@echo "Running integration tests..."
-	@$(GO) test -v -tags=integration ./internal/inference/... || \
+	@$(GO) test -v -tags=integration ./... || \
 		(echo "\n❌ Integration tests failed" && exit 1)
 	@echo "\n✅ Integration tests passed!"
 
 ## test-all: Run all tests (unit + integration)
 test-all: test test-integration
 
-## deploy: Deploy batch-gateway to a local kind cluster and start port-forward
+KIND_CLUSTER_NAME ?= batch-gateway-dev
+
+## dev-deploy: Deploy batch-gateway to a local kind cluster with all dependencies
 dev-deploy:
 	@bash scripts/dev-deploy.sh
 
-## test-e2e: Run E2E tests against a live API server (requires TEST_BASE_URL or port-forward)
+## dev-clean: Clean up dev deployment (removes all resources but keeps the kind cluster)
+dev-clean:
+	@bash scripts/dev-clean.sh
+
+## dev-rm-cluster: Delete the kind cluster
+dev-rm-cluster:
+	@echo "Deleting kind cluster 'batch-gateway-dev'..."
+	@kind delete cluster --name batch-gateway-dev || echo "Cluster not found or already deleted"
+	@echo "✅ Kind cluster deleted"
+
+## test-e2e: Run E2E tests against a live API server (requires TEST_BASE_URL or dev-deploy NodePort services)
+##           Use TEST_RUN to filter tests, e.g.: make test-e2e TEST_RUN=TestE2E/Batches/Cancel/InProgress
 test-e2e:
 	@echo "Running E2E tests..."
 	@OUT=$$(mktemp); \
-	cd test/e2e && $(GO) test -v -count=1 ./... 2>&1 | tee $$OUT; \
+	cd test/e2e && $(GO) test -v -count=1 $(if $(TEST_RUN),-run $(TEST_RUN)) ./... 2>&1 | tee $$OUT; \
 	TEST_EXIT=$${PIPESTATUS[0]}; \
 	PASS_COUNT=$$(grep -- '--- PASS:' $$OUT 2>/dev/null | wc -l | tr -d ' '); \
 	FAIL_COUNT=$$(grep -- '--- FAIL:' $$OUT 2>/dev/null | wc -l | tr -d ' '); \

@@ -19,6 +19,7 @@ limitations under the License.
 package file
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -31,6 +32,7 @@ import (
 
 	"github.com/llm-d-incubation/batch-gateway/internal/apiserver/common"
 	dbapi "github.com/llm-d-incubation/batch-gateway/internal/database/api"
+	fsapi "github.com/llm-d-incubation/batch-gateway/internal/files_store/api"
 	"github.com/llm-d-incubation/batch-gateway/internal/shared/converter"
 	"github.com/llm-d-incubation/batch-gateway/internal/shared/openai"
 	"github.com/llm-d-incubation/batch-gateway/internal/util/clientset"
@@ -40,9 +42,12 @@ import (
 )
 
 const (
-	defaultListFilesLimit = 10000
+	defaultListFilesLimit = 20
 	maxListFilesLimit     = 10000
 )
+
+// Compile-time check: FileAPIHandler implements common.ApiHandler.
+var _ common.ApiHandler = (*FileAPIHandler)(nil)
 
 type FileAPIHandler struct {
 	config  *common.ServerConfig
@@ -285,10 +290,13 @@ func (c *FileAPIHandler) CreateFile(w http.ResponseWriter, r *http.Request) {
 	trace.SpanFromContext(ctx).SetAttributes(attribute.String(uotel.AttrInputFileID, fileID))
 
 	// Sanitize filename
-	fileName := filepath.Base(fileHeader.Filename)
-	if fileName == "" || fileName == "." || fileName == ".." {
-		fileName = fileID + ".jsonl"
+	origName := filepath.Base(fileHeader.Filename)
+	if origName == "" || origName == "." || origName == ".." || origName == "/" {
+		origName = fileID + ".jsonl"
 	}
+
+	// Use fileID-based name for storage to guarantee uniqueness
+	storageName := ucom.FileStorageName(fileID, origName)
 
 	// Get tenant ID from context to use as folder name
 	tenantID := common.GetTenantIDFromContext(ctx)
@@ -298,11 +306,45 @@ func (c *FileAPIHandler) CreateFile(w http.ResponseWriter, r *http.Request) {
 		common.WriteInternalServerError(w, r)
 		return
 	}
-	fileMeta, err := c.clients.File.Store(ctx, fileName, folderName, c.config.FileAPI.GetMaxSizeBytes(), c.config.FileAPI.GetMaxLineCount(), fileReader)
+	fileMeta, err := c.clients.File.Store(ctx, storageName, folderName, c.config.FileAPI.GetMaxSizeBytes(), c.config.FileAPI.GetMaxLineCount(), fileReader)
 	if err != nil {
-		logger.Error(err, "failed to store file content")
-		common.WriteInternalServerError(w, r)
-		return
+		switch {
+		case errors.Is(err, fsapi.ErrFileTooLarge):
+			logger.V(logging.DEBUG).Info("file size exceeds limit during upload", "limit", maxFileSize)
+			apiErr := openai.NewAPIError(
+				http.StatusBadRequest,
+				"",
+				fmt.Sprintf("File size exceeds the maximum allowed size of %d bytes", maxFileSize),
+				nil,
+			)
+			common.WriteAPIError(w, r, apiErr)
+			return
+		case errors.Is(err, fsapi.ErrTooManyLines):
+			maxLines := c.config.FileAPI.GetMaxLineCount()
+			logger.V(logging.DEBUG).Info("file line count exceeds limit during upload", "limit", maxLines)
+			apiErr := openai.NewAPIError(
+				http.StatusBadRequest,
+				"",
+				fmt.Sprintf("File exceeds the maximum allowed line count of %d", maxLines),
+				nil,
+			)
+			common.WriteAPIError(w, r, apiErr)
+			return
+		case errors.Is(err, fsapi.ErrFileExists):
+			logger.V(logging.DEBUG).Info("file already exists in storage", "storageName", storageName)
+			apiErr := openai.NewAPIError(
+				http.StatusConflict,
+				"",
+				"A file with this name already exists",
+				nil,
+			)
+			common.WriteAPIError(w, r, apiErr)
+			return
+		default:
+			logger.Error(err, "failed to store file content")
+			common.WriteInternalServerError(w, r)
+			return
+		}
 	}
 	logger.V(logging.DEBUG).Info("file content stored successfully", "file_id", fileID, "size", fileMeta.Size)
 
@@ -310,8 +352,8 @@ func (c *FileAPIHandler) CreateFile(w http.ResponseWriter, r *http.Request) {
 	var success bool
 	defer func() {
 		if !success {
-			if err := c.clients.File.Delete(ctx, fileName, folderName); err != nil {
-				logger.Error(err, "failed to cleanup file", "fileName", fileName, "folderName", folderName)
+			if err := c.clients.File.Delete(ctx, storageName, folderName); err != nil {
+				logger.Error(err, "failed to cleanup file", "storageName", storageName, "folderName", folderName)
 			}
 		}
 	}()
@@ -322,7 +364,7 @@ func (c *FileAPIHandler) CreateFile(w http.ResponseWriter, r *http.Request) {
 		Bytes:     fileMeta.Size,
 		CreatedAt: createdAt,
 		ExpiresAt: expiresAt,
-		Filename:  fileName,
+		Filename:  origName,
 		Object:    "file",
 		Purpose:   purpose,
 		Status:    openai.FileObjectStatusUploaded,
@@ -378,7 +420,7 @@ func (c *FileAPIHandler) ListFiles(w http.ResponseWriter, r *http.Request) {
 		start = parsedStart
 	}
 
-	// Validate and parse limit (default: 10000, range: 1-10000)
+	// Validate and parse limit (default: 20, range: 1-10000)
 	limit := defaultListFilesLimit
 	if limitStr != "" {
 		parsedLimit, err := strconv.Atoi(limitStr)
@@ -542,9 +584,10 @@ func (c *FileAPIHandler) DownloadFile(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Retrieve file content from storage
-	fileReader, fileMeta, err := c.clients.File.Retrieve(ctx, fileObj.Filename, folderName)
+	storageName := ucom.FileStorageName(fileObj.ID, fileObj.Filename)
+	fileReader, fileMeta, err := c.clients.File.Retrieve(ctx, storageName, folderName)
 	if err != nil {
-		logger.Error(err, "failed to retrieve file content", "fileName", fileObj.Filename, "folderName", folderName)
+		logger.Error(err, "failed to retrieve file content", "storageName", storageName, "folderName", folderName)
 		common.WriteInternalServerError(w, r)
 		return
 	}
@@ -591,9 +634,10 @@ func (c *FileAPIHandler) DeleteFile(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Delete physical file from storage
-	err = c.clients.File.Delete(ctx, fileObj.Filename, folderName)
+	storageName := ucom.FileStorageName(fileObj.ID, fileObj.Filename)
+	err = c.clients.File.Delete(ctx, storageName, folderName)
 	if err != nil {
-		logger.Error(err, "failed to delete physical file", "fileName", fileObj.Filename, "folderName", folderName)
+		logger.Error(err, "failed to delete physical file", "storageName", storageName, "folderName", folderName)
 		// Continue to delete metadata even if physical file deletion fails
 	}
 
