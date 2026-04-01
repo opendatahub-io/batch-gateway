@@ -591,11 +591,11 @@ func (p *Processor) drainUnprocessedRequests(
 
 const sloTTFTMSHeader = "x-slo-ttft-ms"
 
-// mergeSLOTTFTIntoHeaders sets sloTTFTMSHeader to the remaining time until
-// sloCtx's deadline in whole milliseconds, clamped to >= 0. If sloCtx has no
-// deadline or is cancelled, the headers map is returned unchanged.
+// mergeSLOTTFTIntoHeaders sets sloTTFTMSHeader to the remaining time until sloCtx's deadline
+// in whole milliseconds, clamped to >= 0. If sloCtx has no deadline, is cancelled, or has an
+// expired deadline, the headers map is returned unchanged.
 func mergeSLOTTFTIntoHeaders(headers map[string]string, sloCtx context.Context) map[string]string {
-	if sloCtx.Err() == context.Canceled {
+	if sloCtx.Err() != nil {
 		return headers
 	}
 	dl, ok := sloCtx.Deadline()
@@ -604,7 +604,10 @@ func mergeSLOTTFTIntoHeaders(headers map[string]string, sloCtx context.Context) 
 	}
 	sloMs := time.Until(dl).Milliseconds()
 	if sloMs < 0 {
-		sloMs = 0
+		// this check is needed in case the context deadline was exceeded between the sloCtx.Err() check
+		// and the time.Until call above. We return the headers unchanged to avoid sending a negative value
+		// to the inference gateway.
+		return headers
 	}
 	if headers == nil {
 		headers = make(map[string]string)
@@ -679,6 +682,20 @@ func (p *Processor) executeOneRequest(
 		Endpoint:  req.URL,
 		Params:    req.Body,
 		Headers:   headers,
+	}
+
+	if sloCtx.Err() == context.DeadlineExceeded {
+		logger.V(logging.INFO).Info("SLO expired during execution, skipping request", "error", sloCtx.Err())
+		result := &outputLine{
+			ID:       newBatchRequestID(requestID),
+			CustomID: req.CustomID,
+			Error: &outputError{
+				Code:    batch_types.ErrCodeBatchExpired,
+				Message: "This request could not be executed before the completion window expired.",
+			},
+		}
+		metrics.RecordRequestError(modelID)
+		return result, nil
 	}
 
 	start := time.Now()
