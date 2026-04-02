@@ -9,6 +9,7 @@ permissions:
 
 jobs:
   add-label:
+    if: github.repository == 'llm-d-incubation/batch-gateway'
     runs-on: ubuntu-latest
     steps:
       - name: Add default labels
