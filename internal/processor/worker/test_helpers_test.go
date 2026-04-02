@@ -14,8 +14,8 @@ import (
 	"testing"
 	"time"
 
-	klog "k8s.io/klog/v2"
-
+	"github.com/go-logr/logr"
+	"github.com/go-logr/logr/testr"
 	db "github.com/llm-d-incubation/batch-gateway/internal/database/api"
 	mockdb "github.com/llm-d-incubation/batch-gateway/internal/database/mock"
 	filesapi "github.com/llm-d-incubation/batch-gateway/internal/files_store/api"
@@ -24,6 +24,8 @@ import (
 	"github.com/llm-d-incubation/batch-gateway/internal/shared/openai"
 	batch_types "github.com/llm-d-incubation/batch-gateway/internal/shared/types"
 	"github.com/llm-d-incubation/batch-gateway/internal/util/clientset"
+	ucom "github.com/llm-d-incubation/batch-gateway/internal/util/com"
+	"github.com/llm-d-incubation/batch-gateway/internal/util/semaphore"
 	"github.com/llm-d-incubation/batch-gateway/pkg/clients/inference"
 )
 
@@ -33,9 +35,12 @@ import (
 
 const mockFilesRootDir = "/tmp/batch-gateway-files"
 
-func testLoggerCtx() context.Context {
-	l := klog.Background()
-	return klog.NewContext(context.Background(), l)
+func testLogger(t testing.TB) logr.Logger {
+	return testr.NewWithInterface(t, testr.Options{})
+}
+
+func testLoggerCtx(t *testing.T) context.Context {
+	return logr.NewContext(context.Background(), testLogger(t))
 }
 
 func mustJSON(t *testing.T, v any) []byte {
@@ -149,20 +154,33 @@ func (d *dbStoreErrFileClient) DBStore(_ context.Context, _ *db.FileItem) error 
 // ---------------------------------------------------------------------------
 
 type spyPQ struct {
-	inner db.BatchPriorityQueueClient
-	mu    sync.Mutex
-	enqN  int
-	delN  int
+	inner          db.BatchPriorityQueueClient
+	mu             sync.Mutex
+	enqN           int
+	delN           int
+	afterDequeueFn func() // called after a successful dequeue (non-empty result)
+	enqueueErr     error  // if non-nil, PQEnqueue returns this error (after incrementing counter)
 }
 
 func (s *spyPQ) PQEnqueue(ctx context.Context, jobPriority *db.BatchJobPriority) error {
 	s.mu.Lock()
 	s.enqN++
+	injectedErr := s.enqueueErr
 	s.mu.Unlock()
+	if injectedErr != nil {
+		return injectedErr
+	}
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
 	return s.inner.PQEnqueue(ctx, jobPriority)
 }
 func (s *spyPQ) PQDequeue(ctx context.Context, timeout time.Duration, maxObjs int) ([]*db.BatchJobPriority, error) {
-	return s.inner.PQDequeue(ctx, timeout, maxObjs)
+	items, err := s.inner.PQDequeue(ctx, timeout, maxObjs)
+	if err == nil && len(items) > 0 && s.afterDequeueFn != nil {
+		s.afterDequeueFn()
+	}
+	return items, err
 }
 func (s *spyPQ) PQDelete(ctx context.Context, jobPriority *db.BatchJobPriority) (int, error) {
 	s.mu.Lock()
@@ -244,9 +262,20 @@ func (s *spyBatchDB) StatusCalls(status openai.BatchStatus) int {
 
 func mustNewProcessor(t *testing.T, cfg *config.ProcessorConfig, clients *clientset.Clientset) *Processor {
 	t.Helper()
-	p, err := NewProcessor(cfg, clients)
+	p, err := NewProcessor(cfg, clients, testLogger(t))
 	if err != nil {
 		t.Fatalf("NewProcessor: %v", err)
+	}
+	// Tests that call executeJob/processModel directly (without Run) need
+	// semaphores initialized. Run() normally does this with guard callbacks,
+	// but tests use nil callbacks since they don't need graceful shutdown.
+	p.tokens, err = semaphore.New(cfg.NumWorkers, nil)
+	if err != nil {
+		t.Fatalf("worker semaphore: %v", err)
+	}
+	p.globalSem, err = semaphore.New(cfg.GlobalConcurrency, nil)
+	if err != nil {
+		t.Fatalf("global semaphore: %v", err)
 	}
 	return p
 }
@@ -288,9 +317,17 @@ func newTestProcessorEnv(t *testing.T, cfg *config.ProcessorConfig, inferClient 
 		Status:    statusClient,
 		Event:     mockdb.NewMockBatchEventChannelClient(),
 		Inference: inference.NewSingleClientResolver(inferClient),
-	})
+	}, testLogger(t))
 	if err != nil {
 		t.Fatalf("NewProcessor: %v", err)
+	}
+	p.tokens, err = semaphore.New(cfg.NumWorkers, nil)
+	if err != nil {
+		t.Fatalf("worker semaphore: %v", err)
+	}
+	p.globalSem, err = semaphore.New(cfg.GlobalConcurrency, nil)
+	if err != nil {
+		t.Fatalf("global semaphore: %v", err)
 	}
 	p.poller = NewPoller(pqClient, dbClient)
 
@@ -321,31 +358,23 @@ func seedDBJob(t *testing.T, dbClient db.BatchDBClient, jobID string) *db.BatchI
 // Job setup helpers
 // ---------------------------------------------------------------------------
 
-// setupJobWithOutputFile creates the local job directory structure with a dummy output file.
+// setupJobWithOutputFile creates a job directory with a non-empty output.jsonl
+// so that uploadFileAndStoreFileRecord can find and upload it.
 func setupJobWithOutputFile(t *testing.T, cfg *config.ProcessorConfig, jobID, tenantID string) *batch_types.JobInfo {
 	t.Helper()
-	p := mustNewProcessor(t, cfg, validProcessorClients())
-
-	jobDir, err := p.jobRootDir(jobID, tenantID)
+	folderName, err := ucom.GetFolderNameByTenantID(tenantID)
 	if err != nil {
-		t.Fatalf("jobRootDir: %v", err)
+		t.Fatalf("GetFolderNameByTenantID: %v", err)
 	}
+	jobDir := filepath.Join(cfg.WorkDir, folderName, jobsDirName, jobID)
 	if err := os.MkdirAll(jobDir, 0o755); err != nil {
 		t.Fatalf("MkdirAll: %v", err)
 	}
-
-	outputPath, err := p.jobOutputFilePath(jobID, tenantID)
-	if err != nil {
-		t.Fatalf("jobOutputFilePath: %v", err)
-	}
-	if err := os.WriteFile(outputPath, []byte("test output\n"), 0o644); err != nil {
+	outputPath := filepath.Join(jobDir, outputFileName)
+	if err := os.WriteFile(outputPath, []byte(`{"id":"batch_req_1","custom_id":"req-1","response":{"status_code":200}}`+"\n"), 0o644); err != nil {
 		t.Fatalf("WriteFile: %v", err)
 	}
-
-	return &batch_types.JobInfo{
-		JobID:    jobID,
-		TenantID: tenantID,
-	}
+	return &batch_types.JobInfo{JobID: jobID, TenantID: tenantID}
 }
 
 // setupExecutionJob creates a complete job directory with input file, plan files, and model map.

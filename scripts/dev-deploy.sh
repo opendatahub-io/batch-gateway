@@ -9,18 +9,22 @@ source "${SCRIPT_DIR}/dev-common.sh"
 
 # ── Deployment-Specific Configuration ────────────────────────────────────────
 KIND_CLUSTER_NAME="${KIND_CLUSTER_NAME:-batch-gateway-dev}"
+IMAGE_REGISTRY="${IMAGE_REGISTRY:-mirror.gcr.io}"
 DEV_VERSION="${DEV_VERSION:-0.0.1}"
 POSTGRESQL_PASSWORD="${POSTGRESQL_PASSWORD:-postgres}"
 INFERENCE_API_KEY="${INFERENCE_API_KEY:-dummy-api-key}"
 S3_SECRET_ACCESS_KEY="${S3_SECRET_ACCESS_KEY:-minioadmin}"
 FILE_CLIENT_TYPE="${FILE_CLIENT_TYPE:-s3}"
-MINIO_IMAGE="${MINIO_IMAGE:-minio/minio:latest}"
+MINIO_IMAGE="${MINIO_IMAGE:-${IMAGE_REGISTRY}/minio/minio:latest}"
 MINIO_ACCESS_KEY="${MINIO_ACCESS_KEY:-minioadmin}"
 MINIO_SECRET_KEY="${MINIO_SECRET_KEY:-minioadmin}"
 MINIO_REGION="${MINIO_REGION:-us-east-1}"
 VLLM_SIM_MODEL="${VLLM_SIM_MODEL:-sim-model}"
 VLLM_SIM_B_MODEL="${VLLM_SIM_B_MODEL:-sim-model-b}"
 VLLM_SIM_IMAGE="${VLLM_SIM_IMAGE:-ghcr.io/llm-d/llm-d-inference-sim:latest}"
+JAEGER_IMAGE="${JAEGER_IMAGE:-${IMAGE_REGISTRY}/jaegertracing/all-in-one:latest}"
+PROMETHEUS_IMAGE="${PROMETHEUS_IMAGE:-${IMAGE_REGISTRY}/prom/prometheus:latest}"
+GRAFANA_IMAGE="${GRAFANA_IMAGE:-${IMAGE_REGISTRY}/grafana/grafana:latest}"
 LOG_VERBOSITY="${LOG_VERBOSITY:-4}"
 APISERVER_NODE_PORT="${APISERVER_NODE_PORT:-30080}"
 APISERVER_OBS_NODE_PORT="${APISERVER_OBS_NODE_PORT:-30081}"
@@ -28,6 +32,7 @@ PROCESSOR_NODE_PORT="${PROCESSOR_NODE_PORT:-30090}"
 JAEGER_NODE_PORT="${JAEGER_NODE_PORT:-30086}"
 PROMETHEUS_NODE_PORT="${PROMETHEUS_NODE_PORT:-30091}"
 GRAFANA_NODE_PORT="${GRAFANA_NODE_PORT:-30030}"
+MINIO_NODE_PORT="${MINIO_NODE_PORT:-30009}"
 APISERVER_IMG="${APISERVER_IMG:-ghcr.io/llm-d-incubation/batch-gateway-apiserver:${DEV_VERSION}}"
 PROCESSOR_IMG="${PROCESSOR_IMG:-ghcr.io/llm-d-incubation/batch-gateway-processor:${DEV_VERSION}}"
 GC_IMG="${GC_IMG:-ghcr.io/llm-d-incubation/batch-gateway-gc:${DEV_VERSION}}"
@@ -104,6 +109,9 @@ nodes:
     protocol: TCP
   - containerPort: ${GRAFANA_NODE_PORT}
     hostPort: ${GRAFANA_PORT}
+    protocol: TCP
+  - containerPort: ${MINIO_NODE_PORT}
+    hostPort: ${MINIO_PORT}
     protocol: TCP
 EOF
         fi
@@ -396,7 +404,7 @@ spec:
     spec:
       containers:
       - name: jaeger
-        image: jaegertracing/all-in-one:latest
+        image: ${JAEGER_IMAGE}
         imagePullPolicy: IfNotPresent
         ports:
         - containerPort: 4317
@@ -539,7 +547,7 @@ spec:
       serviceAccountName: ${PROMETHEUS_NAME}
       containers:
       - name: prometheus
-        image: prom/prometheus:latest
+        image: ${PROMETHEUS_IMAGE}
         imagePullPolicy: IfNotPresent
         args:
         - --config.file=/etc/prometheus/prometheus.yml
@@ -661,7 +669,7 @@ spec:
     spec:
       containers:
       - name: grafana
-        image: grafana/grafana:latest
+        image: ${GRAFANA_IMAGE}
         imagePullPolicy: IfNotPresent
         ports:
         - containerPort: 3000
@@ -815,7 +823,6 @@ install_batch_gateway() {
         --set "processor.image.tag=${DEV_VERSION}"
         --set "global.fileClient.type=${FILE_CLIENT_TYPE}"
         --set "global.secretName=${APP_SECRET_NAME}"
-        --set "processor.config.modelGateways.default.url=http://unused-default-gateway:8000"
         --set "processor.config.modelGateways.${VLLM_SIM_MODEL}.url=${vllm_sim_url}"
         --set "processor.config.modelGateways.${VLLM_SIM_MODEL}.requestTimeout=5m"
         --set "processor.config.modelGateways.${VLLM_SIM_MODEL}.maxRetries=3"
@@ -835,9 +842,10 @@ install_batch_gateway() {
         --set "global.otel.insecure=true"
         --set "global.otel.redisTracing=true"
         --set "global.otel.postgresqlTracing=true"
-        --set "global.databaseType=postgresql"
+        --set "global.dbClient.type=postgresql"
         --set "apiserver.config.enablePprof=true"
         --set "processor.config.enablePprof=true"
+        --set "processor.resources.requests.memory=256Mi"
         --set "gc.enabled=true"
         --set "gc.image.pullPolicy=IfNotPresent"
         --set "gc.image.tag=${DEV_VERSION}"
@@ -1014,6 +1022,21 @@ spec:
     port: 3000
     targetPort: 3000
     nodePort: ${GRAFANA_NODE_PORT}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ${MINIO_NAME}-nodeport
+spec:
+  type: NodePort
+  selector:
+    app: ${MINIO_NAME}
+  ports:
+  - name: api
+    protocol: TCP
+    port: 9000
+    targetPort: 9000
+    nodePort: ${MINIO_NODE_PORT}
 EOF
 
     log "NodePort services created."
@@ -1115,9 +1138,10 @@ main() {
     install_postgresql
     create_secret
     create_tls_secret
-    if [ "${FILE_CLIENT_TYPE}" = "s3" ]; then
-        install_minio
-    else
+    # MinIO is always installed so that S3 integration tests can run
+    # against the dev cluster regardless of the batch file client type.
+    install_minio
+    if [ "${FILE_CLIENT_TYPE}" != "s3" ]; then
         create_pvc
     fi
     load_images

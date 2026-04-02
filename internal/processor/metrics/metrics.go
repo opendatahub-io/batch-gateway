@@ -45,10 +45,12 @@ const (
 	// - If data inconsistency, use ReasonDBInconsistency
 	// - If retryable backend error, use ReasonDBTransient
 	// - If not runnable, use ReasonNotRunnableState
+	// - If semaphore guard triggered graceful shutdown, use ReasonGuardShutdown
 	// - Otherwise, fall back to ReasonSystemError
 
 	// Reason labels
 	ReasonSystemError      = "system_error"       // unexpected internal errors (panic, serialization failure, invariant violation)
+	ReasonGuardShutdown    = "guard_shutdown"     // semaphore double-release guard triggered graceful shutdown; job re-enqueued
 	ReasonDBTransient      = "db_transient"       // temporary backend/storage error; safe to retry
 	ReasonDBInconsistency  = "db_inconsistency"   // PQ item exists but DB item missing or corrupted
 	ReasonNotRunnableState = "not_runnable_state" // job status is not runnable by processor policy
@@ -91,8 +93,11 @@ var (
 	planBuildDuration             *prometheus.HistogramVec
 	modelInflightRequests         *prometheus.GaugeVec
 	modelRequestExecutionDuration *prometheus.HistogramVec
-	fileUploadRetriesTotal        *prometheus.CounterVec
 	startupRecoveryTotal          *prometheus.CounterVec
+	requestPromptTokensTotal      *prometheus.CounterVec
+	requestGenerationTokensTotal  *prometheus.CounterVec
+	jobE2ELatency                 *prometheus.HistogramVec
+	cancellationTotal             *prometheus.CounterVec
 )
 
 // FileType labels for file upload metrics.
@@ -166,7 +171,7 @@ func InitMetrics(cfg config.ProcessorConfig) error {
 				cfg.ProcessTimeBucket.BucketFactor,
 				cfg.ProcessTimeBucket.BucketCount,
 			),
-		}, []string{"tenantID", "size_bucket"},
+		}, []string{"size_bucket"},
 	)
 
 	// per-model in-flight requests during execution
@@ -201,7 +206,7 @@ func InitMetrics(cfg config.ProcessorConfig) error {
 				cfg.ProcessTimeBucket.BucketFactor,
 				cfg.ProcessTimeBucket.BucketCount,
 			),
-		}, []string{"tenantID", "size_bucket"},
+		}, []string{"size_bucket"},
 	)
 
 	// duration of queue wait time
@@ -214,16 +219,47 @@ func InitMetrics(cfg config.ProcessorConfig) error {
 				cfg.QueueTimeBucket.BucketFactor,
 				cfg.QueueTimeBucket.BucketCount,
 			),
-		}, []string{"tenantID"},
+		}, nil,
 	)
 
-	// upload retries by file type (output / error)
-	fileUploadRetriesTotal = prometheus.NewCounterVec(
+	// per-request prompt token count by model.
+	// Only counted when the inference response includes usage data.
+	requestPromptTokensTotal = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
-			Name: "file_upload_retries_total",
-			Help: "Total number of file upload retry attempts by file type",
+			Name: "batch_request_prompt_tokens_total",
+			Help: "Total prompt tokens consumed by batch inference requests. Only counted when the inference response includes usage data.",
 		},
-		[]string{"file_type"},
+		[]string{"model"},
+	)
+
+	// per-request generation (completion) token count by model.
+	// Only counted when the inference response includes usage data.
+	requestGenerationTokensTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "batch_request_generation_tokens_total",
+			Help: "Total generation tokens produced by batch inference requests. Only counted when the inference response includes usage data.",
+		},
+		[]string{"model"},
+	)
+
+	jobE2ELatency = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name: "batch_job_e2e_latency_seconds",
+			Help: "End-to-end job latency from submission to terminal state (completed, cancelled, expired, failed)",
+			Buckets: prometheus.ExponentialBuckets(
+				cfg.E2ELatencyBucket.BucketStart,
+				cfg.E2ELatencyBucket.BucketFactor,
+				cfg.E2ELatencyBucket.BucketCount,
+			),
+		}, []string{"status"},
+	)
+
+	cancellationTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "batch_cancellation_total",
+			Help: "Total number of batch job cancellations",
+		},
+		[]string{"phase"},
 	)
 
 	// Startup recovery: counts jobs discovered in workdir after a container restart.
@@ -257,8 +293,11 @@ func InitMetrics(cfg config.ProcessorConfig) error {
 		planBuildDuration,
 		modelInflightRequests,
 		modelRequestExecutionDuration,
-		fileUploadRetriesTotal,
 		startupRecoveryTotal,
+		requestPromptTokensTotal,
+		requestGenerationTokensTotal,
+		jobE2ELatency,
+		cancellationTotal,
 	}
 
 	for _, metric := range metricsToRegister {
@@ -276,8 +315,8 @@ func InitMetrics(cfg config.ProcessorConfig) error {
 // Recorder funcs
 
 // RecordQueueWait observes the queue time
-func RecordQueueWaitDuration(duration time.Duration, tenantID string) {
-	jobQueueWaitDuration.WithLabelValues(tenantID).Observe(duration.Seconds())
+func RecordQueueWaitDuration(duration time.Duration) {
+	jobQueueWaitDuration.WithLabelValues().Observe(duration.Seconds())
 }
 
 // RecordJobProcessed increments the total processed jobs count.
@@ -286,8 +325,8 @@ func RecordJobProcessed(result string, reason string) {
 }
 
 // RecordJobProcessingDuration observes the time taken to process a job.
-func RecordJobProcessingDuration(duration time.Duration, tenantID string, sizeBucket string) {
-	jobProcessingDuration.WithLabelValues(tenantID, sizeBucket).Observe(duration.Seconds())
+func RecordJobProcessingDuration(duration time.Duration, sizeBucket string) {
+	jobProcessingDuration.WithLabelValues(sizeBucket).Observe(duration.Seconds())
 }
 
 // IncActiveWorkers increments the gauge for active workers.
@@ -316,8 +355,8 @@ func DecProcessorInflightRequests() {
 }
 
 // RecordPlanBuildDuration observes ingestion plan build duration.
-func RecordPlanBuildDuration(duration time.Duration, tenantID string, sizeBucket string) {
-	planBuildDuration.WithLabelValues(tenantID, sizeBucket).Observe(duration.Seconds())
+func RecordPlanBuildDuration(duration time.Duration, sizeBucket string) {
+	planBuildDuration.WithLabelValues(sizeBucket).Observe(duration.Seconds())
 }
 
 // IncModelInflightRequests increments the in-flight request gauge for a model.
@@ -335,12 +374,43 @@ func RecordModelRequestExecutionDuration(duration time.Duration, model string) {
 	modelRequestExecutionDuration.WithLabelValues(model).Observe(duration.Seconds())
 }
 
-// RecordFileUploadRetry increments the upload retry counter for a given file type.
-func RecordFileUploadRetry(fileType FileType) {
-	fileUploadRetriesTotal.WithLabelValues(string(fileType)).Inc()
-}
-
 // RecordStartupRecovery increments the startup recovery counter.
 func RecordStartupRecovery(status, action string) {
 	startupRecoveryTotal.WithLabelValues(status, action).Inc()
 }
+
+// RecordTokenUsage adds prompt and generation token counts for a model.
+// Only called when the inference response includes a usage object with valid numeric fields.
+func RecordTokenUsage(promptTokens, generationTokens float64, model string) {
+	requestPromptTokensTotal.WithLabelValues(model).Add(promptTokens)
+	requestGenerationTokensTotal.WithLabelValues(model).Add(generationTokens)
+}
+
+// RecordJobE2ELatency observes the full lifecycle duration of a batch job.
+// In the execution path (runJob), the status label reflects the intended terminal state
+// even if the DB write fails. In the polling loop and startup recovery, DB write failures
+// are recorded as E2EStatusFailed to avoid misrepresenting the actual outcome.
+func RecordJobE2ELatency(duration time.Duration, status string) {
+	jobE2ELatency.WithLabelValues(status).Observe(duration.Seconds())
+}
+
+// RecordCancellation increments the cancellation counter for a given phase.
+func RecordCancellation(phase string) {
+	cancellationTotal.WithLabelValues(phase).Inc()
+}
+
+// Cancellation phase labels.
+const (
+	CancelPhaseQueued     = "queued"
+	CancelPhaseInProgress = "in_progress"
+	CancelPhaseFinalizing = "finalizing"
+)
+
+// E2E latency status labels. Must match the terminal states used in
+// job_runner.go, worker.go, and recovery.go.
+const (
+	E2EStatusCompleted = "completed"
+	E2EStatusCancelled = "cancelled"
+	E2EStatusExpired   = "expired"
+	E2EStatusFailed    = "failed"
+)

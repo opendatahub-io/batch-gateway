@@ -22,14 +22,16 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/go-logr/logr"
 	"github.com/google/uuid"
-	"k8s.io/klog/v2"
 
 	"github.com/llm-d-incubation/batch-gateway/internal/processor/metrics"
 	"github.com/llm-d-incubation/batch-gateway/internal/shared/openai"
@@ -53,13 +55,13 @@ type outputWriters struct {
 func (w *outputWriters) write(line []byte, isError bool) error {
 	if isError {
 		w.errorsMu.Lock()
+		defer w.errorsMu.Unlock()
 		_, err := w.errors.Write(line)
-		w.errorsMu.Unlock()
 		return err
 	}
 	w.outputMu.Lock()
+	defer w.outputMu.Unlock()
 	_, err := w.output.Write(line)
-	w.outputMu.Unlock()
 	return err
 }
 
@@ -76,29 +78,69 @@ type outputError struct {
 	Message string `json:"message"`
 }
 
-// executionProgress tracks per-request progress across goroutines
-// and pushes lightweight updates to the status store after every request.
-type executionProgress struct {
-	completed atomic.Int64
-	failed    atomic.Int64
-	total     int64
-	updater   *StatusUpdater
-	jobID     string
+// isSuccess returns true when the output line represents a fully successful request
+// (no non-HTTP error and a 200 HTTP status). HTTP error responses (4xx/5xx) are not
+// considered successful even though they populate the Response field.
+//
+// NOTE: because HTTP errors are written to the output file (not the error file),
+// request_counts.failed may be greater than the number of lines in the error file.
+// This diverges from OpenAI's documented behavior but aligns with the OpenAPI schema
+// (see executeOneRequest for rationale).
+func (o *outputLine) isSuccess() bool {
+	return o.Error == nil && o.Response != nil && o.Response.StatusCode == 200
 }
 
+// progressUpdateInterval is the minimum time between Redis progress updates.
+// Updates within this window are skipped — the next update after the interval
+// will include all accumulated progress. Declared as var so tests can override.
+var progressUpdateInterval = time.Second
+
+// executionProgress tracks per-request progress across goroutines
+// and pushes throttled updates to the status store.
+type executionProgress struct {
+	completed  atomic.Int64
+	failed     atomic.Int64
+	total      int64
+	updater    *StatusUpdater
+	jobID      string
+	lastUpdate atomic.Int64 // unix nanoseconds of last Redis push
+}
+
+// record increments the appropriate counter and pushes a throttled progress
+// update to Redis. Updates are skipped if less than progressUpdateInterval
+// has elapsed since the last push, reducing Redis writes from O(requests)
+// to O(job_duration / interval).
 func (ep *executionProgress) record(ctx context.Context, success bool) {
 	if success {
 		ep.completed.Add(1)
 	} else {
 		ep.failed.Add(1)
 	}
-	// best-effort: status store failure should not block request processing
+	now := time.Now().UnixNano()
+	last := ep.lastUpdate.Load()
+	if now-last < int64(progressUpdateInterval) {
+		return
+	}
+	// Best-effort CAS: if another goroutine raced us, skip this update.
+	if !ep.lastUpdate.CompareAndSwap(last, now) {
+		return
+	}
+	ep.push(ctx)
+}
+
+// flush pushes the final progress to Redis unconditionally, ensuring the
+// last update reflects the true counts regardless of throttling.
+func (ep *executionProgress) flush(ctx context.Context) {
+	ep.push(ctx)
+}
+
+func (ep *executionProgress) push(ctx context.Context) {
 	if err := ep.updater.UpdateProgressCounts(ctx, ep.jobID, &openai.BatchRequestCounts{
 		Total:     ep.total,
 		Completed: ep.completed.Load(),
 		Failed:    ep.failed.Load(),
 	}); err != nil {
-		klog.FromContext(ctx).V(logging.DEBUG).Error(err, "Failed to update progress counts (best-effort)")
+		logr.FromContextOrDiscard(ctx).Error(err, "Failed to update progress counts (best-effort)")
 	}
 }
 
@@ -122,20 +164,16 @@ func (ep *executionProgress) counts() *openai.BatchRequestCounts {
 //   - System error:   (counts, firstErr)      — drain as batch_failed
 //   - Pod shutdown:   (nil, ctx.Err())        — no flush, caller re-enqueues
 
-// inferCtx is cancelled when the user requests batch cancellation. Cancelling it aborts all
+// abortCtx is cancelled when the user requests batch cancellation. Cancelling it aborts all
 // in-flight inference HTTP requests immediately, freeing downstream resources (GPU slots, EPP
-// capacity). inferCtx is derived from sloCtx in the caller so the SLO deadline is also respected.
+// capacity). abortCtx is derived from sloCtx in the caller so the SLO deadline is also respected.
 //
 // Dispatch abort relies solely on context cancellation (checkAbortCondition checks ctx.Err()).
 // The cancelRequested flag is NOT polled to stop dispatch; it is only consulted in the
 // error-handling path to distinguish the cancellation reason (user cancel vs SLO vs pod shutdown)
 // and to drain undispatched entries with the correct error code.
-func (p *Processor) executeJob(ctx, sloCtx, inferCtx context.Context, params *jobExecutionParams) (*openai.BatchRequestCounts, error) {
-	if params.cancelRequested == nil {
-		params.cancelRequested = &atomic.Bool{}
-	}
-
-	logger := klog.FromContext(ctx)
+func (p *Processor) executeJob(ctx, sloCtx, abortCtx context.Context, params *jobExecutionParams) (*openai.BatchRequestCounts, error) {
+	logger := logr.FromContextOrDiscard(ctx)
 	logger.V(logging.INFO).Info("Starting execution: executing job")
 
 	jobRootDir, err := p.jobRootDir(params.jobInfo.JobID, params.jobInfo.TenantID)
@@ -149,12 +187,13 @@ func (p *Processor) executeJob(ctx, sloCtx, inferCtx context.Context, params *jo
 	}
 
 	// Early SLO check: if the deadline already fired before execution begins (e.g. SLO expired
-	// during ingestion), skip dispatch entirely. No output/error files are written
-	// since no requests were executed. handleExpired will transition the job to expired status.
+	// during ingestion), skip dispatch entirely. No output file is written since no requests
+	// were dispatched, but error.jsonl may already contain model_not_found entries from
+	// ingestion. handleExpired will upload whatever files exist.
 	if sloCtx.Err() == context.DeadlineExceeded {
 		logger.V(logging.INFO).Info("SLO already expired at execution start, skipping dispatch",
 			"total", modelMap.LineCount)
-		return &openai.BatchRequestCounts{Total: modelMap.LineCount}, ErrExpired
+		return &openai.BatchRequestCounts{Total: modelMap.LineCount, Failed: modelMap.RejectedCount}, ErrExpired
 	}
 
 	inputFilePath, err := p.jobInputFilePath(params.jobInfo.JobID, params.jobInfo.TenantID)
@@ -181,7 +220,8 @@ func (p *Processor) executeJob(ctx, sloCtx, inferCtx context.Context, params *jo
 	if err != nil {
 		return nil, err
 	}
-	errorFile, err := os.OpenFile(errorFilePath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	// Append mode: ingestion may have already written model_not_found errors.
+	errorFile, err := os.OpenFile(errorFilePath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create error file: %w", err)
 	}
@@ -199,9 +239,9 @@ func (p *Processor) executeJob(ctx, sloCtx, inferCtx context.Context, params *jo
 
 	// one goroutine per model; concurrency within each model is bounded
 	// by globalSem (processor-wide concurrency limit) and perModelMaxConcurrency (per-model concurrency limit).
-	// execCtx is derived from inferCtx (which itself is derived from sloCtx) so both the SLO
+	// execCtx is derived from abortCtx (which itself is derived from sloCtx) so both the SLO
 	// deadline and user-initiated cancellation propagate to all dispatch loops and inference calls.
-	execCtx, execCancel := context.WithCancel(inferCtx)
+	execCtx, execCancel := context.WithCancel(abortCtx)
 	defer execCancel()
 
 	progress := &executionProgress{
@@ -209,6 +249,8 @@ func (p *Processor) executeJob(ctx, sloCtx, inferCtx context.Context, params *jo
 		updater: params.updater,
 		jobID:   params.jobInfo.JobID,
 	}
+	// Seed with requests already rejected during ingestion (model not found).
+	progress.failed.Store(modelMap.RejectedCount)
 
 	errCh := make(chan error, len(modelMap.SafeToModel))
 
@@ -249,6 +291,10 @@ func (p *Processor) executeJob(ctx, sloCtx, inferCtx context.Context, params *jo
 			firstErr = err
 		}
 	}
+
+	// Push final progress to Redis so the last throttled update doesn't
+	// leave stale counts visible to polling clients.
+	progress.flush(ctx)
 
 	if firstErr != nil {
 		// prefer parent-context / user-cancel errors for correct routing in handleJobError
@@ -313,9 +359,10 @@ func (p *Processor) executeJob(ctx, sloCtx, inferCtx context.Context, params *jo
 // This prevents starving other models — blocking on global only wastes a local slot.
 //
 // Error strategy in this function: when a goroutine encounters a fatal error, modelErr is captured
-// via errOnce but the context is NOT cancelled within this function. Already-dispatched
-// goroutines run to completion. Context cancellation is propagated at the executeJob level
-// (execCancel), which stops dispatch across all models.
+// via errOnce but the context is NOT cancelled within this function. Context cancellation is
+// propagated at the executeJob level (execCancel), which stops dispatch across all models.
+// Already-dispatched goroutines may finish with errors or cancellation rather than successful
+// completion, depending on when execCancel fires.
 func (p *Processor) processModel(
 	ctx context.Context,
 	sloCtx context.Context,
@@ -326,8 +373,8 @@ func (p *Processor) processModel(
 	progress *executionProgress,
 	passThroughHeaders map[string]string,
 ) error {
-	logger := klog.FromContext(ctx).WithValues("model", modelID)
-	ctx = klog.NewContext(ctx, logger)
+	logger := logr.FromContextOrDiscard(ctx).WithValues("model", modelID)
+	ctx = logr.NewContext(ctx, logger)
 
 	planPath := filepath.Join(plansDir, safeModelID+".plan")
 	entries, err := readPlanEntries(planPath)
@@ -337,7 +384,7 @@ func (p *Processor) processModel(
 
 	logger.V(logging.INFO).Info("Processing requests for a model", "numEntries", len(entries))
 
-	modelSem, err := semaphore.New(p.cfg.PerModelMaxConcurrency)
+	modelSem, err := semaphore.New(p.cfg.PerModelMaxConcurrency, p.guardCallback)
 	if err != nil {
 		return fmt.Errorf("failed to create model semaphore: %w", err)
 	}
@@ -374,7 +421,7 @@ dispatch:
 			defer modelSem.Release()
 			defer p.globalSem.Release()
 
-			result, execErr := p.executeOneRequest(ctx, inputFile, entry, modelID, passThroughHeaders)
+			result, execErr := p.executeOneRequest(ctx, sloCtx, inputFile, entry, modelID, passThroughHeaders)
 			if execErr != nil {
 				logger.Error(execErr, "Fatal error executing request", "offset", entry.Offset)
 				errOnce.Do(func() { modelErr = execErr })
@@ -384,7 +431,7 @@ dispatch:
 			// If cancel was requested while this request was in-flight,
 			// overwrite the result as batch_cancelled and write to the error file
 			// so that output lines + error lines == total requests.
-			// Note: inferCtx is already cancelled at this point, so the HTTP
+			// Note: abortCtx is already cancelled at this point, so the HTTP
 			// request was aborted and this goroutine returns almost immediately.
 			if cancelRequested.Load() {
 				result.Response = nil
@@ -408,7 +455,7 @@ dispatch:
 				return
 			}
 
-			progress.record(ctx, result.Error == nil)
+			progress.record(ctx, result.isSuccess())
 
 			lineBytes, marshalErr := json.Marshal(result)
 			if marshalErr != nil {
@@ -418,7 +465,9 @@ dispatch:
 			}
 			lineBytes = append(lineBytes, '\n')
 
-			// Write to error file if the result has an error, otherwise to output file.
+			// Write to error file only for non-HTTP errors (error field populated).
+			// HTTP error responses (4xx/5xx) go to output file since they carry a valid
+			// response object with status_code and body per the OpenAI batch spec.
 			isError := result.Error != nil
 			if writeErr := writers.write(lineBytes, isError); writeErr != nil {
 				kind := "output"
@@ -491,7 +540,7 @@ func (p *Processor) drainUnprocessedRequests(
 	errCode string,
 	errMessage string,
 ) {
-	logger := klog.FromContext(ctx)
+	logger := logr.FromContextOrDiscard(ctx)
 
 	// Allocate a single read buffer sized to the largest entry to avoid per-entry allocations.
 	var maxLen uint32
@@ -540,10 +589,38 @@ func (p *Processor) drainUnprocessedRequests(
 	}
 }
 
+const sloTTFTMSHeader = "x-slo-ttft-ms"
+
+// mergeSLOTTFTIntoHeaders sets sloTTFTMSHeader to the remaining time until sloCtx's deadline
+// in whole milliseconds, clamped to >= 0. If sloCtx has no deadline, is cancelled, or has an
+// expired deadline, the headers map is returned unchanged.
+func mergeSLOTTFTIntoHeaders(headers map[string]string, sloCtx context.Context) map[string]string {
+	if sloCtx.Err() != nil {
+		return headers
+	}
+	dl, ok := sloCtx.Deadline()
+	if !ok {
+		return headers
+	}
+	sloMs := time.Until(dl).Milliseconds()
+	if sloMs < 0 {
+		// this check is needed in case the context deadline was exceeded between the sloCtx.Err() check
+		// and the time.Until call above. We return the headers unchanged to avoid sending a negative value
+		// to the inference gateway.
+		return headers
+	}
+	if headers == nil {
+		headers = make(map[string]string)
+	}
+	headers[sloTTFTMSHeader] = strconv.FormatInt(sloMs, 10)
+	return headers
+}
+
 // executeOneRequest reads a single input line from the input file at the given plan entry offset,
 // sends it to the inference gateway, and returns the formatted output line.
 func (p *Processor) executeOneRequest(
 	ctx context.Context,
+	sloCtx context.Context,
 	inputFile *os.File,
 	entry planEntry,
 	modelID string,
@@ -564,7 +641,7 @@ func (p *Processor) executeOneRequest(
 	// parse the request line into a batch_types.Request object
 	var req batch_types.Request
 	if err := json.Unmarshal(trimmed, &req); err != nil {
-		klog.FromContext(ctx).Error(err, "failed to parse request line, recording as error")
+		logr.FromContextOrDiscard(ctx).Error(err, "failed to parse request line, recording as error")
 		return &outputLine{
 			ID: newBatchRequestID(requestID),
 			Error: &outputError{
@@ -575,13 +652,50 @@ func (p *Processor) executeOneRequest(
 	}
 
 	// model id, job id and tenant id are already set in the context
-	logger := klog.FromContext(ctx).WithValues("customId", req.CustomID, "requestId", requestID)
+	logger := logr.FromContextOrDiscard(ctx).WithValues("customId", req.CustomID, "requestId", requestID)
+
+	// Per-model mode rejects unregistered models at ingestion (fast path). ClientFor can
+	// still return nil after gateway config changes between ingestion and execution, or
+	// during recovery when model_map/plan files predate the current resolver — treat as
+	// a request-level error so the rest of the batch can complete.
+	inferClient := p.inference.ClientFor(modelID)
+	if inferClient == nil {
+		logger.V(logging.INFO).Info("ClientFor returned nil during execution (expected rejection at ingestion)",
+			"model", modelID)
+		result := &outputLine{
+			ID:       newBatchRequestID(requestID),
+			CustomID: req.CustomID,
+			Error: &outputError{
+				Code:    inference.ErrCodeModelNotFound,
+				Message: fmt.Sprintf("model %q is not configured in any gateway", modelID),
+			},
+		}
+		metrics.RecordRequestError(modelID)
+		return result, nil
+	}
+
+	headers := maps.Clone(passThroughHeaders)
+	headers = mergeSLOTTFTIntoHeaders(headers, sloCtx)
 
 	inferReq := &inference.GenerateRequest{
 		RequestID: newBatchRequestID(requestID),
 		Endpoint:  req.URL,
 		Params:    req.Body,
-		Headers:   passThroughHeaders,
+		Headers:   headers,
+	}
+
+	if sloCtx.Err() == context.DeadlineExceeded {
+		logger.V(logging.INFO).Info("SLO expired during execution, skipping request", "error", sloCtx.Err())
+		result := &outputLine{
+			ID:       newBatchRequestID(requestID),
+			CustomID: req.CustomID,
+			Error: &outputError{
+				Code:    batch_types.ErrCodeBatchExpired,
+				Message: "This request could not be executed before the completion window expired.",
+			},
+		}
+		metrics.RecordRequestError(modelID)
+		return result, nil
 	}
 
 	start := time.Now()
@@ -589,7 +703,6 @@ func (p *Processor) executeOneRequest(
 	metrics.IncModelInflightRequests(modelID)
 	logger.V(logging.TRACE).Info("Dispatching inference request")
 
-	inferClient := p.inference.ClientFor(modelID)
 	inferResp, inferErr := inferClient.Generate(ctx, inferReq)
 
 	metrics.DecModelInflightRequests(modelID)
@@ -601,20 +714,53 @@ func (p *Processor) executeOneRequest(
 		CustomID: req.CustomID,
 	}
 
-	// response handling by case
+	// Response handling by case.
+	//
+	// Design note: HTTP errors (4xx/5xx) are written to the output file with their
+	// status code and body, rather than the error file. The OpenAI Batch API guides
+	// describe output_file_id as containing "successfully executed requests", but
+	// the OpenAPI schema defines the error field as "for requests that failed with a
+	// non-HTTP error", implying HTTP errors belong in the response. We follow the
+	// schema interpretation here, as it preserves the HTTP status code and body for
+	// callers to inspect.
 	if inferErr != nil {
-		// error is returned by the inference client
 		logger.V(logging.DEBUG).Info("Inference request failed", "error", inferErr.Message)
-		result.Error = &outputError{
-			Code:    string(inferErr.Category),
-			Message: inferErr.Message,
+		if inferErr.StatusCode > 0 {
+			// HTTP error (4xx/5xx) — populate response with status code and original body
+			// per OpenAI spec, error field is only for non-HTTP errors
+			// Ensure body is always a non-nil object to satisfy the OpenAI schema (type: object).
+			body := make(map[string]interface{})
+			if len(inferErr.ResponseBody) > 0 {
+				if err := json.Unmarshal(inferErr.ResponseBody, &body); err != nil {
+					// Non-JSON response body cannot be placed directly into a JSON object field,
+					// so we wrap it in a synthetic error structure to preserve the content.
+					body = map[string]interface{}{
+						"error": map[string]interface{}{
+							"message": string(inferErr.ResponseBody),
+							"type":    inferErr.OpenAIErrorType(),
+						},
+					}
+				}
+			}
+			result.Response = &batch_types.ResponseData{
+				StatusCode: inferErr.StatusCode,
+				RequestID:  inferReq.RequestID,
+				Body:       body,
+			}
+		} else {
+			// Non-HTTP error (network, timeout, etc.)
+			result.Error = &outputError{
+				Code:    string(inferErr.Category),
+				Message: inferErr.Message,
+			}
 		}
 	} else if inferResp == nil {
 		// ok status without error but no response
-		logger.Error(nil, "inference returned no error but response is nil")
+		err := fmt.Errorf("inference returned no error but response is nil")
+		logger.Error(err, "Inference request failed")
 		result.Error = &outputError{
 			Code:    string(httpclient.ErrCategoryServer),
-			Message: "inference returned no error but response is nil",
+			Message: err.Error(),
 		}
 	} else {
 		// success — unmarshal the response body
@@ -636,13 +782,56 @@ func (p *Processor) executeOneRequest(
 				RequestID:  inferResp.RequestID,
 				Body:       body,
 			}
+			recordTokenUsageFromBody(body, modelID, logger)
 		}
 	}
 
-	if result.Error != nil {
+	if !result.isSuccess() {
 		metrics.RecordRequestError(modelID)
 	}
 	return result, nil
+}
+
+// recordTokenUsageFromBody extracts prompt and completion token counts from the
+// inference response body and records them as metrics. Skips if the usage object
+// is absent, if neither prompt_tokens nor completion_tokens is a valid numeric value,
+// or if either one is negative.
+func recordTokenUsageFromBody(body map[string]interface{}, model string, logger logr.Logger) {
+	usage, ok := body["usage"].(map[string]interface{})
+	if !ok {
+		logger.V(logging.DEBUG).Info("Inference response missing usage data, skipping token metrics")
+		return
+	}
+	prompt, promptOK := jsonNumericToFloat64(usage["prompt_tokens"])
+	completion, completionOK := jsonNumericToFloat64(usage["completion_tokens"])
+	if !promptOK && !completionOK {
+		logger.V(logging.DEBUG).Info("Inference response usage has no numeric token fields, skipping token metrics")
+		return
+	}
+	// Prometheus Counter.Add() panics on negative values. Guard against non-conforming
+	// inference backends that might return negative token counts.
+	if prompt < 0 || completion < 0 {
+		logger.V(logging.DEBUG).Info("Inference response usage has negative token values, skipping token metrics",
+			"prompt_tokens", prompt, "completion_tokens", completion)
+		return
+	}
+	metrics.RecordTokenUsage(prompt, completion, model)
+}
+
+func jsonNumericToFloat64(v interface{}) (float64, bool) {
+	switch n := v.(type) {
+	case float64:
+		return n, true
+	case int:
+		return float64(n), true
+	case int64:
+		return float64(n), true
+	case json.Number:
+		f, err := n.Float64()
+		return f, err == nil
+	default:
+		return 0, false
+	}
 }
 
 // newBatchRequestID formats requestID into the "batch_req_<uuid>" form required by the

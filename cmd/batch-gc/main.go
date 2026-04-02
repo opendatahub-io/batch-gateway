@@ -26,13 +26,17 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/go-logr/logr"
 	"k8s.io/klog/v2"
 
 	db "github.com/llm-d-incubation/batch-gateway/internal/database/api"
 	fsapi "github.com/llm-d-incubation/batch-gateway/internal/files_store/api"
+	"github.com/llm-d-incubation/batch-gateway/internal/files_store/retryclient"
+	fstracing "github.com/llm-d-incubation/batch-gateway/internal/files_store/tracing"
 	"github.com/llm-d-incubation/batch-gateway/internal/gc/collector"
 	gcconfig "github.com/llm-d-incubation/batch-gateway/internal/gc/config"
 	"github.com/llm-d-incubation/batch-gateway/internal/util/clientset"
+	ucom "github.com/llm-d-incubation/batch-gateway/internal/util/com"
 	"github.com/llm-d-incubation/batch-gateway/internal/util/interrupt"
 )
 
@@ -40,16 +44,14 @@ func main() {
 	defer klog.Flush()
 
 	if err := run(); err != nil {
-		klog.ErrorS(err, "Garbage collector failed")
-		klog.Flush()
-		os.Exit(1)
+		klog.Fatalf("Garbage collector failed: %v", err)
 	}
 }
 
 func run() error {
 	hostname, _ := os.Hostname()
-	logger := klog.Background().WithValues("hostname", hostname, "service", "batch-gc")
-	ctx := klog.NewContext(context.Background(), logger)
+	logger := klog.NewKlogr().WithValues("hostname", hostname, "service", "batch-gc")
+	ctx := logr.NewContext(context.Background(), logger)
 
 	flagSet := flag.NewFlagSet("batch-gc", flag.ExitOnError)
 	configFile := flagSet.String("config", "./config.yaml", "path to YAML config file")
@@ -78,17 +80,21 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("failed to initialize files storage client: %w", err)
 	}
+	if cfg.FileClientCfg.Retry.MaxRetries > 0 {
+		filesClient = retryclient.New(filesClient, cfg.FileClientCfg.Retry, ucom.ComponentGC)
+	}
+	filesClient = fstracing.Wrap(filesClient, cfg.FileClientCfg.Type)
 	defer func() { _ = filesClient.Close() }()
 
 	var batchDB db.BatchDBClient
 	var fileDB db.FileDBClient
-	switch cfg.DatabaseType {
+	switch cfg.DBClientCfg.Type {
 	case "redis":
-		batchDB, fileDB, err = clientset.NewRedisDBClients(ctx, &cfg.RedisCfg)
+		batchDB, fileDB, err = clientset.NewRedisDBClients(ctx, &cfg.DBClientCfg.RedisCfg)
 	case "postgresql":
-		batchDB, fileDB, err = clientset.NewPostgreSQLDBClients(ctx, &cfg.PostgreSQLCfg)
+		batchDB, fileDB, err = clientset.NewPostgreSQLDBClients(ctx, &cfg.DBClientCfg.PostgreSQLCfg)
 	default:
-		return fmt.Errorf("unsupported database_type: %s", cfg.DatabaseType)
+		return fmt.Errorf("unsupported db_client.type: %s", cfg.DBClientCfg.Type)
 	}
 
 	if err != nil {
@@ -97,7 +103,7 @@ func run() error {
 	defer func() { _ = batchDB.Close() }()
 	defer func() { _ = fileDB.Close() }()
 
-	gc := collector.NewGarbageCollector(batchDB, fileDB, filesClient, cfg.DryRun, cfg.Interval, nil)
+	gc := collector.NewGarbageCollector(batchDB, fileDB, filesClient, cfg.DryRun, cfg.Interval, cfg.MaxConcurrency, nil)
 
 	if err := gc.RunLoop(ctx); err != nil && ctx.Err() == nil {
 		return fmt.Errorf("garbage collector failed: %w", err)
