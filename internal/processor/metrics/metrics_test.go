@@ -24,23 +24,101 @@ import (
 	dto "github.com/prometheus/client_model/go"
 )
 
-// replace with a new registry for every test
 func withIsolatedPromRegistry(t *testing.T, fn func(reg *prometheus.Registry)) {
 	t.Helper()
-
-	oldReg := prometheus.DefaultRegisterer
-	oldGather := prometheus.DefaultGatherer
-
+	oldReg, oldGather := prometheus.DefaultRegisterer, prometheus.DefaultGatherer
 	reg := prometheus.NewRegistry()
 	prometheus.DefaultRegisterer = reg
 	prometheus.DefaultGatherer = reg
-
 	t.Cleanup(func() {
 		prometheus.DefaultRegisterer = oldReg
 		prometheus.DefaultGatherer = oldGather
 	})
-
 	fn(reg)
+}
+
+func collectFamilies(t *testing.T, reg *prometheus.Registry) map[string]*dto.MetricFamily {
+	t.Helper()
+	mfs, err := reg.Gather()
+	if err != nil {
+		t.Fatalf("Gather: %v", err)
+	}
+	out := make(map[string]*dto.MetricFamily, len(mfs))
+	for _, mf := range mfs {
+		out[mf.GetName()] = mf
+	}
+	return out
+}
+
+func labelNamesOf(m *dto.Metric) []string {
+	if m == nil || len(m.Label) == 0 {
+		return nil
+	}
+	names := make([]string, len(m.Label))
+	for i, lp := range m.Label {
+		names[i] = lp.GetName()
+	}
+	return names
+}
+
+func assertLabelNames(t *testing.T, mf *dto.MetricFamily, want []string) {
+	t.Helper()
+	if mf == nil || len(mf.Metric) == 0 {
+		t.Fatal("empty metric family")
+	}
+	got := labelNamesOf(mf.Metric[0])
+	if len(got) != len(want) {
+		t.Fatalf("labels=%v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("labels=%v, want %v", got, want)
+		}
+	}
+}
+
+func gaugeValue(mf *dto.MetricFamily) float64 {
+	if mf == nil || len(mf.Metric) != 1 {
+		return -1
+	}
+	return mf.Metric[0].GetGauge().GetValue()
+}
+
+func counterWithLabels(mf *dto.MetricFamily, want map[string]string) float64 {
+	if mf == nil {
+		return -1
+	}
+outer:
+	for _, m := range mf.Metric {
+		for k, v := range want {
+			var got string
+			for _, lp := range m.Label {
+				if lp.GetName() == k {
+					got = lp.GetValue()
+					break
+				}
+			}
+			if got != v {
+				continue outer
+			}
+		}
+		return m.GetCounter().GetValue()
+	}
+	return -1
+}
+
+func gaugeWithLabel(mf *dto.MetricFamily, label, value string) float64 {
+	if mf == nil {
+		return -1
+	}
+	for _, m := range mf.Metric {
+		for _, lp := range m.Label {
+			if lp.GetName() == label && lp.GetValue() == value {
+				return m.GetGauge().GetValue()
+			}
+		}
+	}
+	return -1
 }
 
 func TestGetSizeBucket(t *testing.T) {
@@ -59,10 +137,8 @@ func TestGetSizeBucket(t *testing.T) {
 		{30000, BucketLarge},
 		{999999, BucketLarge},
 	}
-
 	for _, tc := range cases {
-		got := GetSizeBucket(tc.lines)
-		if got != tc.want {
+		if got := GetSizeBucket(tc.lines); got != tc.want {
 			t.Fatalf("GetSizeBucket(%d)=%q, want %q", tc.lines, got, tc.want)
 		}
 	}
@@ -74,246 +150,186 @@ func TestInitMetrics_AndRecorders(t *testing.T) {
 		cfg.NumWorkers = 7
 
 		if err := InitMetrics(cfg); err != nil {
-			t.Fatalf("InitMetrics() error: %v", err)
+			t.Fatalf("InitMetrics: %v", err)
 		}
 
-		// recorder calls
 		RecordJobProcessed(ResultSuccess, ReasonNone)
 		RecordJobProcessed(ResultFailed, ReasonSystemError)
-
-		RecordQueueWaitDuration(250*time.Millisecond, "tenantA")
-		RecordJobProcessingDuration(1500*time.Millisecond, "tenantA", Bucket1000)
-
+		RecordQueueWaitDuration(250 * time.Millisecond)
+		RecordJobProcessingDuration(1500*time.Millisecond, Bucket1000)
 		IncActiveWorkers()
 		IncActiveWorkers()
 		DecActiveWorkers()
-
 		RecordRequestError("test")
 		RecordRequestError("test")
 		IncProcessorInflightRequests()
 		IncProcessorInflightRequests()
 		DecProcessorInflightRequests()
-		RecordPlanBuildDuration(2*time.Second, "tenantA", Bucket1000)
+		RecordPlanBuildDuration(2*time.Second, Bucket1000)
 		IncModelInflightRequests("modelA")
 		IncModelInflightRequests("modelA")
 		DecModelInflightRequests("modelA")
 		RecordModelRequestExecutionDuration(300*time.Millisecond, "modelA")
-		RecordFileUploadRetry(FileTypeOutput)
-		RecordFileUploadRetry(FileTypeOutput)
-		RecordFileUploadRetry(FileTypeError)
 
-		// gather + value check
-		mfs, err := reg.Gather()
-		if err != nil {
-			t.Fatalf("Gather() error: %v", err)
+		f := collectFamilies(t, reg)
+
+		if v := gaugeValue(f["total_workers"]); v != float64(cfg.NumWorkers) {
+			t.Fatalf("total_workers=%v, want %v", v, cfg.NumWorkers)
+		}
+		if v := gaugeValue(f["active_workers"]); v != 1 {
+			t.Fatalf("active_workers=%v, want 1", v)
+		}
+		if v := gaugeValue(f["processor_inflight_requests"]); v != 1 {
+			t.Fatalf("processor_inflight_requests=%v, want 1", v)
+		}
+		if v := gaugeValue(f["processor_max_inflight_concurrency"]); v != float64(cfg.GlobalConcurrency) {
+			t.Fatalf("processor_max_inflight_concurrency=%v, want %v", v, cfg.GlobalConcurrency)
 		}
 
-		// helpers
-		find := func(name string) *dto.MetricFamily {
-			for _, mf := range mfs {
-				if mf.GetName() == name {
-					return mf
-				}
-			}
-			return nil
+		if v := counterWithLabels(f["jobs_processed_total"], map[string]string{"result": ResultSuccess, "reason": ReasonNone}); v != 1 {
+			t.Fatalf("jobs_processed success/none=%v, want 1", v)
+		}
+		if v := counterWithLabels(f["jobs_processed_total"], map[string]string{"result": ResultFailed, "reason": ReasonSystemError}); v != 1 {
+			t.Fatalf("jobs_processed failed/system_error=%v, want 1", v)
+		}
+		if v := counterWithLabels(f["request_errors_by_model_total"], map[string]string{"model": "test"}); v != 2 {
+			t.Fatalf("request_errors_by_model_total=%v, want 2", v)
+		}
+		if v := gaugeWithLabel(f["model_inflight_requests"], "model", "modelA"); v != 1 {
+			t.Fatalf("model_inflight_requests{modelA}=%v, want 1", v)
 		}
 
-		// total_workers gauge == cfg.NumWorkers
-		{
-			mf := find("total_workers")
-			if mf == nil || len(mf.Metric) != 1 {
-				t.Fatalf("total_workers metric not found or invalid")
-			}
-			got := mf.Metric[0].GetGauge().GetValue()
-			if got != float64(cfg.NumWorkers) {
-				t.Fatalf("total_workers=%v, want %v", got, float64(cfg.NumWorkers))
-			}
-		}
+		// No high-cardinality tenant label on these histograms (regression guard).
+		assertLabelNames(t, f["job_queue_wait_duration_seconds"], nil)
+		assertLabelNames(t, f["job_processing_duration_seconds"], []string{"size_bucket"})
+		assertLabelNames(t, f["plan_build_duration_seconds"], []string{"size_bucket"})
 
-		// active_workers gauge == 1 (2 inc, 1 dec)
-		{
-			mf := find("active_workers")
-			if mf == nil || len(mf.Metric) != 1 {
-				t.Fatalf("active_workers metric not found or invalid")
-			}
-			got := mf.Metric[0].GetGauge().GetValue()
-			if got != 1 {
-				t.Fatalf("active_workers=%v, want %v", got, 1)
-			}
-		}
-
-		// jobs_processed_total counter: (success/none)=1, (failed/system_error)=1
-		{
-			mf := find("jobs_processed_total")
-			if mf == nil {
-				t.Fatalf("jobs_processed_total not found")
-			}
-			// label match > count check
-			var successNone, failedSys float64
-			for _, m := range mf.Metric {
-				var result, reason string
-				for _, lp := range m.Label {
-					if lp.GetName() == "result" {
-						result = lp.GetValue()
-					}
-					if lp.GetName() == "reason" {
-						reason = lp.GetValue()
-					}
-				}
-				val := m.GetCounter().GetValue()
-				if result == ResultSuccess && reason == ReasonNone {
-					successNone = val
-				}
-				if result == ResultFailed && reason == ReasonSystemError {
-					failedSys = val
-				}
-			}
-			if successNone != 1 {
-				t.Fatalf("jobs_processed_total{result=%q,reason=%q}=%v, want 1", ResultSuccess, ReasonNone, successNone)
-			}
-			if failedSys != 1 {
-				t.Fatalf("jobs_processed_total{result=%q,reason=%q}=%v, want 1", ResultFailed, ReasonSystemError, failedSys)
-			}
-		}
-
-		{
-			mf := find("request_errors_by_model_total")
-			if mf == nil {
-				t.Fatalf("request_errors_by_model_total not found")
-			}
-			var got float64
-			for _, m := range mf.Metric {
-				var model string
-				for _, lp := range m.Label {
-					if lp.GetName() == "model" {
-						model = lp.GetValue()
-					}
-				}
-				if model == "test" {
-					got = m.GetCounter().GetValue()
-				}
-			}
-			if got != 2 {
-				t.Fatalf("request_errors_by_model_total{model=%q}=%v, want 2", "test", got)
-			}
-		}
-
-		// histogram minimal observation check
-		{
-			mf := find("job_queue_wait_duration_seconds")
+		for _, name := range []string{
+			"job_queue_wait_duration_seconds",
+			"job_processing_duration_seconds",
+			"plan_build_duration_seconds",
+			"model_request_execution_duration_seconds",
+		} {
+			mf := f[name]
 			if mf == nil || len(mf.Metric) == 0 {
-				t.Fatalf("job_queue_wait_duration_seconds not found")
+				t.Fatalf("%s: missing or empty", name)
 			}
 			if mf.Metric[0].GetHistogram().GetSampleCount() < 1 {
-				t.Fatalf("expected at least 1 observation")
-			}
-		}
-		{
-			mf := find("job_processing_duration_seconds")
-			if mf == nil {
-				t.Fatalf("job_processing_duration_seconds not found")
-			}
-			if len(mf.Metric) == 0 {
-				t.Fatalf("job_processing_duration_seconds has no metrics")
-			}
-		}
-		{
-			mf := find("processor_inflight_requests")
-			if mf == nil || len(mf.Metric) != 1 {
-				t.Fatalf("processor_inflight_requests metric not found or invalid")
-			}
-			got := mf.Metric[0].GetGauge().GetValue()
-			if got != 1 {
-				t.Fatalf("processor_inflight_requests=%v, want %v", got, 1)
-			}
-		}
-		{
-			mf := find("plan_build_duration_seconds")
-			if mf == nil || len(mf.Metric) == 0 {
-				t.Fatalf("plan_build_duration_seconds not found")
-			}
-			if mf.Metric[0].GetHistogram().GetSampleCount() < 1 {
-				t.Fatalf("expected at least 1 observation for plan_build_duration_seconds")
-			}
-		}
-		{
-			mf := find("model_inflight_requests")
-			if mf == nil || len(mf.Metric) == 0 {
-				t.Fatalf("model_inflight_requests not found")
-			}
-			var got float64
-			for _, m := range mf.Metric {
-				var model string
-				for _, lp := range m.Label {
-					if lp.GetName() == "model" {
-						model = lp.GetValue()
-					}
-				}
-				if model == "modelA" {
-					got = m.GetGauge().GetValue()
-				}
-			}
-			if got != 1 {
-				t.Fatalf("model_inflight_requests{model=%q}=%v, want 1", "modelA", got)
-			}
-		}
-		{
-			mf := find("model_request_execution_duration_seconds")
-			if mf == nil || len(mf.Metric) == 0 {
-				t.Fatalf("model_request_execution_duration_seconds not found")
-			}
-			if mf.Metric[0].GetHistogram().GetSampleCount() < 1 {
-				t.Fatalf("expected at least 1 observation for model_request_execution_duration_seconds")
-			}
-		}
-		{
-			mf := find("file_upload_retries_total")
-			if mf == nil {
-				t.Fatalf("file_upload_retries_total not found")
-			}
-			var outputRetries, errorRetries float64
-			for _, m := range mf.Metric {
-				for _, lp := range m.Label {
-					if lp.GetName() == "file_type" {
-						switch lp.GetValue() {
-						case string(FileTypeOutput):
-							outputRetries = m.GetCounter().GetValue()
-						case string(FileTypeError):
-							errorRetries = m.GetCounter().GetValue()
-						}
-					}
-				}
-			}
-			if outputRetries != 2 {
-				t.Fatalf("file_upload_retries_total{file_type=%q}=%v, want 2", FileTypeOutput, outputRetries)
-			}
-			if errorRetries != 1 {
-				t.Fatalf("file_upload_retries_total{file_type=%q}=%v, want 1", FileTypeError, errorRetries)
-			}
-		}
-		{
-			mf := find("processor_max_inflight_concurrency")
-			if mf == nil || len(mf.Metric) != 1 {
-				t.Fatalf("processor_max_inflight_concurrency metric not found or invalid")
-			}
-			got := mf.Metric[0].GetGauge().GetValue()
-			if got != float64(cfg.GlobalConcurrency) {
-				t.Fatalf("processor_max_inflight_concurrency=%v, want %v", got, float64(cfg.GlobalConcurrency))
+				t.Fatalf("%s: expected ≥1 observation", name)
 			}
 		}
 	})
 }
 
-func TestInitMetrics_Twice_DoesNotError(t *testing.T) {
+func histogramSampleCount(mf *dto.MetricFamily, labels map[string]string) uint64 {
+	if mf == nil {
+		return 0
+	}
+	for _, m := range mf.Metric {
+		match := true
+		for k, v := range labels {
+			found := false
+			for _, lp := range m.Label {
+				if lp.GetName() == k && lp.GetValue() == v {
+					found = true
+					break
+				}
+			}
+			if !found {
+				match = false
+				break
+			}
+		}
+		if match {
+			return m.GetHistogram().GetSampleCount()
+		}
+	}
+	return 0
+}
+
+func TestTokenUsageMetrics(t *testing.T) {
 	withIsolatedPromRegistry(t, func(reg *prometheus.Registry) {
 		cfg := *config.NewConfig()
-
 		if err := InitMetrics(cfg); err != nil {
-			t.Fatalf("InitMetrics first error: %v", err)
+			t.Fatalf("InitMetrics: %v", err)
 		}
-		// AlreadyRegisteredError is passed with continue. expect no error.
+
+		RecordTokenUsage(100, 50, "gpt-4")
+		RecordTokenUsage(200, 80, "gpt-4")
+		RecordTokenUsage(50, 30, "llama-3")
+
+		f := collectFamilies(t, reg)
+
+		if v := counterWithLabels(f["batch_request_prompt_tokens_total"], map[string]string{"model": "gpt-4"}); v != 300 {
+			t.Fatalf("prompt_tokens{gpt-4}=%v, want 300", v)
+		}
+		if v := counterWithLabels(f["batch_request_generation_tokens_total"], map[string]string{"model": "gpt-4"}); v != 130 {
+			t.Fatalf("generation_tokens{gpt-4}=%v, want 130", v)
+		}
+		if v := counterWithLabels(f["batch_request_prompt_tokens_total"], map[string]string{"model": "llama-3"}); v != 50 {
+			t.Fatalf("prompt_tokens{llama-3}=%v, want 50", v)
+		}
+
+		assertLabelNames(t, f["batch_request_prompt_tokens_total"], []string{"model"})
+		assertLabelNames(t, f["batch_request_generation_tokens_total"], []string{"model"})
+	})
+}
+
+func TestJobE2ELatencyMetric(t *testing.T) {
+	withIsolatedPromRegistry(t, func(reg *prometheus.Registry) {
+		cfg := *config.NewConfig()
 		if err := InitMetrics(cfg); err != nil {
-			t.Fatalf("InitMetrics second error: %v", err)
+			t.Fatalf("InitMetrics: %v", err)
+		}
+
+		RecordJobE2ELatency(30*time.Second, "completed")
+		RecordJobE2ELatency(10*time.Second, "cancelled")
+
+		f := collectFamilies(t, reg)
+		if c := histogramSampleCount(f["batch_job_e2e_latency_seconds"], map[string]string{"status": "completed"}); c != 1 {
+			t.Fatalf("e2e_latency{completed} sample_count=%d, want 1", c)
+		}
+		if c := histogramSampleCount(f["batch_job_e2e_latency_seconds"], map[string]string{"status": "cancelled"}); c != 1 {
+			t.Fatalf("e2e_latency{cancelled} sample_count=%d, want 1", c)
+		}
+		assertLabelNames(t, f["batch_job_e2e_latency_seconds"], []string{"status"})
+	})
+}
+
+func TestCancellationMetric(t *testing.T) {
+	withIsolatedPromRegistry(t, func(reg *prometheus.Registry) {
+		cfg := *config.NewConfig()
+		if err := InitMetrics(cfg); err != nil {
+			t.Fatalf("InitMetrics: %v", err)
+		}
+
+		RecordCancellation(CancelPhaseQueued)
+		RecordCancellation(CancelPhaseInProgress)
+		RecordCancellation(CancelPhaseInProgress)
+		RecordCancellation(CancelPhaseFinalizing)
+
+		f := collectFamilies(t, reg)
+		if v := counterWithLabels(f["batch_cancellation_total"], map[string]string{"phase": CancelPhaseQueued}); v != 1 {
+			t.Fatalf("cancellation{queued}=%v, want 1", v)
+		}
+		if v := counterWithLabels(f["batch_cancellation_total"], map[string]string{"phase": CancelPhaseInProgress}); v != 2 {
+			t.Fatalf("cancellation{in_progress}=%v, want 2", v)
+		}
+		if v := counterWithLabels(f["batch_cancellation_total"], map[string]string{"phase": CancelPhaseFinalizing}); v != 1 {
+			t.Fatalf("cancellation{finalizing}=%v, want 1", v)
+		}
+		assertLabelNames(t, f["batch_cancellation_total"], []string{"phase"})
+	})
+}
+
+func TestInitMetrics_Twice_DoesNotError(t *testing.T) {
+	withIsolatedPromRegistry(t, func(*prometheus.Registry) {
+		cfg := *config.NewConfig()
+		if err := InitMetrics(cfg); err != nil {
+			t.Fatalf("first InitMetrics: %v", err)
+		}
+		if err := InitMetrics(cfg); err != nil {
+			t.Fatalf("second InitMetrics: %v", err)
 		}
 	})
 }
