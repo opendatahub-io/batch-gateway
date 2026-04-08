@@ -25,6 +25,8 @@ spec:
     value: '{{revision}}'
   - name: output-image
     value: quay.io/redhat-user-workloads/open-data-hub-tenant/temp-batch-gateway-apiserver:on-pr-{{revision}}
+  - name: hermetic
+    value: true
   - name: image-expires-after
     value: 5d
   - name: dockerfile
