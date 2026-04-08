@@ -24,8 +24,6 @@ spec:
     value: '{{revision}}'
   - name: output-image
     value: quay.io/redhat-user-workloads/open-data-hub-tenant/temp-batch-gateway-apiserver:{{revision}}
-  - name: hermetic
-    value: true
   - name: dockerfile
     value: docker/Dockerfile.apiserver.konflux
   pipelineSpec:
