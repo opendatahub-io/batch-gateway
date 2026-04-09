@@ -7,13 +7,13 @@ metadata:
     build.appstudio.redhat.com/target_branch: '{{target_branch}}'
     pipelinesascode.tekton.dev/cancel-in-progress: "false"
     pipelinesascode.tekton.dev/max-keep-runs: "3"
-    pipelinesascode.tekton.dev/on-cel-expression: event == "push" && target_branch == "main"
+    pipelinesascode.tekton.dev/on-cel-expression: event == "push" && target_branch.matches("v[0-9]+[.][0-9]+[.][0-9]+")
   creationTimestamp: null
   labels:
     appstudio.openshift.io/application: opendatahub-poc
-    appstudio.openshift.io/component: temp-batch-gateway-processor
+    appstudio.openshift.io/component: temp-batch-gateway-apiserver
     pipelines.appstudio.openshift.io/type: build
-  name: temp-batch-gateway-processor-on-push
+  name: temp-batch-gateway-apiserver-on-push-release
   namespace: open-data-hub-tenant
 spec:
   params:
@@ -22,13 +22,13 @@ spec:
   - name: revision
     value: '{{revision}}'
   - name: output-image
-    value: quay.io/redhat-user-workloads/open-data-hub-tenant/temp-batch-gateway-processor:odh-dev
+    value: quay.io/redhat-user-workloads/open-data-hub-tenant/temp-batch-gateway-apiserver:{{target_branch}}
   - name: build-platforms
     value:
     - linux/x86_64
     - linux-m2xlarge/arm64
   - name: dockerfile
-    value: docker/Dockerfile.processor.konflux
+    value: docker/Dockerfile.apiserver.konflux
   - name: skip-checks
     value: "false"
   - name: hermetic
@@ -49,7 +49,7 @@ spec:
     - name: pathInRepo
       value: pipelines/multi-arch-container-build.yaml
   taskRunTemplate:
-    serviceAccountName: build-pipeline-temp-batch-gateway-processor
+    serviceAccountName: build-pipeline-temp-batch-gateway-apiserver
   workspaces:
   - name: git-auth
     secret:
