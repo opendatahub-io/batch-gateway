@@ -53,6 +53,10 @@ const (
 	DefaultWriteTimeoutSeconds = 120 // 2 minutes
 	// DefaultIdleTimeoutSeconds for keep-alive connections
 	DefaultIdleTimeoutSeconds = 90
+
+	// Graceful shutdown: max time for http.Server.Shutdown per listener
+	DefaultAPIShutdownTimeoutSeconds           = 60
+	DefaultObservabilityShutdownTimeoutSeconds = 60
 )
 
 type BatchAPIConfig struct {
@@ -113,6 +117,10 @@ type ServerConfig struct {
 	ReadTimeoutSeconds       int64 `yaml:"read_timeout_seconds"`
 	WriteTimeoutSeconds      int64 `yaml:"write_timeout_seconds"`
 	IdleTimeoutSeconds       int64 `yaml:"idle_timeout_seconds"`
+
+	// Graceful shutdown: context timeouts passed to http.Server.Shutdown (seconds)
+	APIShutdownTimeoutSeconds           int64 `yaml:"api_shutdown_timeout_seconds"`
+	ObservabilityShutdownTimeoutSeconds int64 `yaml:"observability_shutdown_timeout_seconds"`
 
 	// API endpoint configurations
 	BatchAPI BatchAPIConfig `yaml:"batch_api"`
@@ -220,6 +228,12 @@ func (c *ServerConfig) applyDefaults() {
 	if c.IdleTimeoutSeconds <= 0 {
 		c.IdleTimeoutSeconds = DefaultIdleTimeoutSeconds
 	}
+	if c.APIShutdownTimeoutSeconds <= 0 {
+		c.APIShutdownTimeoutSeconds = DefaultAPIShutdownTimeoutSeconds
+	}
+	if c.ObservabilityShutdownTimeoutSeconds <= 0 {
+		c.ObservabilityShutdownTimeoutSeconds = DefaultObservabilityShutdownTimeoutSeconds
+	}
 	c.BatchAPI.applyDefaults()
 	c.FileAPI.applyDefaults()
 }
@@ -242,6 +256,23 @@ func (c *ServerConfig) GetWriteTimeoutSeconds() int64 {
 
 func (c *ServerConfig) GetIdleTimeoutSeconds() int64 {
 	return c.IdleTimeoutSeconds
+}
+
+// GetAPIShutdownTimeoutSeconds returns the API server Shutdown context timeout.
+// Non-positive values yield the default (e.g. when ServerConfig was built without Load).
+func (c *ServerConfig) GetAPIShutdownTimeoutSeconds() int64 {
+	if c.APIShutdownTimeoutSeconds <= 0 {
+		return DefaultAPIShutdownTimeoutSeconds
+	}
+	return c.APIShutdownTimeoutSeconds
+}
+
+// GetObservabilityShutdownTimeoutSeconds returns the observability server Shutdown context timeout.
+func (c *ServerConfig) GetObservabilityShutdownTimeoutSeconds() int64 {
+	if c.ObservabilityShutdownTimeoutSeconds <= 0 {
+		return DefaultObservabilityShutdownTimeoutSeconds
+	}
+	return c.ObservabilityShutdownTimeoutSeconds
 }
 
 // GetInputHeader returns the HTTP header name mapped to the given logical key.

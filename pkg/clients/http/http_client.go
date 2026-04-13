@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -41,6 +42,7 @@ const (
 type HTTPClient struct {
 	client    *resty.Client
 	transport *http.Transport // underlying transport (before OTel wrapping)
+	closeOnce sync.Once
 }
 
 // Config holds configuration for the HTTP client
@@ -158,6 +160,22 @@ func NewHTTPClient(config Config, logger logr.Logger) (*HTTPClient, error) {
 		client:    client,
 		transport: transport,
 	}, nil
+}
+
+// Close releases resources held by the client by closing idle connections in the
+// underlying transport. In-flight requests are not interrupted.
+//
+// Close is idempotent and safe to call from multiple goroutines.
+func (c *HTTPClient) Close() error {
+	if c == nil {
+		return nil
+	}
+	c.closeOnce.Do(func() {
+		if c.transport != nil {
+			c.transport.CloseIdleConnections()
+		}
+	})
+	return nil
 }
 
 // Post makes an HTTP POST request with automatic retry logic

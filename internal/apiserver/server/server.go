@@ -230,14 +230,20 @@ func (s *Server) Start(ctx context.Context) error {
 		logger.Info("shutting down", "reason", ctx.Err())
 
 		// Gracefully shutdown both servers
-		shutdownCtx, cancelFn := context.WithTimeout(context.Background(), 60*time.Second)
-		defer cancelFn()
+		apiSd := time.Duration(s.config.GetAPIShutdownTimeoutSeconds()) * time.Second
+		sdApiCtx, cancelApi := context.WithTimeout(context.Background(), apiSd)
+		defer cancelApi()
 
-		if err := obsServer.Shutdown(shutdownCtx); err != nil {
-			logger.Error(err, "failed to gracefully shutdown observability server")
-		}
-		if err := httpserver.Shutdown(shutdownCtx); err != nil {
+		if err := httpserver.Shutdown(sdApiCtx); err != nil {
 			logger.Error(err, "failed to gracefully shutdown API server")
+		}
+
+		obsSd := time.Duration(s.config.GetObservabilityShutdownTimeoutSeconds()) * time.Second
+		sdObsCtx, cancelObs := context.WithTimeout(context.Background(), obsSd)
+		defer cancelObs()
+
+		if err := obsServer.Shutdown(sdObsCtx); err != nil {
+			logger.Error(err, "failed to gracefully shutdown observability server")
 		}
 
 		// Wait for server goroutine to finish with timeout

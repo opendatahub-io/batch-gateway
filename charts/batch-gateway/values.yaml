@@ -96,6 +96,8 @@ global:
 apiserver:
   enabled: true
   replicaCount: 1
+  terminationGracePeriodSeconds: 120
+
   image:
     repository: ghcr.io/llm-d-incubation/batch-gateway-apiserver
     pullPolicy: Always
@@ -188,6 +190,8 @@ apiserver:
     readTimeoutSeconds: 900
     writeTimeoutSeconds: 120
     idleTimeoutSeconds: 90
+    apiShutdownTimeoutSeconds: 60
+    observabilityShutdownTimeoutSeconds: 60
     batchAPI:
       eventTTLSeconds: 2592000
       passThroughHeaders: []

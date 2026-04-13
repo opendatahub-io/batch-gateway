@@ -72,6 +72,20 @@ func TestNewHTTPClient_Defaults(t *testing.T) {
 	if client.transport.ResponseHeaderTimeout != 5*time.Minute {
 		t.Errorf("Expected Transport.ResponseHeaderTimeout=5m (same as default Timeout), got %v", client.transport.ResponseHeaderTimeout)
 	}
+
+	if err := client.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if err := client.Close(); err != nil {
+		t.Fatalf("second Close: %v", err)
+	}
+}
+
+func TestHTTPClient_Close_nilReceiver(t *testing.T) {
+	var c *HTTPClient
+	if err := c.Close(); err != nil {
+		t.Fatalf("Close on nil: %v", err)
+	}
 }
 
 // TestNewHTTPClient_CustomConfig tests NewHTTPClient with custom configuration

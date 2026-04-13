@@ -49,6 +49,22 @@ tests:
           value: 3
         template: templates/apiserver-deployment.yaml
 
+  - it: should set default apiserver terminationGracePeriodSeconds
+    asserts:
+      - equal:
+          path: spec.template.spec.terminationGracePeriodSeconds
+          value: 120
+        template: templates/apiserver-deployment.yaml
+
+  - it: should allow overriding apiserver terminationGracePeriodSeconds
+    set:
+      apiserver.terminationGracePeriodSeconds: 90
+    asserts:
+      - equal:
+          path: spec.template.spec.terminationGracePeriodSeconds
+          value: 90
+        template: templates/apiserver-deployment.yaml
+
   - it: should set processor replicaCount
     set:
       processor.replicaCount: 5

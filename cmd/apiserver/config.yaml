@@ -39,6 +39,11 @@ write_timeout_seconds: 120
 # Default: 90 seconds
 idle_timeout_seconds: 90
 
+# Max time for graceful shutdown of the API and observability HTTP servers (http.Server.Shutdown)
+# Defaults: 60 seconds each; set to 0 or omit to use defaults
+api_shutdown_timeout_seconds: 60
+observability_shutdown_timeout_seconds: 60
+
 # File client configuration
 file_client:
   # Implementation type: "fs" (default), "mock", "s3" (AWS S3)
