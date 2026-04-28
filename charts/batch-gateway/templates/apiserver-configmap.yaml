@@ -21,6 +21,8 @@ data:
     read_timeout_seconds: {{ .Values.apiserver.config.readTimeoutSeconds }}
     write_timeout_seconds: {{ .Values.apiserver.config.writeTimeoutSeconds }}
     idle_timeout_seconds: {{ .Values.apiserver.config.idleTimeoutSeconds }}
+    api_shutdown_timeout_seconds: {{ .Values.apiserver.config.apiShutdownTimeoutSeconds }}
+    observability_shutdown_timeout_seconds: {{ .Values.apiserver.config.observabilityShutdownTimeoutSeconds }}
     db_client:
       type: {{ .Values.global.dbClient.type | quote }}
       redis:

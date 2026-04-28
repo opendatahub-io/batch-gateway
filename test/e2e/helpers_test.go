@@ -21,6 +21,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"os/exec"
 	"strings"
 	"testing"
 	"time"
@@ -34,6 +35,55 @@ func getEnvOrDefault(key, def string) string {
 		return v
 	}
 	return def
+}
+
+// detectDBClientType queries the Helm release for the configured DB client type.
+// Falls back to "postgresql" if the value cannot be detected.
+func detectDBClientType(t *testing.T) string {
+	t.Helper()
+	out, err := exec.Command("helm", "get", "values", testHelmRelease,
+		"-n", testNamespace, "-o", "json",
+	).CombinedOutput()
+	if err != nil {
+		t.Logf("helm get values failed, defaulting to postgresql: %v", err)
+		return "postgresql"
+	}
+	var vals struct {
+		Global struct {
+			DBClient struct {
+				Type string `json:"type"`
+			} `json:"dbClient"`
+		} `json:"global"`
+	}
+	if err := json.Unmarshal(out, &vals); err != nil || vals.Global.DBClient.Type == "" {
+		return "postgresql"
+	}
+	return vals.Global.DBClient.Type
+}
+
+// detectExchangeClientType checks the chart installed for the Redis/Valkey
+// Helm release and returns "valkey" if the chart name starts with "valkey",
+// otherwise "redis".
+func detectExchangeClientType(t *testing.T) string {
+	t.Helper()
+	out, err := exec.Command("helm", "get", "metadata", testRedisRelease,
+		"-n", testNamespace, "-o", "json",
+	).CombinedOutput()
+	if err != nil {
+		t.Logf("helm get metadata %s failed, defaulting to redis: %v", testRedisRelease, err)
+		return "redis"
+	}
+	var meta struct {
+		Chart string `json:"chart"`
+	}
+	if err := json.Unmarshal(out, &meta); err != nil {
+		t.Logf("failed to parse helm metadata, defaulting to redis: %v", err)
+		return "redis"
+	}
+	if strings.HasPrefix(meta.Chart, "valkey") {
+		return "valkey"
+	}
+	return "redis"
 }
 
 // ── Client helpers ───────────────────────────────────────────────────────

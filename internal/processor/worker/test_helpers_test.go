@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -32,8 +33,6 @@ import (
 // ---------------------------------------------------------------------------
 // Common helpers
 // ---------------------------------------------------------------------------
-
-const mockFilesRootDir = "/tmp/batch-gateway-files"
 
 func testLogger(t testing.TB) logr.Logger {
 	return testr.NewWithInterface(t, testr.Options{})
@@ -135,6 +134,33 @@ func (f *failNTimesFilesClient) GetContext(p context.Context, _ time.Duration) (
 	return context.WithCancel(p)
 }
 func (f *failNTimesFilesClient) Close() error { return nil }
+
+// failOnNthCallClient fails the Nth Store call (1-based). All other calls succeed.
+// Thread-safe for concurrent callers.
+type failOnNthCallClient struct {
+	failN   int32
+	calls   atomic.Int32
+	failErr error
+}
+
+func (f *failOnNthCallClient) Store(_ context.Context, _ string, _ string, _, _ int64, _ io.Reader) (*filesapi.BatchFileMetadata, error) {
+	n := f.calls.Add(1)
+	if n == f.failN {
+		return nil, f.failErr
+	}
+	return &filesapi.BatchFileMetadata{Size: 42}, nil
+}
+func (f *failOnNthCallClient) Retrieve(_ context.Context, _, _ string) (io.ReadCloser, *filesapi.BatchFileMetadata, error) {
+	return nil, nil, nil
+}
+func (f *failOnNthCallClient) List(_ context.Context, _ string) ([]filesapi.BatchFileMetadata, error) {
+	return nil, nil
+}
+func (f *failOnNthCallClient) Delete(_ context.Context, _, _ string) error { return nil }
+func (f *failOnNthCallClient) GetContext(p context.Context, _ time.Duration) (context.Context, context.CancelFunc) {
+	return context.WithCancel(p)
+}
+func (f *failOnNthCallClient) Close() error { return nil }
 
 // ---------------------------------------------------------------------------
 // Mock DB error wrappers
@@ -256,6 +282,37 @@ func (s *spyBatchDB) StatusCalls(status openai.BatchStatus) int {
 	return s.calls[status]
 }
 
+// failOnStatusDB wraps a BatchDBClient and injects an error when DBUpdate tries
+// to write a specific status. All other operations pass through.
+type failOnStatusDB struct {
+	inner      db.BatchDBClient
+	failStatus openai.BatchStatus
+	failErr    error
+}
+
+func (f *failOnStatusDB) DBStore(ctx context.Context, item *db.BatchItem) error {
+	return f.inner.DBStore(ctx, item)
+}
+func (f *failOnStatusDB) DBGet(ctx context.Context, query *db.BatchQuery, includeStatic bool, start, limit int) ([]*db.BatchItem, int, bool, error) {
+	return f.inner.DBGet(ctx, query, includeStatic, start, limit)
+}
+func (f *failOnStatusDB) DBUpdate(ctx context.Context, item *db.BatchItem) error {
+	if len(item.Status) > 0 {
+		var st openai.BatchStatusInfo
+		if err := json.Unmarshal(item.Status, &st); err == nil && st.Status == f.failStatus {
+			return f.failErr
+		}
+	}
+	return f.inner.DBUpdate(ctx, item)
+}
+func (f *failOnStatusDB) DBDelete(ctx context.Context, IDs []string) ([]string, error) {
+	return f.inner.DBDelete(ctx, IDs)
+}
+func (f *failOnStatusDB) GetContext(parentCtx context.Context, timeLimit time.Duration) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(parentCtx, timeLimit)
+}
+func (f *failOnStatusDB) Close() error { return f.inner.Close() }
+
 // ---------------------------------------------------------------------------
 // Processor construction helpers
 // ---------------------------------------------------------------------------
@@ -280,11 +337,12 @@ func mustNewProcessor(t *testing.T, cfg *config.ProcessorConfig, clients *client
 	return p
 }
 
-func validProcessorClients() *clientset.Clientset {
+func validProcessorClients(t testing.TB) *clientset.Clientset {
+	t.Helper()
 	return &clientset.Clientset{
 		BatchDB:   newMockBatchDBClient(),
 		FileDB:    newMockFileDBClient(),
-		File:      mockfiles.NewMockBatchFilesClient(),
+		File:      mockfiles.NewMockBatchFilesClient(t.TempDir()),
 		Queue:     mockdb.NewMockBatchPriorityQueueClient(),
 		Status:    mockdb.NewMockBatchStatusClient(),
 		Event:     mockdb.NewMockBatchEventChannelClient(),
@@ -312,7 +370,7 @@ func newTestProcessorEnv(t *testing.T, cfg *config.ProcessorConfig, inferClient 
 	p, err := NewProcessor(cfg, &clientset.Clientset{
 		BatchDB:   dbClient,
 		FileDB:    newMockFileDBClient(),
-		File:      mockfiles.NewMockBatchFilesClient(),
+		File:      mockfiles.NewMockBatchFilesClient(t.TempDir()),
 		Queue:     pqClient,
 		Status:    statusClient,
 		Event:     mockdb.NewMockBatchEventChannelClient(),
@@ -617,13 +675,6 @@ func readNonEmptyJSONLLines(t *testing.T, path string) [][]byte {
 		}
 	}
 	return lines
-}
-
-func cleanMockFilesFolder(t *testing.T, folder string) {
-	t.Helper()
-	target := filepath.Join(mockFilesRootDir, folder)
-	_ = os.RemoveAll(target)
-	t.Cleanup(func() { _ = os.RemoveAll(target) })
 }
 
 func uniqueTestFolder(t *testing.T, base string) string {

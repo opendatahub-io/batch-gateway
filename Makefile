@@ -5,7 +5,7 @@ SHELL := /usr/bin/env bash
 TARGETARCH ?= $(shell go env GOARCH)
 
 # Variables
-DEV_VERSION ?= 0.0.1
+IMAGE_TAG ?= 0.0.1
 APISERVER_BINARY=batch-gateway-apiserver
 PROCESSOR_BINARY=batch-gateway-processor
 GC_BINARY=batch-gateway-gc
@@ -20,11 +20,11 @@ RELEASE_BINARIES := apiserver:$(CMD_APISERVER) processor:$(CMD_PROCESSOR) gc:$(C
 BINARIES_DIR ?= dist/binaries
 RELEASE_DIR ?= release
 APISERVER_IMAGE_TAG_BASE ?= ghcr.io/llm-d-incubation/$(APISERVER_BINARY)
-APISERVER_IMG = $(APISERVER_IMAGE_TAG_BASE):$(DEV_VERSION)
+APISERVER_IMG = $(APISERVER_IMAGE_TAG_BASE):$(IMAGE_TAG)
 PROCESSOR_IMAGE_TAG_BASE ?= ghcr.io/llm-d-incubation/$(PROCESSOR_BINARY)
-PROCESSOR_IMG = $(PROCESSOR_IMAGE_TAG_BASE):$(DEV_VERSION)
+PROCESSOR_IMG = $(PROCESSOR_IMAGE_TAG_BASE):$(IMAGE_TAG)
 GC_IMAGE_TAG_BASE ?= ghcr.io/llm-d-incubation/$(GC_BINARY)
-GC_IMG = $(GC_IMAGE_TAG_BASE):$(DEV_VERSION)
+GC_IMG = $(GC_IMAGE_TAG_BASE):$(IMAGE_TAG)
 GO=go
 GOFLAGS=
 LDFLAGS=-ldflags "-s -w"
@@ -108,12 +108,16 @@ publish-helm-chart:
 	export GITHUB_ACTOR="$(GITHUB_ACTOR)"; \
 	./scripts/publish-helm-chart.sh
 
-## generate-release: Create and push a release tag from main (requires REL_VERSION, e.g. make generate-release REL_VERSION=0.0.1)
+## generate-release: Create and push a release tag (requires REL_VERSION; optional REL_BRANCH=main|release-vX.Y.Z , default main)
 generate-release:
 	@if [ -z "$(REL_VERSION)" ]; then \
 	  echo "Error: REL_VERSION is required. Example: make generate-release REL_VERSION=0.0.1"; exit 1; \
 	fi
-	@./scripts/generate-release.sh $(REL_VERSION)
+	@if [ -n "$(REL_BRANCH)" ]; then \
+	  ./scripts/generate-release.sh $(REL_VERSION) $(REL_BRANCH); \
+	else \
+	  ./scripts/generate-release.sh $(REL_VERSION); \
+	fi
 
 ## run-apiserver: Run the apiserver
 run-apiserver: build-apiserver

@@ -38,6 +38,7 @@ import (
 
 	"github.com/go-logr/logr"
 	"github.com/go-logr/logr/testr"
+	"github.com/go-resty/resty/v2"
 )
 
 func testLogger(t testing.TB) logr.Logger {
@@ -57,6 +58,7 @@ func TestNewHTTPClient_Defaults(t *testing.T) {
 
 	if client == nil {
 		t.Fatal("Expected non-nil client")
+		return
 	}
 
 	// Verify transport settings (defaults should be applied)
@@ -71,6 +73,20 @@ func TestNewHTTPClient_Defaults(t *testing.T) {
 	}
 	if client.transport.ResponseHeaderTimeout != 5*time.Minute {
 		t.Errorf("Expected Transport.ResponseHeaderTimeout=5m (same as default Timeout), got %v", client.transport.ResponseHeaderTimeout)
+	}
+
+	if err := client.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if err := client.Close(); err != nil {
+		t.Fatalf("second Close: %v", err)
+	}
+}
+
+func TestHTTPClient_Close_nilReceiver(t *testing.T) {
+	var c *HTTPClient
+	if err := c.Close(); err != nil {
+		t.Fatalf("Close on nil: %v", err)
 	}
 }
 
@@ -445,6 +461,218 @@ func TestPost_NoRetryOn400(t *testing.T) {
 	}
 }
 
+// TestRetryAfter_429WithRetryAfterHeader tests that 429 responses with Retry-After header
+// are retried after the server-specified delay.
+func TestRetryAfter_429WithRetryAfterHeader(t *testing.T) {
+	tests := []struct {
+		name         string
+		retryAfter   string
+		minElapsed   time.Duration
+		maxElapsed   time.Duration
+		assertTiming bool
+	}{
+		{
+			name:         "seconds format",
+			retryAfter:   "0",
+			maxElapsed:   80 * time.Millisecond,
+			assertTiming: true,
+		},
+		{
+			name:         "HTTP-date format",
+			retryAfter:   time.Now().Add(120 * time.Millisecond).UTC().Format(http.TimeFormat),
+			assertTiming: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var attemptCount atomic.Int32
+
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				count := attemptCount.Add(1)
+				if count < 2 {
+					w.Header().Set("Retry-After", tt.retryAfter)
+					w.WriteHeader(http.StatusTooManyRequests)
+					_, _ = w.Write([]byte(`{"error": {"message": "rate limited"}}`))
+				} else {
+					w.WriteHeader(http.StatusOK)
+					_, _ = w.Write([]byte(`{"result": "success"}`))
+				}
+			}))
+			defer server.Close()
+
+			client, err := NewHTTPClient(Config{
+				BaseURL:        server.URL,
+				MaxRetries:     3,
+				InitialBackoff: 10 * time.Millisecond,
+				MaxBackoff:     100 * time.Millisecond,
+			}, testLogger(t))
+			if err != nil {
+				t.Fatalf("NewHTTPClient failed: %v", err)
+			}
+
+			start := time.Now()
+			_, statusCode, err := client.Post(context.Background(), "/test", nil, nil, "test-retry-after")
+			elapsed := time.Since(start)
+			if err != nil {
+				t.Fatalf("Post failed: %v", err)
+			}
+
+			if statusCode != http.StatusOK {
+				t.Errorf("Expected status 200, got %d", statusCode)
+			}
+
+			if attemptCount.Load() != 2 {
+				t.Errorf("Expected 2 attempts, got %d", attemptCount.Load())
+			}
+			if tt.assertTiming {
+				if tt.minElapsed > 0 && elapsed < tt.minElapsed {
+					t.Errorf("Expected elapsed >= %v, got %v", tt.minElapsed, elapsed)
+				}
+				if tt.maxElapsed > 0 && elapsed > tt.maxElapsed {
+					t.Errorf("Expected elapsed <= %v, got %v", tt.maxElapsed, elapsed)
+				}
+			}
+		})
+	}
+}
+
+// TestRetryAfter_429WithoutHeader tests that 429 responses without Retry-After header
+// still retry with the 429-specific longer backoff.
+func TestRetryAfter_429WithoutHeader(t *testing.T) {
+	var attemptCount atomic.Int32
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		count := attemptCount.Add(1)
+		if count < 2 {
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte(`{"error": {"message": "rate limited"}}`))
+		} else {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"result": "success"}`))
+		}
+	}))
+	defer server.Close()
+
+	client, err := NewHTTPClient(Config{
+		BaseURL:        server.URL,
+		MaxRetries:     3,
+		InitialBackoff: 10 * time.Millisecond,
+		MaxBackoff:     1 * time.Second,
+	}, testLogger(t))
+	if err != nil {
+		t.Fatalf("NewHTTPClient failed: %v", err)
+	}
+
+	_, statusCode, err := client.Post(context.Background(), "/test", nil, nil, "test-429-no-header")
+	if err != nil {
+		t.Fatalf("Post failed: %v", err)
+	}
+
+	if statusCode != http.StatusOK {
+		t.Errorf("Expected status 200, got %d", statusCode)
+	}
+
+	if attemptCount.Load() != 2 {
+		t.Errorf("Expected 2 attempts, got %d", attemptCount.Load())
+	}
+}
+
+// TestRetryAfter_5xxUsesFasterBackoff verifies that the retryAfter function
+// uses a lower max-backoff cap for transient 502/503/504 (maxBackoff/2) than
+// for other 5xx errors (maxBackoff).
+func TestRetryAfter_5xxUsesFasterBackoff(t *testing.T) {
+	const (
+		initialBackoff = 1 * time.Second
+		maxBackoff     = 60 * time.Second
+	)
+
+	retryAfter := newRetryAfterFunc(initialBackoff, maxBackoff)
+
+	makeResp := func(statusCode, attempt int) *resty.Response {
+		return &resty.Response{
+			Request:     &resty.Request{Attempt: attempt},
+			RawResponse: &http.Response{StatusCode: statusCode, Header: http.Header{}},
+		}
+	}
+
+	transientCodes := []int{
+		http.StatusBadGateway,
+		http.StatusServiceUnavailable,
+		http.StatusGatewayTimeout,
+	}
+
+	// The jitter factor is 0.5, so the max returned value for a capped
+	// interval is max * (1 + 0.5) = max * 1.5.
+	transientCeiling := maxBackoff / 2 * 3 / 2 // maxBackoff/2 with +50% jitter
+	standardCeiling := maxBackoff * 3 / 2      // maxBackoff with +50% jitter
+
+	for _, code := range transientCodes {
+		t.Run(fmt.Sprintf("status_%d_capped_at_half_max", code), func(t *testing.T) {
+			for attempt := 1; attempt <= 10; attempt++ {
+				d, _ := retryAfter(nil, makeResp(code, attempt))
+				if d > transientCeiling {
+					t.Errorf("attempt %d: %d backoff %v exceeds transient ceiling %v",
+						attempt, code, d, transientCeiling)
+				}
+			}
+		})
+	}
+
+	t.Run("status_500_reaches_higher_cap", func(t *testing.T) {
+		// At high attempt counts, 500 should sometimes exceed the transient
+		// ceiling since its cap is maxBackoff (not maxBackoff/2).
+		// Run enough iterations to observe this with high probability.
+		var exceeded bool
+		for range 200 {
+			d, _ := retryAfter(nil, makeResp(http.StatusInternalServerError, 10))
+			if d > transientCeiling {
+				exceeded = true
+				break
+			}
+		}
+		if !exceeded {
+			t.Errorf("500 backoff at high attempt never exceeded transient ceiling %v; "+
+				"expected it to reach up to %v", transientCeiling, standardCeiling)
+		}
+	})
+}
+
+// TestParseRetryAfter tests the Retry-After header parsing function.
+func TestParseRetryAfter(t *testing.T) {
+	tests := []struct {
+		name     string
+		value    string
+		wantOK   bool
+		wantZero bool // if wantOK, whether the duration should be zero
+	}{
+		{name: "integer seconds", value: "120", wantOK: true, wantZero: false},
+		{name: "zero seconds", value: "0", wantOK: true, wantZero: true},
+		{name: "HTTP-date future", value: time.Now().Add(10 * time.Second).UTC().Format(http.TimeFormat), wantOK: true, wantZero: false},
+		{name: "HTTP-date past", value: time.Now().Add(-10 * time.Second).UTC().Format(http.TimeFormat), wantOK: true, wantZero: true},
+		{name: "invalid value", value: "abc", wantOK: false},
+		{name: "empty string", value: "", wantOK: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			d, ok := parseRetryAfter(tt.value)
+			if ok != tt.wantOK {
+				t.Fatalf("parseRetryAfter(%q): ok = %v, want %v", tt.value, ok, tt.wantOK)
+			}
+			if !tt.wantOK {
+				return
+			}
+			if tt.wantZero && d != 0 {
+				t.Errorf("Expected zero duration, got %v", d)
+			}
+			if !tt.wantZero && d <= 0 {
+				t.Errorf("Expected positive duration, got %v", d)
+			}
+		})
+	}
+}
+
 // TestHandleErrorResponse_OpenAIFormat tests parsing OpenAI-style error response
 func TestHandleErrorResponse_OpenAIFormat(t *testing.T) {
 	body := []byte(`{"error": {"message": "Invalid API key", "type": "invalid_request_error", "code": "invalid_api_key"}}`)
@@ -454,6 +682,7 @@ func TestHandleErrorResponse_OpenAIFormat(t *testing.T) {
 
 	if clientErr == nil {
 		t.Fatal("Expected non-nil error")
+		return
 	}
 
 	if clientErr.Category != ErrCategoryAuth {
@@ -482,6 +711,7 @@ func TestHandleErrorResponse_PlainText(t *testing.T) {
 
 	if clientErr == nil {
 		t.Fatal("Expected non-nil error")
+		return
 	}
 
 	if clientErr.Category != ErrCategoryServer {
@@ -502,6 +732,7 @@ func TestHandleErrorResponse_EmptyBody(t *testing.T) {
 
 	if clientErr == nil {
 		t.Fatal("Expected non-nil error")
+		return
 	}
 
 	if clientErr.Category != ErrCategoryServer {
@@ -593,6 +824,7 @@ func TestBuildTLSConfig_InsecureSkipVerify(t *testing.T) {
 
 	if tlsConfig == nil {
 		t.Fatal("Expected non-nil TLS config")
+		return
 	}
 
 	if !tlsConfig.InsecureSkipVerify {
@@ -623,6 +855,7 @@ func TestBuildTLSConfig_CustomCA(t *testing.T) {
 
 	if tlsConfig == nil {
 		t.Fatal("Expected non-nil TLS config")
+		return
 	}
 
 	if tlsConfig.RootCAs == nil {
@@ -701,6 +934,7 @@ func TestBuildTLSConfig_TLSVersions(t *testing.T) {
 
 	if tlsConfig == nil {
 		t.Fatal("Expected non-nil TLS config")
+		return
 	}
 
 	if tlsConfig.MinVersion != tls.VersionTLS12 {
@@ -735,6 +969,7 @@ func TestBuildTLSConfig_CombinedOptions(t *testing.T) {
 
 	if tlsConfig == nil {
 		t.Fatal("Expected non-nil TLS config")
+		return
 	}
 
 	if tlsConfig.RootCAs == nil {

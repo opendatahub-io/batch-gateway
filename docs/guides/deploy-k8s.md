@@ -101,7 +101,7 @@ For security and operations readers: **admission on the batch API is not the sam
 - **batch-route** proves the caller has a valid Kubernetes token and applies batch-side **RateLimitPolicy**. Invalid or missing credentials are rejected with **401**; excess batch API traffic is rejected with **429**. It does **not** evaluate whether the caller may use a specific model.
 - **llm-route** runs **authentication and authorization** (SubjectAccessReview on `inferencepools` as above) on each inference request the processor sends through the gateway. A user can create a batch job and still see **per-request failures** (often surfaced as failed lines or job errors) when the llm-route returns **403** — this is **by design**, not a bypass of model access control.
 
-Configure **`passThroughHeaders: {Authorization}`** so the processor forwards the end user’s bearer token on inference calls. Without that, the gateway cannot attribute inference traffic to the original caller and model-level checks cannot run as intended.
+The `Authorization` header is included in `passThroughHeaders` by default, so the processor forwards the end user's bearer token on inference calls automatically. Without it, the gateway cannot attribute inference traffic to the original caller and model-level checks cannot run as intended.
 
 ## 2. Prerequisites
 
@@ -343,7 +343,10 @@ spec:
     port: 80
     allowedRoutes:
       namespaces:
-        from: All
+        from: Selector
+        selector:
+          matchLabels:
+            llm-d.ai/gateway-route: "true"
   - name: https
     protocol: HTTPS
     port: 443
@@ -353,7 +356,10 @@ spec:
       - name: ${GATEWAY_NAME}-tls
     allowedRoutes:
       namespaces:
-        from: All
+        from: Selector
+        selector:
+          matchLabels:
+            llm-d.ai/gateway-route: "true"
 EOF
 
 # wait for gateway instance is ready
@@ -362,6 +368,8 @@ kubectl wait --for=condition=Programmed --timeout=300s \
 ```
 
 > **Note**: The Gateway uses a self-signed certificate from cert-manager (not OpenShift router certs). Access via `kubectl port-forward` with `-k` (insecure) flag on curl.
+
+> **Security**: The Gateway uses `allowedRoutes.namespaces.from: Selector` to restrict HTTPRoute attachment. Only namespaces labeled with `llm-d.ai/gateway-route: "true"` can attach HTTPRoutes. This must be applied to the batch and LLM namespaces before creating their HTTPRoutes CRs.
 
 </details>
 
@@ -449,6 +457,12 @@ replicaset.apps/ms-llmd-llm-d-modelservice-prefill-7d7b78699f   1         1     
 
 <details>
 <summary>Create HTTPRoute for LLM inference</summary>
+
+Label the LLM namespace so the Gateway's namespace selector allows HTTPRoute attachment:
+
+```bash
+kubectl label namespace ${LLM_NS} llm-d.ai/gateway-route=true
+```
 
 The llm-route is manually created with URL rewrite rules that map `/{namespace}/{model}/v1/*` to the InferencePool backend.
 
@@ -605,13 +619,23 @@ kubectl wait tokenratelimitpolicy/inference-token-limit \
 ```bash
 BATCH_NS=batch-api
 kubectl create namespace "${BATCH_NS}" 2>/dev/null || true
+kubectl label namespace "${BATCH_NS}" llm-d.ai/gateway-route=true
 
-# Install Redis
+# Install Redis (or Valkey — see alternative below)
 helm install redis oci://registry-1.docker.io/bitnamicharts/redis \
     --namespace ${BATCH_NS} --create-namespace \
     --set architecture=standalone \
     --set auth.enabled=false
 kubectl rollout status statefulset/redis-master -n ${BATCH_NS} --timeout=120s
+
+# Alternative: Install Valkey (wire-protocol compatible with Redis)
+# helm install redis oci://registry-1.docker.io/bitnamicharts/valkey \
+#     --namespace ${BATCH_NS} --create-namespace \
+#     --set architecture=standalone \
+#     --set auth.enabled=false
+# kubectl rollout status statefulset/redis-valkey-primary -n ${BATCH_NS} --timeout=120s
+# Note: when using Valkey, update the redis-url secret below to use:
+#   redis://redis-valkey-primary.${BATCH_NS}.svc.cluster.local:6379/0
 
 # Install PostgreSQL
 helm install postgresql oci://registry-1.docker.io/bitnamicharts/postgresql \
@@ -679,7 +703,6 @@ helm install batch-gateway ./charts/batch-gateway \
     --set "processor.config.modelGateways.${MODEL_NAME}.initialBackoff=1s" \
     --set "processor.config.modelGateways.${MODEL_NAME}.maxBackoff=60s" \
     --set "processor.config.modelGateways.${MODEL_NAME}.tlsInsecureSkipVerify=true" \
-    --set "apiserver.config.batchAPI.passThroughHeaders={Authorization}" \
     --set apiserver.tls.enabled=true \
     --set apiserver.tls.certManager.enabled=true \
     --set apiserver.tls.certManager.issuerName=selfsigned-issuer \
@@ -689,7 +712,7 @@ helm install batch-gateway ./charts/batch-gateway \
 
 > - **Processor → inference TLS**: This demo uses `tlsInsecureSkipVerify=true` for a typical self-signed in-cluster gateway. For private CAs, mTLS, or mounting certificate Secrets, see [Processor inference TLS](processor-inference-tls.md).
 > - **`modelGateways.<model>.url`**: The processor uses this URL to send inference requests. It points to the Gateway's model endpoint (via in-cluster Service DNS), not directly to the model server, so that requests go through the Gateway's AuthPolicy and rate limiting.
-> - **`passThroughHeaders: {Authorization}`**: Ensures the processor sends inference requests on behalf of the original user, so the LLM route's AuthPolicy can enforce model-level authorization on batch requests.
+> - **`passThroughHeaders`**: Defaults to `[Authorization]`, so the processor forwards the end user's bearer token on inference calls without extra configuration. Override this only if you need a different set of headers.
 > - **`apiserver.tls.certManager.*`**: Enables TLS for the batch API server using cert-manager. The `dnsNames` should include the Service name and FQDN so the Gateway can verify the backend certificate when re-encrypting traffic (see DestinationRule in 3.8).
 > - **File storage**: This example uses `global.fileClient.type=fs` with a PVC. To use S3-compatible storage instead, replace the `fs` options with:
 >   ```

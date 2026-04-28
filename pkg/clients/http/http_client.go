@@ -24,8 +24,11 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"strconv"
+	"sync"
 	"time"
 
+	cbackoff "github.com/cenkalti/backoff/v5"
 	"github.com/go-logr/logr"
 	"github.com/go-resty/resty/v2"
 	"github.com/llm-d-incubation/batch-gateway/internal/util/logging"
@@ -35,12 +38,18 @@ import (
 const (
 	HeaderNameReqID       string = "X-Request-ID"
 	HeaderNameContentType string = "Content-Type"
+
+	// rateLimitBackoffMultiplier scales the initial backoff for 429 responses.
+	// A 429 means the server explicitly asks the client to slow down, so we
+	// back off harder than for transient 5xx errors.
+	rateLimitBackoffMultiplier = 3
 )
 
 // HTTPClient implements HTTP client with retry, TLS, and observability support
 type HTTPClient struct {
 	client    *resty.Client
 	transport *http.Transport // underlying transport (before OTel wrapping)
+	closeOnce sync.Once
 }
 
 // Config holds configuration for the HTTP client
@@ -102,7 +111,11 @@ func NewHTTPClient(config Config, logger logr.Logger) (*HTTPClient, error) {
 
 	// Configure transport - start with Go's secure defaults (http.DefaultTransport)
 	// This gives us: TLS 1.2+, system root CAs, certificate verification, proper timeouts
-	transport := http.DefaultTransport.(*http.Transport).Clone()
+	defaultTransport, ok := http.DefaultTransport.(*http.Transport)
+	if !ok {
+		return nil, fmt.Errorf("unexpected default transport type: %T", http.DefaultTransport)
+	}
+	transport := defaultTransport.Clone()
 
 	// Override only the settings we need to customize for batch processing
 	transport.MaxIdleConns = config.MaxIdleConns
@@ -129,9 +142,9 @@ func NewHTTPClient(config Config, logger logr.Logger) (*HTTPClient, error) {
 	// Configure retry only if enabled
 	if config.MaxRetries > 0 {
 		client.SetRetryCount(config.MaxRetries).
-			SetRetryWaitTime(config.InitialBackoff). // Min wait time between retries
-			SetRetryMaxWaitTime(config.MaxBackoff)   // Max wait time between retries
-		// Resty automatically applies exponential backoff with jitter
+			SetRetryWaitTime(config.InitialBackoff).                                   // Min wait time between retries
+			SetRetryMaxWaitTime(config.MaxBackoff).                                    // Max wait time between retries
+			SetRetryAfter(newRetryAfterFunc(config.InitialBackoff, config.MaxBackoff)) // Status-code-aware backoff
 
 		// Retry condition: retry on server errors, rate limits, and network errors
 		client.AddRetryCondition(func(r *resty.Response, err error) bool {
@@ -158,6 +171,22 @@ func NewHTTPClient(config Config, logger logr.Logger) (*HTTPClient, error) {
 		client:    client,
 		transport: transport,
 	}, nil
+}
+
+// Close releases resources held by the client by closing idle connections in the
+// underlying transport. In-flight requests are not interrupted.
+//
+// Close is idempotent and safe to call from multiple goroutines.
+func (c *HTTPClient) Close() error {
+	if c == nil {
+		return nil
+	}
+	c.closeOnce.Do(func() {
+		if c.transport != nil {
+			c.transport.CloseIdleConnections()
+		}
+	})
+	return nil
 }
 
 // Post makes an HTTP POST request with automatic retry logic
@@ -247,6 +276,85 @@ func MapStatusCodeToCategory(statusCode int) ErrorCategory {
 		}
 		return ErrCategoryUnknown
 	}
+}
+
+// newRetryAfterFunc returns a resty RetryAfterFunc that differentiates retry
+// delays by HTTP status code:
+//   - 429 with Retry-After header: use the server-specified delay (0 retries as fast as InitialBackoff allows)
+//   - 429 without Retry-After: use a longer backoff (rateLimitBackoffMultiplier × initialBackoff)
+//   - 502/503/504: transient failures, faster retry targeting ~maxBackoff/2 (jitter may exceed)
+//   - other 5xx: standard exponential backoff
+func newRetryAfterFunc(initialBackoff, maxBackoff time.Duration) func(*resty.Client, *resty.Response) (time.Duration, error) {
+	return func(_ *resty.Client, resp *resty.Response) (time.Duration, error) {
+		if resp == nil {
+			return computeBackoff(1, initialBackoff, maxBackoff), nil
+		}
+
+		switch resp.StatusCode() {
+		case http.StatusTooManyRequests: // 429
+			// Honor server's Retry-After header if present and parseable.
+			// Resty treats returned 0 as "use default algorithm", so we use
+			// 1ns for Retry-After: 0 — resty clamps it to InitialBackoff.
+			if ra := resp.Header().Get("Retry-After"); ra != "" {
+				if d, ok := parseRetryAfter(ra); ok {
+					if d == 0 {
+						d = 1 * time.Nanosecond
+					}
+					return d, nil
+				}
+			}
+			// No usable header — use longer backoff
+			return computeBackoff(resp.Request.Attempt, rateLimitBackoffMultiplier*initialBackoff, maxBackoff), nil
+
+		case http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout: // 502, 503, 504
+			// Transient failures — retry faster
+			return computeBackoff(resp.Request.Attempt, initialBackoff, maxBackoff/2), nil
+
+		default:
+			return computeBackoff(resp.Request.Attempt, initialBackoff, maxBackoff), nil
+		}
+	}
+}
+
+// computeBackoff uses cenkalti/backoff to calculate exponential backoff with
+// jitter for the given attempt number.
+func computeBackoff(attempt int, base, max time.Duration) time.Duration {
+	if attempt < 1 {
+		attempt = 1
+	}
+	b := &cbackoff.ExponentialBackOff{
+		InitialInterval:     base,
+		MaxInterval:         max,
+		Multiplier:          2,
+		RandomizationFactor: 0.5,
+	}
+	b.Reset()
+	var d time.Duration
+	for range attempt {
+		d = b.NextBackOff()
+	}
+	return d
+}
+
+// parseRetryAfter parses a Retry-After header value, which can be either
+// a number of seconds (e.g. "120") or an HTTP-date (e.g. "Thu, 01 Dec 1994 16:00:00 GMT").
+// Returns the parsed duration and true if successful, or (0, false) if unparsable.
+// A value of 0 seconds is valid and means "retry as soon as possible" (subject to
+// resty's InitialBackoff floor).
+func parseRetryAfter(value string) (time.Duration, bool) {
+	// Try integer seconds first
+	if seconds, err := strconv.Atoi(value); err == nil && seconds >= 0 {
+		return time.Duration(seconds) * time.Second, true
+	}
+	// Try HTTP-date format
+	if t, err := time.Parse(http.TimeFormat, value); err == nil {
+		d := time.Until(t)
+		if d < 0 {
+			d = 0
+		}
+		return d, true
+	}
+	return 0, false
 }
 
 // BuildTLSConfig constructs a custom TLS configuration based on provided options

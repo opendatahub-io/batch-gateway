@@ -14,6 +14,12 @@ tests:
           pattern: 'observability_port: "8081"'
       - matchRegex:
           path: data["config.yaml"]
+          pattern: 'api_shutdown_timeout_seconds: 60'
+      - matchRegex:
+          path: data["config.yaml"]
+          pattern: 'observability_shutdown_timeout_seconds: 60'
+      - matchRegex:
+          path: data["config.yaml"]
           pattern: 'db_client:\n\s+type: "postgresql"'
 
   - it: should render inputHeaders when set

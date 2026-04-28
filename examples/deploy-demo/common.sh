@@ -28,8 +28,9 @@ TLS_ISSUER_NAME="${TLS_ISSUER_NAME:-selfsigned-issuer}"
 # Demo uninstall safety: default uninstall removes batch-gateway-scoped
 # resources and the named Gateway only. Set UNINSTALL_ALL=1 to also tear down Kuadrant,
 # Istio, cert-manager, operators, cluster CRDs, and other shared platform pieces.
+UNINSTALL_ALL="${UNINSTALL_ALL:-0}"
 is_demo_uninstall_all() {
-    case "${UNINSTALL_ALL:-0}" in
+    case "${UNINSTALL_ALL}" in
         1|true|yes|TRUE|YES) return 0 ;;
         *) return 1 ;;
     esac
@@ -68,6 +69,7 @@ GW_MAX_RETRIES="${GW_MAX_RETRIES:-3}"
 GW_INITIAL_BACKOFF="${GW_INITIAL_BACKOFF:-1s}"
 GW_MAX_BACKOFF="${GW_MAX_BACKOFF:-60s}"
 BATCH_REDIS_RELEASE="${BATCH_REDIS_RELEASE:-redis}"
+BATCH_EXCHANGE_CLIENT_TYPE="${BATCH_EXCHANGE_CLIENT_TYPE:-redis}"
 BATCH_POSTGRESQL_RELEASE="${BATCH_POSTGRESQL_RELEASE:-postgresql}"
 # WARNING: Default passwords are for demo only. For production, override via env vars or use K8s secrets.
 BATCH_POSTGRESQL_PASSWORD="${BATCH_POSTGRESQL_PASSWORD:-postgres}"
@@ -80,6 +82,16 @@ BATCH_MINIO_RELEASE="${BATCH_MINIO_RELEASE:-minio}"
 MINIO_ROOT_USER="${MINIO_ROOT_USER:-minioadmin}"
 MINIO_ROOT_PASSWORD="${MINIO_ROOT_PASSWORD:-minioadmin}"
 MINIO_BUCKET="${MINIO_BUCKET:-batch-gateway}"
+# Image overrides. When set, these take precedence over defaults derived from
+# BATCH_RELEASE_VERSION / BATCH_DEV_VERSION. Leave unset to use chart defaults.
+# Example (upstream):
+#   BATCH_IMAGE_TAG=v0.1.0 BATCH_APISERVER_REPO=ghcr.io/llm-d-incubation/batch-gateway-apiserver \
+#   BATCH_PROCESSOR_REPO=ghcr.io/llm-d-incubation/batch-gateway-processor \
+#   BATCH_GC_REPO=ghcr.io/llm-d-incubation/batch-gateway-gc ./deploy-k8s.sh
+BATCH_IMAGE_TAG="${BATCH_IMAGE_TAG:-}"
+BATCH_APISERVER_REPO="${BATCH_APISERVER_REPO:-}"
+BATCH_PROCESSOR_REPO="${BATCH_PROCESSOR_REPO:-}"
+BATCH_GC_REPO="${BATCH_GC_REPO:-}"
 
 # Temp directory cleanup (used by install_batch_gateway)
 _BATCH_TMP_DIR=""
@@ -370,18 +382,30 @@ EOF
 
 # ── Database / Storage Functions ──────────────────────────────────────────────
 
-install_batch_redis() {
-    step "Installing Redis..."
+install_batch_exchange() {
+    local chart="oci://registry-1.docker.io/bitnamicharts/${BATCH_EXCHANGE_CLIENT_TYPE}"
+    step "Installing exchange backend (${chart})..."
     if helm status "${BATCH_REDIS_RELEASE}" -n "${BATCH_NAMESPACE}" &>/dev/null; then
-        log "Redis release '${BATCH_REDIS_RELEASE}' is already installed. Skipping."
-        return
+        local installed_chart
+        installed_chart=$(helm get metadata "${BATCH_REDIS_RELEASE}" -n "${BATCH_NAMESPACE}" -o json 2>/dev/null | jq -r '.chart')
+        if [[ "${installed_chart}" == "${BATCH_EXCHANGE_CLIENT_TYPE}-"* ]]; then
+            log "Exchange backend (${chart}) release '${BATCH_REDIS_RELEASE}' is already installed. Skipping."
+            return
+        fi
+        warn "Installed exchange chart '${installed_chart}' does not match requested '${BATCH_EXCHANGE_CLIENT_TYPE}'. Reinstalling..."
+        helm uninstall "${BATCH_REDIS_RELEASE}" -n "${BATCH_NAMESPACE}" --wait
     fi
-    helm install "${BATCH_REDIS_RELEASE}" oci://registry-1.docker.io/bitnamicharts/redis \
+    helm install "${BATCH_REDIS_RELEASE}" "${chart}" \
         --namespace "${BATCH_NAMESPACE}" --create-namespace \
         --set architecture=standalone \
         --set auth.enabled=false
-    kubectl rollout status statefulset/"${BATCH_REDIS_RELEASE}-master" -n "${BATCH_NAMESPACE}" --timeout=180s
-    log "Redis installed (standalone, no auth)."
+
+    local sts_name="${BATCH_REDIS_RELEASE}-master"
+    if [[ "${BATCH_EXCHANGE_CLIENT_TYPE}" == "valkey" ]]; then
+        sts_name="${BATCH_REDIS_RELEASE}-valkey-primary"
+    fi
+    kubectl rollout status statefulset/"${sts_name}" -n "${BATCH_NAMESPACE}" --timeout=180s
+    log "Exchange backend (${chart}) installed (standalone, no auth)."
 }
 
 install_batch_postgresql() {
@@ -511,7 +535,11 @@ EOF
 create_batch_secret() {
     step "Creating app secret '${BATCH_APP_SECRET_NAME}'..."
 
-    local redis_url="redis://${BATCH_REDIS_RELEASE}-master.${BATCH_NAMESPACE}.svc.cluster.local:6379/0"
+    local exchange_svc="${BATCH_REDIS_RELEASE}-master"
+    if [[ "${BATCH_EXCHANGE_CLIENT_TYPE}" == "valkey" ]]; then
+        exchange_svc="${BATCH_REDIS_RELEASE}-valkey-primary"
+    fi
+    local redis_url="redis://${exchange_svc}.${BATCH_NAMESPACE}.svc.cluster.local:6379/0"
     local postgresql_url="postgresql://postgres:${BATCH_POSTGRESQL_PASSWORD}@${BATCH_POSTGRESQL_RELEASE}.${BATCH_NAMESPACE}.svc.cluster.local:5432/batch?sslmode=disable"
 
     kubectl apply -f - <<EOF
@@ -571,14 +599,14 @@ install_batch_gateway() {
 
     # Print installed versions and verify image tags
     local expected_tag
-    if [ -n "${BATCH_RELEASE_VERSION}" ]; then
+    if [ -n "${BATCH_IMAGE_TAG}" ]; then
+        expected_tag="${BATCH_IMAGE_TAG}"
+    elif [ -n "${BATCH_RELEASE_VERSION}" ]; then
         expected_tag="${BATCH_RELEASE_VERSION}"
+    elif [ "${BATCH_DEV_VERSION}" = "local" ]; then
+        expected_tag="latest"
     else
-        if [ "${BATCH_DEV_VERSION}" = "local" ]; then
-            expected_tag="latest"
-        else
-            expected_tag="${BATCH_DEV_VERSION}"
-        fi
+        expected_tag="${BATCH_DEV_VERSION}"
     fi
     step "Installed batch-gateway components:"
     local mismatch=false
@@ -606,8 +634,9 @@ install_batch_gateway() {
 # (e.g. modelGateways, passThroughHeaders).
 do_deploy_batch_gateway() {
     kubectl get namespace "${BATCH_NAMESPACE}" &>/dev/null || kubectl create namespace "${BATCH_NAMESPACE}"
+    kubectl label namespace "${BATCH_NAMESPACE}" llm-d.ai/gateway-route=true --overwrite
 
-    install_batch_redis
+    install_batch_exchange
     install_batch_postgresql
     if [ "${BATCH_STORAGE_TYPE}" = "s3" ]; then
         install_batch_minio
@@ -621,9 +650,20 @@ do_deploy_batch_gateway() {
         --set "global.secretName=${BATCH_APP_SECRET_NAME}"
     )
 
-    # Only override image tags for non-release installs.
-    # Released OCI charts already have correct image tags baked in.
-    if [ -z "${BATCH_RELEASE_VERSION}" ]; then
+    # Image repository overrides (when set via env vars)
+    [ -n "${BATCH_APISERVER_REPO}" ]  && helm_args+=(--set "apiserver.image.repository=${BATCH_APISERVER_REPO}")
+    [ -n "${BATCH_PROCESSOR_REPO}" ]  && helm_args+=(--set "processor.image.repository=${BATCH_PROCESSOR_REPO}")
+    [ -n "${BATCH_GC_REPO}" ]         && helm_args+=(--set "gc.image.repository=${BATCH_GC_REPO}")
+
+    # Image tag: explicit BATCH_IMAGE_TAG takes precedence; otherwise derive from
+    # BATCH_DEV_VERSION for non-release installs (release charts have tags baked in).
+    if [ -n "${BATCH_IMAGE_TAG}" ]; then
+        helm_args+=(
+            --set "apiserver.image.tag=${BATCH_IMAGE_TAG}"
+            --set "processor.image.tag=${BATCH_IMAGE_TAG}"
+            --set "gc.image.tag=${BATCH_IMAGE_TAG}"
+        )
+    elif [ -z "${BATCH_RELEASE_VERSION}" ]; then
         local image_tag="latest"
         [ "${BATCH_DEV_VERSION}" != "local" ] && image_tag="${BATCH_DEV_VERSION}"
         helm_args+=(
@@ -686,7 +726,7 @@ do_deploy_batch_gateway() {
 #   4. sleep 60
 #   5. Batch Authentication   (unauthenticated -> 401, authenticated -> 200)
 #   6. Batch Authorization    (unauthorized batch -> LLM route rejects)
-#   7. Batch Lifecycle        (upload + create + poll -> completed)
+#   7. Batch Lifecycle        (upload + create + poll -> completed + download output)
 #   8. Batch Request Rate Limit (rapid requests -> 429)
 #
 # llm_url:            inference endpoint (e.g. .../v1/chat/completions)
@@ -756,6 +796,7 @@ run_tests() {
         local input_file="/tmp/batch-$$-${RANDOM}.jsonl"
         cat > "${input_file}" <<JSONL
 {"custom_id":"req-1","method":"POST","url":"/v1/chat/completions","body":{"model":"${model}","messages":[{"role":"user","content":"Hello"}],"max_tokens":10}}
+{"custom_id":"req-2","method":"POST","url":"/v1/chat/completions","body":{"model":"${model}","messages":[{"role":"user","content":"Tell me a joke"}],"max_tokens":50}}
 JSONL
         response=$(curl -sk -w "\n%{http_code}" -X POST "${url}/v1/files" \
             -H "${header}" -F "purpose=batch" -F "file=@${input_file}")
@@ -854,8 +895,9 @@ JSONL
 
     # ── 4. Batch Authn ──────────────────────────────────
     test_group_header "Batch Authn"
-    assert_http 401 "Unauthenticated batch request -> 401" "${batch_url}/v1/batches"
+    assert_http 401 "No credentials batch request -> 401" "${batch_url}/v1/batches"
     assert_http 200 "Authenticated batch request -> 200" -H "${authorized_header}" "${batch_url}/v1/batches"
+    assert_http 200 "Unauthorized but authenticated batch request -> 200 (no authz on batch-route)" -H "${unauthorized_header}" "${batch_url}/v1/batches"
 
     # ── 5. Batch Authz (LLM route enforces) ──────────────
     test_group_header "Batch Authz (LLM route enforces)"
@@ -895,6 +937,26 @@ JSONL
         _poll_batch "${batch_url}" "${_BATCH_ID}" "${authorized_header}"
         if [ "$_BATCH_STATUS" = "completed" ]; then
             pass_test "Batch completed successfully"
+
+            next_test "Download output file"
+            local output_file_id
+            output_file_id=$(curl -sk "${batch_url}/v1/batches/${_BATCH_ID}" \
+                -H "${authorized_header}" | jq -r '.output_file_id // empty')
+            if [ -n "$output_file_id" ]; then
+                local output_content
+                output_content=$(curl -sk "${batch_url}/v1/files/${output_file_id}/content" \
+                    -H "${authorized_header}")
+                if [ -n "$output_content" ]; then
+                    pass_test "Output file downloaded (file: ${output_file_id})"
+                    echo "  --- output content ---"
+                    echo "$output_content"
+                    echo "  --- end ---"
+                else
+                    fail_test "Output file is empty (file: ${output_file_id})"
+                fi
+            else
+                fail_test "No output_file_id in completed batch"
+            fi
         else
             fail_test "Batch ended with status=${_BATCH_STATUS} (expected completed)"
         fi

@@ -55,6 +55,15 @@ type RedisClientConfig struct {
 	ConnMaxLifetime time.Duration      `yaml:"conn_max_lifetime"`  // The maximum amount of time a connection may be reused. If <= 0, connections are not closed due to a connection's age. Default is to not close idle connections.
 }
 
+// DeepCopy returns a copy of the config with pointer fields cloned.
+func (c RedisClientConfig) DeepCopy() RedisClientConfig {
+	if c.Certificates != nil {
+		certs := *c.Certificates
+		c.Certificates = &certs
+	}
+	return c
+}
+
 func NewRedisClient(ctx context.Context, cnf *RedisClientConfig) (*gredis.Client, error) {
 	var (
 		redisOps  *gredis.Options
@@ -66,18 +75,13 @@ func NewRedisClient(ctx context.Context, cnf *RedisClientConfig) (*gredis.Client
 	}
 	logger := logr.FromContextOrDiscard(ctx)
 	if cnf == nil {
-		err = fmt.Errorf("redis config was not provided")
-		logger.Error(err, "NewRedisClient")
-		return nil, err
+		return nil, fmt.Errorf("redis config was not provided")
 	}
 	if cnf.Url == "" {
-		err = fmt.Errorf("redis config has empty url")
-		logger.Error(err, "NewRedisClient")
-		return nil, err
+		return nil, fmt.Errorf("redis config has empty url")
 	}
 	redisOps, err = gredis.ParseURL(cnf.Url)
 	if err != nil {
-		logger.Error(err, "NewRedisClient")
 		return nil, err
 	}
 	if redisOps.ClientName == "" {
@@ -131,7 +135,6 @@ func NewRedisClient(ctx context.Context, cnf *RedisClientConfig) (*gredis.Client
 			caCertFile,
 		)
 		if err != nil {
-			logger.Error(err, "NewRedisClient")
 			return nil, err
 		}
 	}
@@ -140,13 +143,10 @@ func NewRedisClient(ctx context.Context, cnf *RedisClientConfig) (*gredis.Client
 	}
 	rds := gredis.NewClient(redisOps)
 	if rds == nil {
-		err = fmt.Errorf("redis.NewClient returned nil client [addr: %s]", redisOps.Addr)
-		logger.Error(err, "NewRedisClient")
-		return nil, err
+		return nil, fmt.Errorf("redis.NewClient returned nil client [addr: %s]", redisOps.Addr)
 	}
 	if cnf.EnableTracing {
 		if err := redisotel.InstrumentTracing(rds); err != nil {
-			logger.Error(err, "NewRedisClient: failed to instrument Redis tracing")
 			_ = rds.Close()
 			return nil, err
 		}
@@ -155,7 +155,6 @@ func NewRedisClient(ctx context.Context, cnf *RedisClientConfig) (*gredis.Client
 	defer cancel()
 	_, err = rds.Ping(ctx).Result()
 	if err != nil {
-		logger.Error(err, "NewRedisClient")
 		_ = rds.Close()
 		return nil, err
 	}
@@ -167,7 +166,6 @@ func CheckClient(ctx context.Context, rds *gredis.Client, cmdTimeout time.Durati
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	logger := logr.FromContextOrDiscard(ctx)
 	cctx, ccancel := context.WithTimeout(ctx, cmdTimeout)
 	err = rds.Set(cctx, getPingKeyName(keyPrefix, serviceName), "ping", 10*time.Second).Err()
 	ccancel()
@@ -178,19 +176,16 @@ func CheckClient(ctx context.Context, rds *gredis.Client, cmdTimeout time.Durati
 		ccancel()
 		if err == nil {
 			if !strings.Contains(info, "role:slave") {
-				// In this case the client is determined as good.
-				logger.Info("CheckClient: success")
 				return nil
 			} else {
 				err = fmt.Errorf("slave confirmed")
 			}
 		} else {
-			err = fmt.Errorf("info failed: %s", err.Error())
+			err = fmt.Errorf("info failed: %w", err)
 		}
 	} else {
-		err = fmt.Errorf("write failed: %s", err.Error())
+		err = fmt.Errorf("write failed: %w", err)
 	}
-	logger.Error(err, "CheckClient: failed")
 	return
 }
 

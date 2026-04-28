@@ -35,7 +35,7 @@ func newRecoveryTestProcessor(t *testing.T, workDir string) (*Processor, db.Batc
 	p, err := NewProcessor(cfg, &clientset.Clientset{
 		BatchDB:   batchDB,
 		FileDB:    newMockFileDBClient(),
-		File:      mockfiles.NewMockBatchFilesClient(),
+		File:      mockfiles.NewMockBatchFilesClient(t.TempDir()),
 		Queue:     spyQueue,
 		Status:    statusClient,
 		Event:     mockdb.NewMockBatchEventChannelClient(),
@@ -582,7 +582,7 @@ func newRecoveryTestProcessorWithFailDB(t *testing.T, workDir string, failOn int
 	p, err := NewProcessor(cfg, &clientset.Clientset{
 		BatchDB:   failDB,
 		FileDB:    newMockFileDBClient(),
-		File:      mockfiles.NewMockBatchFilesClient(),
+		File:      mockfiles.NewMockBatchFilesClient(t.TempDir()),
 		Queue:     pq,
 		Status:    statusClient,
 		Event:     mockdb.NewMockBatchEventChannelClient(),
@@ -621,7 +621,7 @@ func TestRecoverJob_Cancelling_AllUpdatesFail_ReturnsError(t *testing.T) {
 	p, err := NewProcessor(cfg, &clientset.Clientset{
 		BatchDB:   failDB,
 		FileDB:    newMockFileDBClient(),
-		File:      mockfiles.NewMockBatchFilesClient(),
+		File:      mockfiles.NewMockBatchFilesClient(t.TempDir()),
 		Queue:     pq,
 		Status:    statusClient,
 		Event:     mockdb.NewMockBatchEventChannelClient(),
@@ -665,7 +665,7 @@ func TestRecoverJob_Validating_EnqueueFails_FallsBackToFailed(t *testing.T) {
 	p, err := NewProcessor(cfg, &clientset.Clientset{
 		BatchDB:   batchDB,
 		FileDB:    newMockFileDBClient(),
-		File:      mockfiles.NewMockBatchFilesClient(),
+		File:      mockfiles.NewMockBatchFilesClient(t.TempDir()),
 		Queue:     pq,
 		Status:    statusClient,
 		Event:     mockdb.NewMockBatchEventChannelClient(),
@@ -713,7 +713,7 @@ func TestRecoverJob_InProgressReEnqueue_EnqueueFails_FallsBackToFailed(t *testin
 	p, err := NewProcessor(cfg, &clientset.Clientset{
 		BatchDB:   batchDB,
 		FileDB:    newMockFileDBClient(),
-		File:      mockfiles.NewMockBatchFilesClient(),
+		File:      mockfiles.NewMockBatchFilesClient(t.TempDir()),
 		Queue:     pq,
 		Status:    statusClient,
 		Event:     mockdb.NewMockBatchEventChannelClient(),
@@ -848,7 +848,7 @@ func TestRecoverStaleJobs_RunsConcurrently(t *testing.T) {
 	p, err := NewProcessor(cfg, &clientset.Clientset{
 		BatchDB:   slowDB,
 		FileDB:    newMockFileDBClient(),
-		File:      mockfiles.NewMockBatchFilesClient(),
+		File:      mockfiles.NewMockBatchFilesClient(t.TempDir()),
 		Queue:     pq,
 		Status:    statusClient,
 		Event:     mockdb.NewMockBatchEventChannelClient(),
@@ -923,4 +923,135 @@ func TestOutputFileHasContent(t *testing.T) {
 	if !has {
 		t.Error("expected true for file with content")
 	}
+}
+
+// ---------------------------------------------------------------------------
+// recoverExpired success path — verify partial file IDs are recorded in DB
+// ---------------------------------------------------------------------------
+
+func TestRecoverJob_InProgress_EmptyOutput_ExpiredSLO_PreservesErrorFileID(t *testing.T) {
+	workDir := t.TempDir()
+	p, dbClient, spyQueue := newRecoveryTestProcessor(t, workDir)
+
+	jobID := "job-inprog-expired-with-errors"
+	tenantID := "tenant-1"
+	counts := &openai.BatchRequestCounts{Total: 100, Completed: 50, Failed: 0}
+	expiredSLO := time.Now().UTC().Add(-1 * time.Minute)
+
+	seedDBJobWithStatusAndSLO(t, dbClient, jobID, tenantID,
+		openai.BatchStatusInProgress, counts, expiredSLO)
+
+	jobDir := createJobDir(t, p, jobID, tenantID)
+	createOutputFile(t, jobDir, "")
+	createErrorFile(t, jobDir, `{"id":"batch_req_2","custom_id":"req-2","error":{"code":"server_error","message":"fail"}}`+"\n")
+
+	ctx := testLoggerCtx(t)
+	if err := p.recoverJob(ctx, jobID); err != nil {
+		t.Fatalf("recoverJob: %v", err)
+	}
+
+	info := getDBJobStatusInfo(t, dbClient, jobID)
+	if info.Status != openai.BatchStatusExpired {
+		t.Fatalf("expected expired, got %s", info.Status)
+	}
+	if info.OutputFileID != nil {
+		t.Fatalf("output_file_id should be nil for empty output file, got %s", *info.OutputFileID)
+	}
+	if info.ErrorFileID == nil {
+		t.Fatal("error_file_id must be preserved for expired job with partial errors on disk")
+	}
+
+	if spyQueue.EnqueueCalls() != 0 {
+		t.Fatalf("expected 0 enqueue calls, got %d", spyQueue.EnqueueCalls())
+	}
+
+	assertJobDirRemoved(t, p, jobID, tenantID)
+}
+
+// ---------------------------------------------------------------------------
+// Router fallback tests — verify recoverJob routes errors through
+// recoverWithFailed and preserves fileIDs from the recoveryResult.
+// ---------------------------------------------------------------------------
+
+func TestRecoverJob_Finalizing_UpdateFails_FallbackPreservesFileIDs(t *testing.T) {
+	workDir := t.TempDir()
+	p, innerDB := newRecoveryTestProcessorWithFailDB(t, workDir, 1)
+
+	jobID := "job-finalizing-fallback"
+	tenantID := "tenant-1"
+	counts := &openai.BatchRequestCounts{Total: 10, Completed: 8, Failed: 2}
+
+	seedDBJobWithStatus(t, innerDB, jobID, tenantID, openai.BatchStatusFinalizing, counts)
+
+	jobDir := createJobDir(t, p, jobID, tenantID)
+	createOutputFile(t, jobDir, `{"id":"batch_req_1","custom_id":"req-1","response":{"status_code":200}}`+"\n")
+	createErrorFile(t, jobDir, `{"id":"batch_req_2","custom_id":"req-2","error":{"code":"server_error","message":"fail"}}`+"\n")
+
+	ctx := testLoggerCtx(t)
+	if err := p.recoverJob(ctx, jobID); err != nil {
+		t.Fatalf("recoverJob should succeed via fallback, got: %v", err)
+	}
+
+	info := getDBJobStatusInfo(t, innerDB, jobID)
+	if info.Status != openai.BatchStatusFailed {
+		t.Fatalf("expected failed, got %s", info.Status)
+	}
+	if info.OutputFileID == nil {
+		t.Fatal("output_file_id must be preserved in fallback")
+	}
+	if info.ErrorFileID == nil {
+		t.Fatal("error_file_id must be preserved in fallback")
+	}
+
+	assertJobDirRemoved(t, p, jobID, tenantID)
+}
+
+func TestRecoverJob_ExpiredWriteFails_FallbackToFailed(t *testing.T) {
+	workDir := t.TempDir()
+
+	innerDB := newMockBatchDBClient()
+	failDB := &failOnNthBatchDB{
+		BatchDBClient: innerDB,
+		failOn:        1,
+		failErr:       errors.New("expired write failed"),
+	}
+	statusClient := mockdb.NewMockBatchStatusClient()
+	pq := mockdb.NewMockBatchPriorityQueueClient()
+
+	cfg := config.NewConfig()
+	cfg.WorkDir = workDir
+
+	p, err := NewProcessor(cfg, &clientset.Clientset{
+		BatchDB:   failDB,
+		FileDB:    newMockFileDBClient(),
+		File:      mockfiles.NewMockBatchFilesClient(t.TempDir()),
+		Queue:     pq,
+		Status:    statusClient,
+		Event:     mockdb.NewMockBatchEventChannelClient(),
+		Inference: inference.NewSingleClientResolver(&fakeInferenceClient{}),
+	}, testLogger(t))
+	if err != nil {
+		t.Fatalf("NewProcessor: %v", err)
+	}
+	p.poller = NewPoller(pq, failDB)
+	p.updater = NewStatusUpdater(failDB, statusClient, 86400)
+
+	jobID := "job-expired-fallback"
+	tenantID := "tenant-1"
+	expiredSLO := time.Now().UTC().Add(-1 * time.Minute)
+
+	seedDBJobWithStatusAndSLO(t, innerDB, jobID, tenantID, openai.BatchStatusValidating, nil, expiredSLO)
+	createJobDir(t, p, jobID, tenantID)
+
+	ctx := testLoggerCtx(t)
+	if err := p.recoverJob(ctx, jobID); err != nil {
+		t.Fatalf("recoverJob should succeed via fallback, got: %v", err)
+	}
+
+	status := getDBJobStatus(t, innerDB, jobID)
+	if status != openai.BatchStatusFailed {
+		t.Fatalf("expected failed after expired write failure fallback, got %s", status)
+	}
+
+	assertJobDirRemoved(t, p, jobID, tenantID)
 }
