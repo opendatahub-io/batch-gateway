@@ -44,7 +44,7 @@ Both the LLM route and the batch route use **kubernetesTokenReview** for authent
 
 ### 1.4 Authorization Model
 
-Model access is controlled through Kubernetes RBAC. Users need `get` permission on the specific `LLMInferenceService` resource to access a model. This is granted by creating a Role and RoleBinding in the model's namespace (see [Enabling authentication and authorization for LLM inference service](https://docs.redhat.com/en/documentation/red_hat_openshift_ai_self-managed/3.4/html/deploying_models/deploying_models#enabling-authentication-and-authorization-for-llm-inference-service_rhoai-user) for details).
+Model access is controlled through Kubernetes RBAC. Users need `get` permission on the specific `LLMInferenceService` resource to access a model. This is granted by creating a Role and RoleBinding in the model's namespace (see [Enabling authentication and authorization for LLM inference service](https://docs.redhat.com/en/documentation/red_hat_openshift_ai_self-managed/latest/html/deploying_models/deploying_models#enabling-authentication-and-authorization-for-llm-inference-service_rhoai-user) for details).
 
 - **LLM route**: SubjectAccessReview checks if user can `get llminferenceservices/<name>` — unauthorized requests are rejected with **403**
 - **Batch route**: No authorization check — authorization is enforced by the LLM route when the processor forwards inference requests with the user's original token
@@ -60,7 +60,7 @@ The `Authorization` header is included in `passThroughHeaders` by default. Witho
 
 ## 2. Prerequisites
 - OpenShift cluster 4.20 or later (required for Distributed Inference with llm-d).
-- Red Hat OpenShift AI 3.4 or later.
+- Red Hat OpenShift AI (latest version recommended).
 - OpenShift Service Mesh v2 is not installed in the cluster.
 
 
@@ -361,7 +361,7 @@ oc wait --for=condition=ready pod -l authorino-resource=authorino \
 
 ### 3.5 Install RHOAI
 
-Follow [RHOAI Installation Guide](https://docs.redhat.com/en/documentation/red_hat_openshift_ai_self-managed/3.4/html/installing_and_uninstalling_openshift_ai_self-managed/index) to install RHOAI
+Follow [RHOAI Installation Guide](https://docs.redhat.com/en/documentation/red_hat_openshift_ai_self-managed/latest/html/installing_and_uninstalling_openshift_ai_self-managed/index) to install RHOAI
 
 <details>
 <summary>Install RHOAI operator</summary>
@@ -446,9 +446,9 @@ oc wait datasciencecluster/default-dsc --for=jsonpath='{.status.phase}'=Ready --
 
 ### 3.6 Deploy model with llm-d
 
-Follow [deploy model doc](https://docs.redhat.com/en/documentation/red_hat_openshift_ai_self-managed/3.4/html/deploying_models/deploying_models#deploying-models-using-distributed-inference_rhoai-user) to deploy model with LLM-D
+Follow [deploy model doc](https://docs.redhat.com/en/documentation/red_hat_openshift_ai_self-managed/latest/html/deploying_models/deploying_models#deploying-models-using-distributed-inference_rhoai-user) to deploy model with LLM-D
 
-For more examples: [kserve samples repo](https://github.com/red-hat-data-services/kserve/tree/rhoai-3.4/docs/samples/llmisvc)
+For more examples: [kserve samples repo](https://github.com/red-hat-data-services/kserve/tree/main/docs/samples/llmisvc) (switch to the `rhoai-<version>` branch matching your RHOAI version for version-specific samples)
 
 The following example deploys a simulated model with `LLMInferenceService`.
 
