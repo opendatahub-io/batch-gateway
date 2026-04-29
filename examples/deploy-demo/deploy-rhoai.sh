@@ -21,9 +21,16 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
+# ── Image defaults (set before sourcing common.sh to override its defaults) ──
+BATCH_APISERVER_REPO="${BATCH_APISERVER_REPO:-quay.io/opendatahub/odh-llm-d-batch-gateway-apiserver}"
+BATCH_PROCESSOR_REPO="${BATCH_PROCESSOR_REPO:-quay.io/opendatahub/odh-llm-d-batch-gateway-processor}"
+BATCH_GC_REPO="${BATCH_GC_REPO:-quay.io/opendatahub/odh-llm-d-batch-gateway-gc}"
+BATCH_IMAGE_TAG="${BATCH_IMAGE_TAG:-odh-stable}"
+export BATCH_APISERVER_REPO BATCH_PROCESSOR_REPO BATCH_GC_REPO BATCH_IMAGE_TAG
+
 source "${SCRIPT_DIR}/common.sh"
 
-# ── Configuration (set before sourcing common.sh to override its defaults) ──
+# ── Configuration ────────────────────────────────────────────────────────────
 LLM_NAMESPACE="${LLM_NAMESPACE:-llm}"
 KUADRANT_NAMESPACE="${KUADRANT_NAMESPACE:-kuadrant-system}"
 
@@ -831,6 +838,8 @@ cmd_install() {
     log "  Batch Gateway: ${BATCH_HELM_RELEASE} (${BATCH_NAMESPACE})"
     if [ -n "${BATCH_RELEASE_VERSION}" ]; then
         log "  Batch Gateway version: ${BATCH_RELEASE_VERSION} (OCI chart)"
+    elif [ -n "${BATCH_IMAGE_TAG}" ]; then
+        log "  Batch Gateway image tag: ${BATCH_IMAGE_TAG}"
     elif [ "${BATCH_DEV_VERSION}" != "local" ]; then
         log "  Batch Gateway image tag: ${BATCH_DEV_VERSION} (commit chart)"
     else
@@ -1045,7 +1054,11 @@ usage() {
     echo "  MODEL_NAME       Model name for simulator (default: facebook/opt-125m)"
     echo "  MODEL_REPLICAS   Number of replicas (default: 2)"
     echo "  SIM_IMAGE        Simulator image (default: ghcr.io/llm-d/llm-d-inference-sim:v0.7.1)"
-    echo "  BATCH_DEV_VERSION      Batch gateway image tag / commit SHA (default: local)"
+    echo "  BATCH_IMAGE_TAG        Batch gateway image tag (default: odh-stable)"
+    echo "  BATCH_APISERVER_REPO   Apiserver image repo (default: quay.io/opendatahub/odh-llm-d-batch-gateway-apiserver)"
+    echo "  BATCH_PROCESSOR_REPO   Processor image repo (default: quay.io/opendatahub/odh-llm-d-batch-gateway-processor)"
+    echo "  BATCH_GC_REPO          GC image repo (default: quay.io/opendatahub/odh-llm-d-batch-gateway-gc)"
+    echo "  BATCH_DEV_VERSION      Batch gateway commit SHA for dev chart (default: local)"
     echo "  BATCH_RELEASE_VERSION  Install released OCI chart (e.g. v1.0.0)"
     echo "  BATCH_DB_TYPE          Database: postgresql or redis (default: postgresql)"
     echo "  BATCH_STORAGE_TYPE     File storage: fs or s3 (default: s3)"
