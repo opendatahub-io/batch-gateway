@@ -100,9 +100,9 @@ apiserver:
   terminationGracePeriodSeconds: 120
 
   image:
-    repository: ghcr.io/llm-d-incubation/batch-gateway-apiserver
+    repository: quay.io/opendatahub/odh-llm-d-batch-gateway-apiserver
     pullPolicy: Always
-    tag: "latest"
+    tag: "odh-stable"
 
   nameOverride: ""
   fullnameOverride: ""
@@ -237,9 +237,9 @@ processor:
     medium: "" # node disk
 
   image:
-    repository: ghcr.io/llm-d-incubation/batch-gateway-processor
+    repository: quay.io/opendatahub/odh-llm-d-batch-gateway-processor
     pullPolicy: Always
-    tag: "latest"
+    tag: "odh-stable"
 
   nameOverride: ""
   fullnameOverride: ""
@@ -422,9 +422,9 @@ gc:
   replicaCount: 1
 
   image:
-    repository: ghcr.io/llm-d-incubation/batch-gateway-gc
+    repository: quay.io/opendatahub/odh-llm-d-batch-gateway-gc
     pullPolicy: IfNotPresent
-    tag: "latest"
+    tag: "odh-stable"
 
   serviceAccount:
     create: true
