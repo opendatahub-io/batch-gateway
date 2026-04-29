@@ -21,13 +21,6 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
-# ── Image defaults (set before sourcing common.sh to override its defaults) ──
-BATCH_APISERVER_REPO="${BATCH_APISERVER_REPO:-quay.io/opendatahub/odh-llm-d-batch-gateway-apiserver}"
-BATCH_PROCESSOR_REPO="${BATCH_PROCESSOR_REPO:-quay.io/opendatahub/odh-llm-d-batch-gateway-processor}"
-BATCH_GC_REPO="${BATCH_GC_REPO:-quay.io/opendatahub/odh-llm-d-batch-gateway-gc}"
-BATCH_IMAGE_TAG="${BATCH_IMAGE_TAG:-odh-stable}"
-export BATCH_APISERVER_REPO BATCH_PROCESSOR_REPO BATCH_GC_REPO BATCH_IMAGE_TAG
-
 source "${SCRIPT_DIR}/common.sh"
 
 # ── Configuration ────────────────────────────────────────────────────────────
@@ -45,7 +38,7 @@ GATEWAY_NAMESPACE="${GATEWAY_NAMESPACE:-openshift-ingress}"
 # LLMInferenceService configuration
 MODEL_NAME="${MODEL_NAME:-facebook/opt-125m}"
 MODEL_URI="${MODEL_URI:-hf://sshleifer/tiny-gpt2}"
-MODEL_REPLICAS="${MODEL_REPLICAS:-2}"
+MODEL_REPLICAS="${MODEL_REPLICAS:-1}"
 SIM_IMAGE="${SIM_IMAGE:-ghcr.io/llm-d/llm-d-inference-sim:v0.7.1}"
 
 # ── 1. cert-manager ─────────────────────────────────────────────────────────
@@ -1052,12 +1045,12 @@ usage() {
     echo "  RHOAI_VERSION    RHOAI version (default: 3.4)"
     echo "  RHOAI_CHANNEL    OLM channel (default: stable-\${RHOAI_VERSION})"
     echo "  MODEL_NAME       Model name for simulator (default: facebook/opt-125m)"
-    echo "  MODEL_REPLICAS   Number of replicas (default: 2)"
+    echo "  MODEL_REPLICAS   Number of replicas (default: 1)"
     echo "  SIM_IMAGE        Simulator image (default: ghcr.io/llm-d/llm-d-inference-sim:v0.7.1)"
-    echo "  BATCH_IMAGE_TAG        Batch gateway image tag (default: odh-stable)"
-    echo "  BATCH_APISERVER_REPO   Apiserver image repo (default: quay.io/opendatahub/odh-llm-d-batch-gateway-apiserver)"
-    echo "  BATCH_PROCESSOR_REPO   Processor image repo (default: quay.io/opendatahub/odh-llm-d-batch-gateway-processor)"
-    echo "  BATCH_GC_REPO          GC image repo (default: quay.io/opendatahub/odh-llm-d-batch-gateway-gc)"
+    echo "  BATCH_IMAGE_TAG        Batch gateway image tag (default: from values.yaml)"
+    echo "  BATCH_APISERVER_REPO   Apiserver image repo (default: from values.yaml)"
+    echo "  BATCH_PROCESSOR_REPO   Processor image repo (default: from values.yaml)"
+    echo "  BATCH_GC_REPO          GC image repo (default: from values.yaml)"
     echo "  BATCH_DEV_VERSION      Batch gateway commit SHA for dev chart (default: local)"
     echo "  BATCH_RELEASE_VERSION  Install released OCI chart (e.g. v1.0.0)"
     echo "  BATCH_DB_TYPE          Database: postgresql or redis (default: postgresql)"
