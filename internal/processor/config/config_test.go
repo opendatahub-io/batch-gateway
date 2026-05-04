@@ -150,6 +150,7 @@ e2e_latency_bucket:
 model_gateways:
   "llama-3":
     url: "http://llama-gw:8000"
+    inference_objective: "batch-sheddable-a"
     request_timeout: 5m
     max_retries: 3
     initial_backoff: 1s
@@ -181,6 +182,24 @@ progress_ttl_seconds: 86400
 	}
 	if *noRetry.MaxRetries != 0 {
 		t.Fatalf("no-retry-model MaxRetries = %d, want 0 (explicit zero must not be overwritten by default)", *noRetry.MaxRetries)
+	}
+
+	llama, ok := c.ModelGateways["llama-3"]
+	if !ok {
+		t.Fatal("ModelGateways missing llama-3")
+	}
+	if llama.InferenceObjective != "batch-sheddable-a" {
+		t.Fatalf("llama-3 InferenceObjective = %q, want %q", llama.InferenceObjective, "batch-sheddable-a")
+	}
+	if noRetry.InferenceObjective != "" {
+		t.Fatalf("no-retry-model InferenceObjective = %q, want empty", noRetry.InferenceObjective)
+	}
+
+	if c.InferenceObjectiveFor("llama-3") != "batch-sheddable-a" {
+		t.Fatalf("InferenceObjectiveFor(llama-3) = %q, want per-model override", c.InferenceObjectiveFor("llama-3"))
+	}
+	if c.InferenceObjectiveFor("no-retry-model") != "" {
+		t.Fatalf("InferenceObjectiveFor(no-retry-model) = %q, want empty", c.InferenceObjectiveFor("no-retry-model"))
 	}
 
 	if err := c.Validate(); err != nil {
@@ -475,5 +494,109 @@ progress_ttl_seconds: 3600
 	}
 	if c.ProgressTTLSeconds != 3600 {
 		t.Fatalf("ProgressTTLSeconds = %d, want %d", c.ProgressTTLSeconds, 3600)
+	}
+}
+
+func TestProcessorConfig_InferenceObjectiveFor(t *testing.T) {
+	tests := []struct {
+		name    string
+		cfg     ProcessorConfig
+		modelID string
+		want    string
+	}{
+		{
+			name:    "no objective configured anywhere",
+			cfg:     ProcessorConfig{ModelGateways: validPerModelConfig()},
+			modelID: "llama-3",
+			want:    "",
+		},
+		{
+			name: "per-model objective set",
+			cfg: ProcessorConfig{
+				ModelGateways: map[string]ModelGatewayConfig{
+					"llama-3": {
+						URL:                "http://gw:8000",
+						InferenceObjective: "batch-sheddable-a",
+						RequestTimeout:     ptr.To(5 * time.Minute),
+						MaxRetries:         ptr.To(3),
+						InitialBackoff:     ptr.To(1 * time.Second),
+						MaxBackoff:         ptr.To(60 * time.Second),
+					},
+				},
+			},
+			modelID: "llama-3",
+			want:    "batch-sheddable-a",
+		},
+		{
+			name: "unlisted model returns empty",
+			cfg: ProcessorConfig{
+				ModelGateways: map[string]ModelGatewayConfig{
+					"llama-3": {
+						URL:                "http://gw:8000",
+						InferenceObjective: "batch-sheddable-a",
+						RequestTimeout:     ptr.To(5 * time.Minute),
+						MaxRetries:         ptr.To(3),
+						InitialBackoff:     ptr.To(1 * time.Second),
+						MaxBackoff:         ptr.To(60 * time.Second),
+					},
+				},
+			},
+			modelID: "mistral",
+			want:    "",
+		},
+		{
+			name: "per-model empty returns empty",
+			cfg: ProcessorConfig{
+				ModelGateways: map[string]ModelGatewayConfig{
+					"llama-3": {
+						URL:            "http://gw:8000",
+						RequestTimeout: ptr.To(5 * time.Minute),
+						MaxRetries:     ptr.To(3),
+						InitialBackoff: ptr.To(1 * time.Second),
+						MaxBackoff:     ptr.To(60 * time.Second),
+					},
+				},
+			},
+			modelID: "llama-3",
+			want:    "",
+		},
+		{
+			name: "global gateway with objective",
+			cfg: ProcessorConfig{
+				GlobalInferenceGateway: &ModelGatewayConfig{
+					URL:                "http://global-gw:8000",
+					InferenceObjective: "batch-sheddable-global",
+					RequestTimeout:     ptr.To(5 * time.Minute),
+					MaxRetries:         ptr.To(3),
+					InitialBackoff:     ptr.To(1 * time.Second),
+					MaxBackoff:         ptr.To(60 * time.Second),
+				},
+			},
+			modelID: "any-model",
+			want:    "batch-sheddable-global",
+		},
+		{
+			name: "global gateway without objective returns empty",
+			cfg: ProcessorConfig{
+				GlobalInferenceGateway: &ModelGatewayConfig{
+					URL:            "http://global-gw:8000",
+					RequestTimeout: ptr.To(5 * time.Minute),
+					MaxRetries:     ptr.To(3),
+					InitialBackoff: ptr.To(1 * time.Second),
+					MaxBackoff:     ptr.To(60 * time.Second),
+				},
+			},
+			modelID: "any-model",
+			want:    "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := tt.cfg.InferenceObjectiveFor(tt.modelID)
+			if got != tt.want {
+				t.Fatalf("InferenceObjectiveFor(%q) = %q, want %q", tt.modelID, got, tt.want)
+			}
+		})
 	}
 }
