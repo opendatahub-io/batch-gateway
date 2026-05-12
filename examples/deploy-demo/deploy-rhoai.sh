@@ -32,13 +32,17 @@ CUSTOM_CATALOG="${CUSTOM_CATALOG:-}"       # custom catalog image (e.g. quay.io/
 RHOAI_VERSION="${RHOAI_VERSION:-3.4}"
 RHOAI_CHANNEL="${RHOAI_CHANNEL:-stable-${RHOAI_VERSION}}"
 ODH_CHANNEL="${ODH_CHANNEL:-fast-3}"
+GATEWAY_CLASS_NAME="${GATEWAY_CLASS_NAME:-openshift-default}"
 GATEWAY_NAME="${GATEWAY_NAME:-openshift-ai-inference}"
 GATEWAY_NAMESPACE="${GATEWAY_NAMESPACE:-openshift-ingress}"
+BATCH_INTERNAL_GATEWAY_NAME="${BATCH_INTERNAL_GATEWAY_NAME:-batch-internal-gateway}"
+BATCH_INTERNAL_GATEWAY_NAMESPACE="${BATCH_INTERNAL_GATEWAY_NAMESPACE:-${GATEWAY_NAMESPACE}}"
 
 # LLMInferenceService configuration
 MODEL_NAME="${MODEL_NAME:-facebook/opt-125m}"
 MODEL_URI="${MODEL_URI:-hf://sshleifer/tiny-gpt2}"
 MODEL_REPLICAS="${MODEL_REPLICAS:-1}"
+ISVC_NAME="${ISVC_NAME:-$(echo "${MODEL_NAME}" | tr '/' '-' | tr '[:upper:]' '[:lower:]')}"
 SIM_IMAGE="${SIM_IMAGE:-ghcr.io/llm-d/llm-d-inference-sim:v0.7.1}"
 
 # ── 1. cert-manager ─────────────────────────────────────────────────────────
@@ -88,9 +92,9 @@ EOF
 install_lws_operator() {
     step "Installing LeaderWorkerSet operator (OLM)..."
 
-    if kubectl get subscription.operators.coreos.com leader-worker-set \
+    if kubectl get leaderworkersetoperator cluster \
         -n openshift-lws-operator &>/dev/null 2>&1; then
-        log "LWS operator already installed. Skipping."
+        log "LWS CR already installed. Skipping."
         return
     fi
 
@@ -144,11 +148,11 @@ create_openshift_gateway() {
 
     # GatewayClass
     # During the creation of the GatewayClass resource, the Ingress Operator(in the openshift-ingress-operator namespace) installs a lightweight version of Red Hat OpenShift Service Mesh, an Istio custom resource, and a new deployment in the openshift-ingress namespace
-    kubectl apply -f - <<'EOF'
+    kubectl apply -f - <<EOF
 apiVersion: gateway.networking.k8s.io/v1
 kind: GatewayClass
 metadata:
-  name: openshift-default
+  name: ${GATEWAY_CLASS_NAME}
 spec:
   controllerName: openshift.io/gateway-controller/v1
 EOF
@@ -173,7 +177,7 @@ metadata:
   name: ${GATEWAY_NAME}
   namespace: ${GATEWAY_NAMESPACE}
 spec:
-  gatewayClassName: openshift-default
+  gatewayClassName: ${GATEWAY_CLASS_NAME}
   listeners:
   - name: http
     hostname: "${hostname}"
@@ -504,7 +508,8 @@ apply_dsci_and_dsc() {
     log "DSCInitialization exists."
 
     # DataScienceCluster
-    if kubectl get datasciencecluster default-dsc &>/dev/null; then
+    local dsc_name="default-dsc"
+    if kubectl get datasciencecluster ${dsc_name} &>/dev/null; then
         log "DataScienceCluster already exists. Skipping."
     else
         step "Creating DataScienceCluster..."
@@ -512,7 +517,7 @@ apply_dsci_and_dsc() {
 apiVersion: datasciencecluster.opendatahub.io/v2
 kind: DataScienceCluster
 metadata:
-  name: default-dsc
+  name: ${dsc_name}
 spec:
   components:
     kserve:
@@ -530,7 +535,7 @@ EOF
     local i=0
     while [ "${i}" -lt 60 ]; do
         local phase
-        phase=$(kubectl get datasciencecluster default-dsc \
+        phase=$(kubectl get datasciencecluster ${dsc_name} \
             -o jsonpath='{.status.phase}' 2>/dev/null || echo "Unknown")
         if [ "${phase}" = "Ready" ]; then
             log "DataScienceCluster is ready."
@@ -547,8 +552,7 @@ EOF
 
 deploy_llm_inference_service() {
     # https://github.com/red-hat-data-services/kserve/tree/main/docs/samples/llmisvc
-    local isvc_name
-    isvc_name=$(echo "${MODEL_NAME}" | tr '/' '-' | tr '[:upper:]' '[:lower:]')
+    local isvc_name="${ISVC_NAME}"
 
     step "Deploying LLMInferenceService '${isvc_name}' (simulator) in namespace '${LLM_NAMESPACE}'..."
 
@@ -662,11 +666,130 @@ EOF
     die "LLMInferenceService '${isvc_name}' not ready after 600s. Check operator logs."
 }
 
-# ── 6b. TokenRateLimitPolicy for inference ───────────────────────────────────
+# ── 6b. Batch LLM HTTPRoute on Internal Gateway ─────────────────────────────
+# Routes batch processor inference traffic through the Internal Gateway (ClusterIP)
+# to the same InferencePool, preserving EPP but bypassing TokenRateLimitPolicy.
+
+create_batch_llm_httproute() {
+    local isvc_name="${ISVC_NAME}"
+
+    step "Discovering InferencePool for LLMInferenceService '${isvc_name}'..."
+    local pool_name
+    pool_name=$(kubectl get inferencepool -n "${LLM_NAMESPACE}" -o json | \
+        jq -r --arg owner "${isvc_name}" \
+        '.items[] | select(.metadata.ownerReferences[]?.name == $owner) | .metadata.name' \
+        2>/dev/null | head -1)
+    [ -z "${pool_name}" ] && die "No InferencePool owned by LLMInferenceService '${isvc_name}' found in namespace '${LLM_NAMESPACE}'."
+    log "InferencePool: ${pool_name} (owned by ${isvc_name})"
+
+    step "Creating batch-llm-route on Internal Gateway..."
+    kubectl apply -f - <<EOF
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: batch-llm-route
+  namespace: ${LLM_NAMESPACE}
+spec:
+  parentRefs:
+  - name: ${BATCH_INTERNAL_GATEWAY_NAME}
+    namespace: ${BATCH_INTERNAL_GATEWAY_NAMESPACE}
+  rules:
+  - matches:
+    - path:
+        type: PathPrefix
+        value: /${LLM_NAMESPACE}/${isvc_name}/v1/completions
+    filters:
+    - type: URLRewrite
+      urlRewrite:
+        path:
+          type: ReplacePrefixMatch
+          replacePrefixMatch: /v1/completions
+    backendRefs:
+    - group: inference.networking.x-k8s.io
+      kind: InferencePool
+      name: ${pool_name}
+  - matches:
+    - path:
+        type: PathPrefix
+        value: /${LLM_NAMESPACE}/${isvc_name}/v1/chat/completions
+    filters:
+    - type: URLRewrite
+      urlRewrite:
+        path:
+          type: ReplacePrefixMatch
+          replacePrefixMatch: /v1/chat/completions
+    backendRefs:
+    - group: inference.networking.x-k8s.io
+      kind: InferencePool
+      name: ${pool_name}
+  - matches:
+    - path:
+        type: PathPrefix
+        value: /${LLM_NAMESPACE}/${isvc_name}
+    filters:
+    - type: URLRewrite
+      urlRewrite:
+        path:
+          type: ReplacePrefixMatch
+          replacePrefixMatch: /
+    backendRefs:
+    - group: inference.networking.x-k8s.io
+      kind: InferencePool
+      name: ${pool_name}
+EOF
+
+    log "batch-llm-route created: /${LLM_NAMESPACE}/${isvc_name}/* -> InferencePool/${pool_name} (via Internal Gateway)"
+}
+
+# ── 6c. AuthPolicy for batch LLM route (Internal Gateway) ──────────────────
+# Same authentication + model-level authorization as the external LLM route,
+# but NO TokenRateLimitPolicy — batch requests are exempt from token rate limits.
+
+apply_batch_llm_auth_policy() {
+    step "Creating batch-llm-route AuthPolicy (authentication + model authorization)..."
+    kubectl apply -f - <<EOF
+apiVersion: kuadrant.io/v1
+kind: AuthPolicy
+metadata:
+  name: batch-llm-route-auth
+  namespace: ${LLM_NAMESPACE}
+spec:
+  targetRef:
+    group: gateway.networking.k8s.io
+    kind: HTTPRoute
+    name: batch-llm-route
+  rules:
+    authentication:
+      kubernetes-user:
+        kubernetesTokenReview:
+          audiences:
+          - https://kubernetes.default.svc
+    authorization:
+      model-access:
+        kubernetesSubjectAccessReview:
+          user:
+            expression: auth.identity.user.username
+          authorizationGroups:
+            expression: auth.identity.user.groups
+          resourceAttributes:
+            group:
+              value: serving.kserve.io
+            resource:
+              value: llminferenceservices
+            namespace:
+              expression: request.path.split("/")[1]
+            name:
+              expression: request.path.split("/")[2]
+            verb:
+              value: get
+EOF
+    log "Batch LLM AuthPolicy applied."
+}
+
+# ── 6d. TokenRateLimitPolicy for inference ───────────────────────────────────
 
 apply_llm_token_rate_limit() {
-    local isvc_name
-    isvc_name=$(echo "${MODEL_NAME}" | tr '/' '-' | tr '[:upper:]' '[:lower:]')
+    local isvc_name="${ISVC_NAME}"
 
     # Target Gateway (not HTTPRoute) because the inference HTTPRoute name is
     # dynamically generated by LLMInferenceService controller.
@@ -702,15 +825,14 @@ EOF
     log "TokenRateLimitPolicy applied."
 }
 
-# ── 6c. AuthPolicy for batch route ────────────────────────────────────────────
-# The Gateway-level AuthPolicy checks LLMInferenceService RBAC via path-based
-# namespace/name extraction, which doesn't apply to batch API paths
-# (/v1/batches, /v1/files). Override with token auth only (no authorization).
+# ── 6e. AuthPolicy for batch route ────────────────────────────────────────────
+# The batch API paths (/v1/batches, /v1/files) don't match the /{ns}/{model}
+# pattern used for model-level authorization. Authentication only here;
+# model-level authorization happens when the batch processor forwards requests
+# to the Internal Gateway's batch-llm-route (which has its own AuthPolicy).
 
 apply_batch_auth_policy() {
     step "Creating batch-route AuthPolicy (authentication only)..."
-    # No authorization here; model-level authorization happens when batch processor
-    # forwards requests to the LLM route.
     kubectl apply -f - <<EOF
 apiVersion: kuadrant.io/v1
 kind: AuthPolicy
@@ -732,7 +854,7 @@ EOF
     log "Batch AuthPolicy applied."
 }
 
-# ── 6d. RateLimitPolicy for batch route ───────────────────────────────────────
+# ── 6f. RateLimitPolicy for batch route ───────────────────────────────────────
 
 apply_batch_request_rate_limit() {
     step "Creating batch-route RateLimitPolicy (20 req/1m per user)..."
@@ -764,14 +886,18 @@ EOF
 deploy_batch_gateway_rhoai() {
     banner "Installing Batch Gateway"
 
-    # Get model URL from LLMInferenceService
-    local isvc_name
-    isvc_name=$(echo "${MODEL_NAME}" | tr '/' '-' | tr '[:upper:]' '[:lower:]')
-    local model_url
-    model_url=$(kubectl get llminferenceservice "${isvc_name}" -n "${LLM_NAMESPACE}" \
-        -o jsonpath='{.status.url}' 2>/dev/null || echo "")
-    [ -z "${model_url}" ] && die "LLMInferenceService '${isvc_name}' has no URL. Is it ready?"
-    log "Model URL: ${model_url}"
+    local isvc_name="${ISVC_NAME}"
+
+    # Route batch processor through the Internal Gateway (ClusterIP, no rate limit)
+    # instead of the external Gateway. The Internal Gateway still uses EPP and
+    # enforces AuthPolicy (model access check with user's original token).
+    local internal_gw_svc
+    internal_gw_svc=$(kubectl get svc -n "${BATCH_INTERNAL_GATEWAY_NAMESPACE}" \
+        -l "gateway.networking.k8s.io/gateway-name=${BATCH_INTERNAL_GATEWAY_NAME}" \
+        -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
+    [ -z "${internal_gw_svc}" ] && die "No service found for Internal Gateway '${BATCH_INTERNAL_GATEWAY_NAME}'."
+    local model_url="http://${internal_gw_svc}.${BATCH_INTERNAL_GATEWAY_NAMESPACE}.svc.cluster.local/${LLM_NAMESPACE}/${isvc_name}"
+    log "Model URL (via Internal Gateway): ${model_url}"
 
     # Escape dots in model name for helm --set path
     local model_key="${MODEL_NAME//./\\.}"
@@ -784,28 +910,29 @@ deploy_batch_gateway_rhoai() {
         --set "processor.config.modelGateways.${model_key}.maxBackoff=${GW_MAX_BACKOFF}"
         --set "apiserver.config.batchAPI.passThroughHeaders={Authorization}"
     )
-    if [[ "${DEMO_TLS_INSECURE_SKIP_VERIFY}" == "1" ]]; then
-        helm_args+=(--set "processor.config.modelGateways.${model_key}.tlsInsecureSkipVerify=true")
-        warn "DEMO_TLS_INSECURE_SKIP_VERIFY=1: processor TLS verify disabled for model gateway (demo/lab only)."
-    fi
 
     do_deploy_batch_gateway "${helm_args[@]}"
 }
 
-# ── Install ──────────────────────────────────────────────────────────────────
-
-cmd_install() {
-    banner "RHOAI Platform + Batch Gateway Setup (${OPERATOR_TYPE})"
-
-    # Prerequisites
+check_prerequisites() {
+    step "Checking prerequisites..."
     local missing=()
     for cmd in oc kubectl helm jq curl; do
         command -v "$cmd" &>/dev/null || missing+=("$cmd")
     done
     [ ${#missing[@]} -gt 0 ] && die "Missing required tools: ${missing[*]}"
-    is_openshift || die "This script requires OpenShift. Use deploy-k8s.sh for vanilla Kubernetes."
+
     oc whoami &>/dev/null || die "Not logged in to OpenShift. Run 'oc login' first."
+    is_openshift || die "This script requires OpenShift. Use deploy-k8s.sh for vanilla Kubernetes."
     log "Connected to: $(oc whoami --show-server)"
+}
+
+# ── Install ──────────────────────────────────────────────────────────────────
+
+cmd_install() {
+    banner "RHOAI(${OPERATOR_TYPE}) + Batch Gateway Setup"
+
+    check_prerequisites
 
     install_cert_manager_operator
     create_selfsigned_issuer
@@ -819,6 +946,11 @@ cmd_install() {
     deploy_llm_inference_service
     apply_llm_token_rate_limit
 
+    create_batch_internal_gateway
+    create_batch_llm_httproute
+    apply_batch_llm_auth_policy
+    check_batch_internal_gateway
+
     deploy_batch_gateway_rhoai
     apply_batch_auth_policy
     apply_batch_request_rate_limit
@@ -829,14 +961,15 @@ cmd_install() {
     [ -n "${CUSTOM_CATALOG}" ] && log "  Catalog:  ${CUSTOM_CATALOG} (custom)"
     log "  Model: ${MODEL_NAME} (simulator, ${MODEL_REPLICAS} replicas, no GPU)"
     log "  Batch Gateway: ${BATCH_HELM_RELEASE} (${BATCH_NAMESPACE})"
+    if [ -n "${BATCH_IMAGE_TAG}" ]; then
+        log "  Batch Gateway image tag: ${BATCH_IMAGE_TAG}"
+    fi
     if [ -n "${BATCH_RELEASE_VERSION}" ]; then
         log "  Batch Gateway version: ${BATCH_RELEASE_VERSION} (OCI chart)"
-    elif [ -n "${BATCH_IMAGE_TAG}" ]; then
-        log "  Batch Gateway image tag: ${BATCH_IMAGE_TAG}"
     elif [ "${BATCH_DEV_VERSION}" != "local" ]; then
-        log "  Batch Gateway image tag: ${BATCH_DEV_VERSION} (commit chart)"
+        log "  Batch Gateway version: ${BATCH_DEV_VERSION} (commit chart)"
     else
-        log "  Batch Gateway image tag: latest (local chart)"
+        log "  Batch Gateway version: latest (local chart)"
     fi
     log ""
     log "Run '$0 test' to verify."
@@ -849,8 +982,7 @@ cmd_test() {
 
     set_gateway_url
 
-    local isvc_name
-    isvc_name=$(echo "${MODEL_NAME}" | tr '/' '-' | tr '[:upper:]' '[:lower:]')
+    local isvc_name="${ISVC_NAME}"
 
     log "Gateway:   ${GATEWAY_URL}"
     log "Inference: ${GATEWAY_URL}/${LLM_NAMESPACE}/${isvc_name}"
@@ -908,6 +1040,8 @@ EOF
     local llm_url="${GATEWAY_URL}/${LLM_NAMESPACE}/${isvc_name}/v1/chat/completions"
     local inference_payload="{\"model\":\"${MODEL_NAME}\",\"messages\":[{\"role\":\"user\",\"content\":\"Hello\"}],\"max_tokens\":10}"
 
+    check_batch_internal_gateway
+
     run_tests "${llm_url}" "${GATEWAY_URL}" "${MODEL_NAME}" \
         "Authorization: Bearer ${token}" \
         "Authorization: Bearer ${unauth_token}" \
@@ -943,12 +1077,18 @@ cmd_uninstall() {
     # DestinationRule (in GATEWAY_NAMESPACE, not deleted with batch namespace)
     kubectl delete destinationrule "${BATCH_HELM_RELEASE}-backend-tls" -n "${GATEWAY_NAMESPACE}" 2>/dev/null || true
 
+    # Internal Gateway resources (batch-llm-route)
+    step "Removing Internal Gateway resources..."
+    kubectl delete authpolicy batch-llm-route-auth -n "${LLM_NAMESPACE}" 2>/dev/null || true
+    kubectl delete httproute batch-llm-route -n "${LLM_NAMESPACE}" 2>/dev/null || true
+
     # TokenRateLimitPolicy
     step "Removing TokenRateLimitPolicy..."
     kubectl delete tokenratelimitpolicy inference-token-limit -n "${GATEWAY_NAMESPACE}" 2>/dev/null || true
 
-    # Named Gateway only (never delete all Gateways in a shared ingress namespace).
-    step "Removing Gateway ${GATEWAY_NAME}..."
+    # Named Gateways only (never delete all Gateways in a shared ingress namespace).
+    step "Removing Gateways..."
+    kubectl delete gateway "${BATCH_INTERNAL_GATEWAY_NAME}" -n "${BATCH_INTERNAL_GATEWAY_NAMESPACE}" 2>/dev/null || true
     kubectl delete gateway "${GATEWAY_NAME}" -n "${GATEWAY_NAMESPACE}" 2>/dev/null || true
 
     if is_demo_uninstall_all; then
@@ -987,8 +1127,8 @@ cmd_uninstall() {
         kubectl get clusterrole -o name 2>/dev/null | grep -E 'kuadrant|authorino|limitador|^clusterrole.*/dns-operator-' | xargs -r kubectl delete 2>/dev/null || true
         kubectl get clusterrolebinding -o name 2>/dev/null | grep -E 'kuadrant|authorino|limitador|^clusterrolebinding.*/dns-operator-' | xargs -r kubectl delete 2>/dev/null || true
 
-        step "Removing GatewayClass openshift-default..."
-        kubectl delete gatewayclass openshift-default 2>/dev/null || true
+        step "Removing GatewayClass ${GATEWAY_CLASS_NAME}..."
+        kubectl delete gatewayclass "${GATEWAY_CLASS_NAME}" 2>/dev/null || true
 
         # LWS
         step "Removing LWS operator..."

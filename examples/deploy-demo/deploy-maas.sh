@@ -24,6 +24,10 @@ GATEWAY_NAMESPACE="${GATEWAY_NAMESPACE:-openshift-ingress}"
 
 LLM_NAMESPACE="${LLM_NAMESPACE:-llm}"
 
+GATEWAY_CLASS_NAME="${GATEWAY_CLASS_NAME:-openshift-default}"
+BATCH_INTERNAL_GATEWAY_NAME="${BATCH_INTERNAL_GATEWAY_NAME:-batch-internal-gateway}"
+BATCH_INTERNAL_GATEWAY_NAMESPACE="${BATCH_INTERNAL_GATEWAY_NAMESPACE:-${GATEWAY_NAMESPACE}}"
+
 # ── MaaS-specific Configuration ─────────────────────────────────────────────
 MAAS_REPO="${MAAS_REPO:-https://github.com/opendatahub-io/models-as-a-service.git}"
 MAAS_REF="${MAAS_REF:-main}"
@@ -44,6 +48,8 @@ MAAS_UNAUTH_GROUP="${MAAS_UNAUTH_GROUP:-tier-unauth-users}"
 
 # Model served by MaaS simulator sample
 MAAS_MODEL_NAME="${MAAS_MODEL_NAME:-facebook/opt-125m}"
+# LLMInferenceService name after kustomize (namePrefix "facebook-opt-125m-" + resource name "simulated")
+MAAS_ISVC_NAME="${MAAS_ISVC_NAME:-facebook-opt-125m-simulated}"
 
 # ── Install MaaS Platform ───────────────────────────────────────────────────
 
@@ -55,23 +61,13 @@ install_maas() {
         return
     fi
 
-    step "Cloning MaaS repo (${MAAS_REF})..."
-    rm -rf "${MAAS_DIR}"
-    git clone --depth 1 --branch "${MAAS_REF}" "${MAAS_REPO}" "${MAAS_DIR}" 2>/dev/null \
-        || git clone "${MAAS_REPO}" "${MAAS_DIR}"
-    if [ "${MAAS_REF}" != "main" ]; then
-        (cd "${MAAS_DIR}" && git checkout "${MAAS_REF}")
-    fi
-
-    step "Running MaaS deploy script..."
-    (cd "${MAAS_DIR}" && MAAS_REF="${MAAS_REF}" ./scripts/deploy.sh)
-
-    # TODO: Remove this RBAC patch once the ODH operator includes these permissions natively.
+    # Apply RBAC before deploy.sh so maas-api can read maas-db-config on first boot.
+    # The SA doesn't exist yet but K8s allows binding to a future SA.
+    # TODO: Remove once the ODH operator includes these permissions natively.
     # In operator mode, ODH creates the maas-api SA but not the ClusterRole from
     # deployment/base/maas-api/rbac/clusterrole.yaml (that only applies in kustomize mode).
-    # This patch adds the subset of permissions that the operator doesn't provide.
     # Ref: models-as-a-service/deployment/base/maas-api/rbac/clusterrole.yaml
-    step "Patching maas-api RBAC for MaaS CRDs..."
+    step "Pre-creating maas-api RBAC for MaaS CRDs..."
     kubectl apply -f - <<EOF
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
@@ -111,10 +107,13 @@ roleRef:
   name: maas-api-extra
   apiGroup: rbac.authorization.k8s.io
 EOF
-    kubectl rollout restart deploy/maas-api -n "${MAAS_NAMESPACE}"
-    kubectl rollout status deploy/maas-api -n "${MAAS_NAMESPACE}" --timeout=180s
 
-    create_selfsigned_issuer
+    step "Cloning MaaS repo (${MAAS_REF})..."
+    rm -rf "${MAAS_DIR}"
+    git clone --depth 1 --branch "${MAAS_REF}" "${MAAS_REPO}" "${MAAS_DIR}"
+
+    step "Running MaaS deploy script..."
+    (cd "${MAAS_DIR}" && MAAS_REF="${MAAS_REF}" ./scripts/deploy.sh)
 
     log "MaaS platform installed."
 }
@@ -124,8 +123,7 @@ EOF
 deploy_sample_model() {
     step "Deploying sample model (simulator) in namespace '${LLM_NAMESPACE}'..."
 
-    # kustomize namePrefix produces "facebook-opt-125m-simulated"
-    local isvc_name="facebook-opt-125m-simulated"
+    local isvc_name="${MAAS_ISVC_NAME}"
 
     if kubectl get llminferenceservice "${isvc_name}" -n "${LLM_NAMESPACE}" &>/dev/null; then
         log "Sample model '${isvc_name}' already exists. Skipping."
@@ -133,6 +131,7 @@ deploy_sample_model() {
     fi
 
     kubectl get namespace "${LLM_NAMESPACE}" &>/dev/null || kubectl create namespace "${LLM_NAMESPACE}"
+    kubectl label namespace "${LLM_NAMESPACE}" llm-d.ai/gateway-route=true --overwrite
 
     local samples_dir="${MAAS_DIR}/docs/samples/models/simulator"
     if [ ! -d "${samples_dir}" ]; then
@@ -152,7 +151,6 @@ deploy_sample_model() {
     step "Waiting for LLMInferenceService to be ready..."
     if ! oc wait "llminferenceservice/${isvc_name}" -n "${LLM_NAMESPACE}" \
             --for=condition=Ready --timeout=300s 2>/dev/null; then
-        die "LLMInferenceService not ready after 300s"
         oc get "llminferenceservice/${isvc_name}" -n "${LLM_NAMESPACE}" -o yaml 2>/dev/null || true
         oc get events -n "${LLM_NAMESPACE}" --sort-by='.lastTimestamp' 2>/dev/null | tail -10 || true
         die "Model '${isvc_name}' did not become ready"
@@ -160,30 +158,147 @@ deploy_sample_model() {
     log "Sample model '${isvc_name}' is ready."
 }
 
+# ── Batch LLM HTTPRoute on Internal Gateway ─────────────────────────────────
+# Routes batch processor inference traffic through the Internal Gateway (ClusterIP)
+# to the same InferencePool, preserving EPP but bypassing TokenRateLimitPolicy.
+
+create_batch_llm_httproute() {
+    local isvc_name="${MAAS_ISVC_NAME}"
+
+    step "Discovering InferencePool for LLMInferenceService '${isvc_name}'..."
+    local pool_name
+    pool_name=$(kubectl get inferencepool -n "${LLM_NAMESPACE}" -o json | \
+        jq -r --arg owner "${isvc_name}" \
+        '.items[] | select(.metadata.ownerReferences[]?.name == $owner) | .metadata.name' \
+        2>/dev/null | head -1)
+    [ -z "${pool_name}" ] && die "No InferencePool owned by LLMInferenceService '${isvc_name}' found in namespace '${LLM_NAMESPACE}'."
+    log "InferencePool: ${pool_name} (owned by ${isvc_name})"
+
+    step "Creating batch-llm-route on Internal Gateway..."
+    kubectl apply -f - <<EOF
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: batch-llm-route
+  namespace: ${LLM_NAMESPACE}
+spec:
+  parentRefs:
+  - name: ${BATCH_INTERNAL_GATEWAY_NAME}
+    namespace: ${BATCH_INTERNAL_GATEWAY_NAMESPACE}
+  rules:
+  - matches:
+    - path:
+        type: PathPrefix
+        value: /${LLM_NAMESPACE}/${isvc_name}/v1/completions
+    filters:
+    - type: URLRewrite
+      urlRewrite:
+        path:
+          type: ReplacePrefixMatch
+          replacePrefixMatch: /v1/completions
+    backendRefs:
+    - group: inference.networking.x-k8s.io
+      kind: InferencePool
+      name: ${pool_name}
+  - matches:
+    - path:
+        type: PathPrefix
+        value: /${LLM_NAMESPACE}/${isvc_name}/v1/chat/completions
+    filters:
+    - type: URLRewrite
+      urlRewrite:
+        path:
+          type: ReplacePrefixMatch
+          replacePrefixMatch: /v1/chat/completions
+    backendRefs:
+    - group: inference.networking.x-k8s.io
+      kind: InferencePool
+      name: ${pool_name}
+  - matches:
+    - path:
+        type: PathPrefix
+        value: /${LLM_NAMESPACE}/${isvc_name}
+    filters:
+    - type: URLRewrite
+      urlRewrite:
+        path:
+          type: ReplacePrefixMatch
+          replacePrefixMatch: /
+    backendRefs:
+    - group: inference.networking.x-k8s.io
+      kind: InferencePool
+      name: ${pool_name}
+EOF
+
+    log "batch-llm-route created: /${LLM_NAMESPACE}/${isvc_name}/* -> InferencePool/${pool_name} (via Internal Gateway)"
+}
+
+# ── AuthPolicy for batch LLM route (Internal Gateway) ──────────────────────
+# API key authentication via maas-api callback, NO TokenRateLimitPolicy.
+# Model-level authorization was validated at batch job creation time.
+
+apply_batch_llm_auth_policy() {
+    local isvc_name="${MAAS_ISVC_NAME}"
+    local source_policy="maas-auth-${isvc_name}"
+
+    step "Copying AuthPolicy '${source_policy}' for batch-llm-route (no TokenRateLimitPolicy)..."
+
+    local policy_json
+    policy_json=$(kubectl get authpolicy "${source_policy}" -n "${LLM_NAMESPACE}" -o json 2>/dev/null)
+    if [ -z "${policy_json}" ]; then
+        warn "AuthPolicy '${source_policy}' not found in namespace '${LLM_NAMESPACE}'."
+        warn "Ensure MaaSAuthPolicy is reconciled before running this step."
+        return 1
+    fi
+
+    echo "${policy_json}" \
+        | jq '{
+            apiVersion: .apiVersion,
+            kind: .kind,
+            metadata: {
+                name: "batch-llm-route-auth",
+                namespace: .metadata.namespace
+            },
+            spec: (.spec | .targetRef = {
+                group: "gateway.networking.k8s.io",
+                kind: "HTTPRoute",
+                name: "batch-llm-route"
+            })
+        }' \
+        | kubectl apply -f - \
+        || die "Failed to apply batch-llm-route AuthPolicy (source: ${source_policy})"
+
+    log "batch-llm-route AuthPolicy applied (copied from ${source_policy}, no TokenRateLimitPolicy)."
+}
+
 # ── Batch Gateway (MaaS) ──────────────────────────────────────────────────────
 
 deploy_batch_gateway_maas() {
     banner "Installing Batch Gateway"
 
-    # MaaS gateway routes: /<namespace>/<isvc-name>/v1/...
-    # Use external hostname because the gateway listener requires SNI matching.
-    # Internal service FQDN causes TLS handshake failure (connection reset).
-    local gw_host
-    gw_host=$(get_maas_gateway_host)
-    local gw_base="${gw_host}/${LLM_NAMESPACE}/facebook-opt-125m-simulated"
+    local isvc_name="${MAAS_ISVC_NAME}"
+
+    # Route batch processor through the Internal Gateway (ClusterIP, no token rate limit)
+    # instead of the external MaaS Gateway. The Internal Gateway still uses EPP and
+    # enforces AuthPolicy (API key validation).
+    local internal_gw_svc
+    internal_gw_svc=$(kubectl get svc -n "${BATCH_INTERNAL_GATEWAY_NAMESPACE}" \
+        -l "gateway.networking.k8s.io/gateway-name=${BATCH_INTERNAL_GATEWAY_NAME}" \
+        -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
+    [ -z "${internal_gw_svc}" ] && die "No service found for Internal Gateway '${BATCH_INTERNAL_GATEWAY_NAME}'."
+    local model_url="http://${internal_gw_svc}.${BATCH_INTERNAL_GATEWAY_NAMESPACE}.svc.cluster.local/${LLM_NAMESPACE}/${isvc_name}"
+    log "Model URL (via Internal Gateway): ${model_url}"
+
+    local model_key="${MAAS_MODEL_NAME}"
 
     local helm_args=(
-        --set "processor.config.modelGateways.${MAAS_MODEL_NAME}.url=${gw_base}"
-        --set "processor.config.modelGateways.${MAAS_MODEL_NAME}.requestTimeout=${GW_REQUEST_TIMEOUT}"
-        --set "processor.config.modelGateways.${MAAS_MODEL_NAME}.maxRetries=${GW_MAX_RETRIES}"
-        --set "processor.config.modelGateways.${MAAS_MODEL_NAME}.initialBackoff=${GW_INITIAL_BACKOFF}"
-        --set "processor.config.modelGateways.${MAAS_MODEL_NAME}.maxBackoff=${GW_MAX_BACKOFF}"
+        --set "processor.config.modelGateways.${model_key}.url=${model_url}"
+        --set "processor.config.modelGateways.${model_key}.requestTimeout=${GW_REQUEST_TIMEOUT}"
+        --set "processor.config.modelGateways.${model_key}.maxRetries=${GW_MAX_RETRIES}"
+        --set "processor.config.modelGateways.${model_key}.initialBackoff=${GW_INITIAL_BACKOFF}"
+        --set "processor.config.modelGateways.${model_key}.maxBackoff=${GW_MAX_BACKOFF}"
         --set "apiserver.config.batchAPI.passThroughHeaders={Authorization,X-MaaS-Subscription}"
     )
-    if [[ "${DEMO_TLS_INSECURE_SKIP_VERIFY}" == "1" ]]; then
-        helm_args+=(--set "processor.config.modelGateways.${MAAS_MODEL_NAME}.tlsInsecureSkipVerify=true")
-        warn "DEMO_TLS_INSECURE_SKIP_VERIFY=1: processor TLS verify disabled for model gateway (demo/lab only)."
-    fi
 
     do_deploy_batch_gateway "${helm_args[@]}"
 }
@@ -194,7 +309,7 @@ MAAS_TOKEN_RATE_LIMIT="${MAAS_TOKEN_RATE_LIMIT:-500}"
 MAAS_TOKEN_RATE_WINDOW="${MAAS_TOKEN_RATE_WINDOW:-1m}"
 
 create_maas_model_policies() {
-    local isvc_name="facebook-opt-125m-simulated"
+    local isvc_name="${MAAS_ISVC_NAME}"
 
     kubectl get namespace "${MAAS_POLICY_NAMESPACE}" &>/dev/null || kubectl create namespace "${MAAS_POLICY_NAMESPACE}"
 
@@ -538,24 +653,35 @@ get_maas_api_key() {
     echo "${api_key}"
 }
 
-# ── Install ──────────────────────────────────────────────────────────────────
-
-cmd_install() {
-    banner "MaaS + Batch Gateway Setup"
-
+check_prerequisites() {
     step "Checking prerequisites..."
     local missing=()
     for cmd in oc kubectl helm kustomize jq htpasswd; do
         command -v "$cmd" &>/dev/null || missing+=("$cmd")
     done
     [ ${#missing[@]} -gt 0 ] && die "Missing required tools: ${missing[*]}"
+
     oc whoami &>/dev/null || die "Not logged in to OpenShift. Run 'oc login' first."
     is_openshift || die "This script requires an OpenShift cluster (oc, OAuth, LLMInferenceService)."
     log "Connected to cluster: $(oc whoami --show-server)"
+}
+
+# ── Install ──────────────────────────────────────────────────────────────────
+
+cmd_install() {
+    banner "MaaS + Batch Gateway Setup"
+
+    check_prerequisites
 
     install_maas
+    create_selfsigned_issuer
     deploy_sample_model
     create_maas_model_policies
+
+    create_batch_internal_gateway
+    create_batch_llm_httproute
+    apply_batch_llm_auth_policy
+    check_batch_internal_gateway
 
     deploy_batch_gateway_maas
     apply_batch_auth_policy
@@ -565,16 +691,19 @@ cmd_install() {
 
     local host
     host=$(get_maas_gateway_host)
-    log "Deployment complete!"
+    log "Setup complete!"
     log "  MaaS Gateway: ${host}"
     log "  Batch API:    ${host}/v1/batches"
     log "  Test user:    ${MAAS_TEST_USER} / ${MAAS_TEST_PASS} (group: ${MAAS_TEST_GROUP})"
+    if [ -n "${BATCH_IMAGE_TAG}" ]; then
+        log "  Batch Gateway image tag: ${BATCH_IMAGE_TAG}"
+    fi
     if [ -n "${BATCH_RELEASE_VERSION}" ]; then
         log "  Batch Gateway version: ${BATCH_RELEASE_VERSION} (OCI chart)"
     elif [ "${BATCH_DEV_VERSION}" != "local" ]; then
-        log "  Batch Gateway image tag: ${BATCH_DEV_VERSION} (commit chart)"
+        log "  Batch Gateway version: ${BATCH_DEV_VERSION} (commit chart)"
     else
-        log "  Batch Gateway image tag: latest (local chart)"
+        log "  Batch Gateway version: latest (local chart)"
     fi
     log ""
     log "Run '$0 test' to verify."
@@ -601,8 +730,10 @@ cmd_test() {
         get_maas_api_key "${gw_url}")
     log "Unauthorized user API key obtained"
 
-    local llm_url="${gw_url}/${LLM_NAMESPACE}/facebook-opt-125m-simulated/v1/chat/completions"
+    local llm_url="${gw_url}/${LLM_NAMESPACE}/${MAAS_ISVC_NAME}/v1/chat/completions"
     local inference_payload="{\"model\":\"${MAAS_MODEL_NAME}\",\"messages\":[{\"role\":\"user\",\"content\":\"Hello\"}],\"max_tokens\":10}"
+
+    check_batch_internal_gateway
 
     run_tests "${llm_url}" "${gw_url}" "${MAAS_MODEL_NAME}" \
         "Authorization: Bearer ${api_key}" \
@@ -633,6 +764,12 @@ cmd_uninstall() {
     kubectl delete pvc "${BATCH_FILES_PVC_NAME}" -n "${BATCH_NAMESPACE}" 2>/dev/null || true
     kubectl delete namespace "${BATCH_NAMESPACE}" --timeout=60s 2>/dev/null || true
     log "Batch gateway uninstalled."
+
+    # Internal Gateway resources (batch-llm-route)
+    step "Removing Internal Gateway resources..."
+    kubectl delete authpolicy batch-llm-route-auth -n "${LLM_NAMESPACE}" 2>/dev/null || true
+    kubectl delete httproute batch-llm-route -n "${LLM_NAMESPACE}" 2>/dev/null || true
+    kubectl delete gateway "${BATCH_INTERNAL_GATEWAY_NAME}" -n "${BATCH_INTERNAL_GATEWAY_NAMESPACE}" 2>/dev/null || true
 
     # RBAC patch created by this demo (safe to remove; does not delete MaaS core).
     kubectl delete clusterrolebinding maas-api-extra 2>/dev/null || true
@@ -706,7 +843,7 @@ usage() {
     echo "  help       Show this help message"
     echo ""
     echo "Environment Variables:"
-    echo "  MAAS_REF              MaaS git ref (default: main)"
+    echo "  MAAS_REF              MaaS branch or tag (default: main)"
     echo "  MAAS_TEST_USER        Test username (default: testuser)"
     echo "  MAAS_TEST_GROUP       Test user group (default: tier-free-users)"
     echo "  UNINSTALL_ALL            Set to 1 to run MaaS cleanup script / remove operators (ephemeral clusters only)"
