@@ -21,6 +21,7 @@ package redis_test
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"maps"
 	"os"
@@ -316,7 +317,7 @@ func TestRedisDSClient(t *testing.T) {
 		updId := batchesIDs[0]
 		updBatch := batches[updId]
 		updBatch.Status = []byte("statusUpdated")
-		err := batchClient.DBUpdate(context.Background(), updBatch)
+		err := batchClient.DBUpdate(context.Background(), updBatch, nil)
 		if err != nil {
 			t.Fatalf("Failed to update item: %v", err)
 		}
@@ -558,7 +559,7 @@ func TestRedisDSClient(t *testing.T) {
 		updId := filesIDs[0]
 		updFile := files[updId]
 		updFile.Status = []byte("statusUpdated")
-		err := fileClient.DBUpdate(context.Background(), updFile)
+		err := fileClient.DBUpdate(context.Background(), updFile, nil)
 		if err != nil {
 			t.Fatalf("Failed to update item: %v", err)
 		}
@@ -1581,7 +1582,7 @@ func TestRedisDSClient(t *testing.T) {
 				Status: []byte("updated"),
 			},
 		}
-		err = batchClient.DBUpdate(context.Background(), nonExistentBatch)
+		err = batchClient.DBUpdate(context.Background(), nonExistentBatch, nil)
 		if err != nil {
 			t.Fatalf("Update of non-existent item should not error: %v", err)
 		}
@@ -1594,7 +1595,7 @@ func TestRedisDSClient(t *testing.T) {
 				ID: "",
 			},
 		}
-		err = batchClient.DBUpdate(context.Background(), invalidUpdate)
+		err = batchClient.DBUpdate(context.Background(), invalidUpdate, nil)
 		if err == nil {
 			t.Fatalf("Expected error when updating batch with empty ID")
 		}
@@ -1735,7 +1736,7 @@ func TestRedisDSClient(t *testing.T) {
 				Status: []byte{},
 			},
 		}
-		err = batchClient.DBUpdate(context.Background(), updateBatch)
+		err = batchClient.DBUpdate(context.Background(), updateBatch, nil)
 		if err != nil {
 			t.Fatalf("Failed to update batch: %v", err)
 		}
@@ -2218,6 +2219,285 @@ func TestRedisDSClient(t *testing.T) {
 
 		// Cleanup.
 		_, _ = batchClient.DBDelete(context.Background(), []string{batch1ID, batch2ID})
+	})
+
+	t.Run("CAS update", func(t *testing.T) {
+		t.Parallel()
+		baseClient, batchClient, _, _ := setupRedisDSClients(t, redisUrl, redisCaCert)
+		t.Cleanup(func() {
+			_ = baseClient.Close()
+		})
+
+		tests := []struct {
+			name           string
+			initialStatus  []byte
+			expectedStatus []byte
+			newStatus      []byte
+			skipStore      bool
+			wantErr        bool
+		}{
+			{
+				name:           "matching expected status succeeds",
+				initialStatus:  []byte("validating"),
+				expectedStatus: []byte("validating"),
+				newStatus:      []byte("in_progress"),
+			},
+			{
+				name:           "mismatched expected status returns ErrConflict",
+				initialStatus:  []byte("in_progress"),
+				expectedStatus: []byte("validating"),
+				newStatus:      []byte("failed"),
+				wantErr:        true,
+			},
+			{
+				name:           "non-existent key returns ErrConflict",
+				expectedStatus: []byte("validating"),
+				newStatus:      []byte("in_progress"),
+				skipStore:      true,
+				wantErr:        true,
+			},
+			{
+				name:           "nil expected status bypasses CAS",
+				initialStatus:  []byte("validating"),
+				expectedStatus: nil,
+				newStatus:      []byte("in_progress"),
+			},
+		}
+
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				id := uuid.New().String()
+				batch := &db_api.BatchItem{
+					BaseIndexes:  db_api.BaseIndexes{ID: id, TenantID: "Tnt1"},
+					BaseContents: db_api.BaseContents{Status: tt.initialStatus},
+				}
+				if !tt.skipStore {
+					if err := batchClient.DBStore(context.Background(), batch); err != nil {
+						t.Fatalf("Failed to store: %v", err)
+					}
+				}
+
+				batch.Status = tt.newStatus
+				err := batchClient.DBUpdate(context.Background(), batch, tt.expectedStatus)
+
+				if tt.wantErr {
+					if !errors.Is(err, db_api.ErrConflict) {
+						t.Fatalf("expected ErrConflict, got %v", err)
+					}
+					if !tt.skipStore {
+						// Verify status unchanged.
+						items, _, _, err := batchClient.DBGet(context.Background(),
+							&db_api.BatchQuery{BaseQuery: db_api.BaseQuery{IDs: []string{id}}}, true, 0, 1)
+						if err != nil {
+							t.Fatalf("Failed to get: %v", err)
+						}
+						if !bytes.Equal(items[0].Status, tt.initialStatus) {
+							t.Fatalf("status should be unchanged: got %s, want %s", items[0].Status, tt.initialStatus)
+						}
+					}
+				} else {
+					if err != nil {
+						t.Fatalf("unexpected error: %v", err)
+					}
+					// Verify status updated.
+					items, _, _, err := batchClient.DBGet(context.Background(),
+						&db_api.BatchQuery{BaseQuery: db_api.BaseQuery{IDs: []string{id}}}, true, 0, 1)
+					if err != nil {
+						t.Fatalf("Failed to get: %v", err)
+					}
+					if !bytes.Equal(items[0].Status, tt.newStatus) {
+						t.Fatalf("status mismatch: got %s, want %s", items[0].Status, tt.newStatus)
+					}
+				}
+
+				_, _ = batchClient.DBDelete(context.Background(), []string{id})
+			})
+		}
+	})
+
+	t.Run("InFlight operations", func(t *testing.T) {
+		t.Parallel()
+		baseClient, _, _, exchClient := setupRedisDSClients(t, redisUrl, redisCaCert)
+		t.Cleanup(func() {
+			_ = baseClient.Close()
+		})
+
+		t.Run("set and get round-trip", func(t *testing.T) {
+			err := exchClient.InFlightSet(context.Background(), "job-1", "pod-a")
+			if err != nil {
+				t.Fatalf("InFlightSet failed: %v", err)
+			}
+
+			all, err := exchClient.InFlightGetAll(context.Background())
+			if err != nil {
+				t.Fatalf("InFlightGetAll failed: %v", err)
+			}
+			entry, ok := all["job-1"]
+			if !ok {
+				t.Fatal("expected job-1 in in-flight entries")
+			}
+			if entry.ProcessorID != "pod-a" {
+				t.Fatalf("expected ProcessorID pod-a, got %s", entry.ProcessorID)
+			}
+			if entry.LastSeen <= 0 {
+				t.Fatalf("expected positive LastSeen, got %d", entry.LastSeen)
+			}
+
+			// Cleanup.
+			_ = exchClient.InFlightDelete(context.Background(), "job-1")
+		})
+
+		t.Run("set overwrites existing entry", func(t *testing.T) {
+			_ = exchClient.InFlightSet(context.Background(), "job-2", "pod-a")
+			_ = exchClient.InFlightSet(context.Background(), "job-2", "pod-b")
+
+			all, err := exchClient.InFlightGetAll(context.Background())
+			if err != nil {
+				t.Fatalf("InFlightGetAll failed: %v", err)
+			}
+			if all["job-2"].ProcessorID != "pod-b" {
+				t.Fatalf("expected overwritten ProcessorID pod-b, got %s", all["job-2"].ProcessorID)
+			}
+
+			_ = exchClient.InFlightDelete(context.Background(), "job-2")
+		})
+
+		t.Run("delete removes entry", func(t *testing.T) {
+			_ = exchClient.InFlightSet(context.Background(), "job-3", "pod-a")
+			err := exchClient.InFlightDelete(context.Background(), "job-3")
+			if err != nil {
+				t.Fatalf("InFlightDelete failed: %v", err)
+			}
+
+			all, err := exchClient.InFlightGetAll(context.Background())
+			if err != nil {
+				t.Fatalf("InFlightGetAll failed: %v", err)
+			}
+			if _, ok := all["job-3"]; ok {
+				t.Fatal("expected job-3 to be deleted")
+			}
+		})
+
+		t.Run("delete non-existent key is idempotent", func(t *testing.T) {
+			err := exchClient.InFlightDelete(context.Background(), "non-existent")
+			if err != nil {
+				t.Fatalf("InFlightDelete of non-existent key should not error: %v", err)
+			}
+		})
+
+		t.Run("get all on empty hash returns empty map", func(t *testing.T) {
+			all, err := exchClient.InFlightGetAll(context.Background())
+			if err != nil {
+				t.Fatalf("InFlightGetAll failed: %v", err)
+			}
+			if len(all) != 0 {
+				t.Fatalf("expected empty map, got %d entries", len(all))
+			}
+		})
+
+		t.Run("validation rejects empty jobID", func(t *testing.T) {
+			if err := exchClient.InFlightSet(context.Background(), "", "pod-a"); err == nil {
+				t.Fatal("expected error for empty jobID")
+			}
+			if err := exchClient.InFlightDelete(context.Background(), ""); err == nil {
+				t.Fatal("expected error for empty jobID")
+			}
+		})
+
+		t.Run("validation rejects empty processorID", func(t *testing.T) {
+			if err := exchClient.InFlightSet(context.Background(), "job-x", ""); err == nil {
+				t.Fatal("expected error for empty processorID")
+			}
+		})
+	})
+
+	t.Run("PQGetIDs", func(t *testing.T) {
+		if minirds != nil {
+			t.Skip("Miniredis model")
+		}
+		baseClient, _, _, exchClient := setupRedisDSClients(t, redisUrl, redisCaCert)
+		t.Cleanup(func() {
+			_ = baseClient.Close()
+		})
+
+		tests := []struct {
+			name     string
+			enqueue  int
+			dequeue  int
+			wantSize int
+		}{
+			{
+				name:     "empty queue returns empty map",
+				enqueue:  0,
+				wantSize: 0,
+			},
+			{
+				name:     "returns all enqueued IDs",
+				enqueue:  5,
+				wantSize: 5,
+			},
+			{
+				name:     "excludes dequeued IDs",
+				enqueue:  5,
+				dequeue:  2,
+				wantSize: 3,
+			},
+		}
+
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				var enqueuedIDs []string
+				for range tt.enqueue {
+					item := &db_api.BatchJobPriority{
+						ID:   uuid.New().String(),
+						SLO:  time.Now().Add(time.Hour),
+						TTL:  1000,
+						Data: []byte("test"),
+					}
+					if err := exchClient.PQEnqueue(context.Background(), item); err != nil {
+						t.Fatalf("Failed to enqueue: %v", err)
+					}
+					enqueuedIDs = append(enqueuedIDs, item.ID)
+				}
+
+				if tt.dequeue > 0 {
+					items, err := exchClient.PQDequeue(context.Background(), 1*time.Second, tt.dequeue)
+					if err != nil {
+						t.Fatalf("Failed to dequeue: %v", err)
+					}
+					if len(items) != tt.dequeue {
+						t.Fatalf("expected %d dequeued, got %d", tt.dequeue, len(items))
+					}
+				}
+
+				ids, err := exchClient.PQGetIDs(context.Background())
+				if err != nil {
+					t.Fatalf("PQGetIDs failed: %v", err)
+				}
+				if len(ids) != tt.wantSize {
+					t.Fatalf("expected %d IDs, got %d", tt.wantSize, len(ids))
+				}
+
+				// Verify returned IDs are from the enqueued set.
+				for id := range ids {
+					found := false
+					for _, eid := range enqueuedIDs {
+						if id == eid {
+							found = true
+							break
+						}
+					}
+					if !found {
+						t.Fatalf("unexpected ID %s in PQGetIDs result", id)
+					}
+				}
+
+				// Cleanup: drain remaining items.
+				if tt.wantSize > 0 {
+					_, _ = exchClient.PQDequeue(context.Background(), 1*time.Second, tt.wantSize)
+				}
+			})
+		}
 	})
 }
 

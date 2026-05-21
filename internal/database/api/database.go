@@ -20,11 +20,19 @@ package api
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
 	"github.com/llm-d-incubation/batch-gateway/internal/shared/store"
 )
+
+// ErrConflict is returned by DBUpdate when expectedStatus is non-nil and
+// the current status in the database does not match. Callers can use
+// errors.Is(err, ErrConflict) to detect CAS failures.
+var ErrConflict = errors.New("status conflict")
+
+// -- Metadata storage --
 
 // DBClient is a generic interface for managing database items in persistent storage.
 //
@@ -66,7 +74,12 @@ type DBClient[T any, Q any] interface {
 	// The function will update in the item's record in the database - all the dynamic fields of the item which are not empty
 	// in the given item object.
 	// Any dynamic field that is empty in the given item object - will not be updated in the item's record in the database.
-	DBUpdate(ctx context.Context, item *T) (err error)
+	//
+	// When expectedStatus is non-nil, the update is conditional (CAS): it only
+	// succeeds if the current status in the database matches expectedStatus exactly.
+	// Returns ErrConflict if the status has changed since it was read.
+	// Pass nil to skip the CAS check (unconditional update).
+	DBUpdate(ctx context.Context, item *T, expectedStatus []byte) (err error)
 
 	// DBDelete removes items by their IDs.
 	DBDelete(ctx context.Context, IDs []string) (deletedIDs []string, err error)
@@ -131,6 +144,9 @@ type BatchPriorityQueueClient interface {
 	// It returns the number of deleted objects.
 	// An error is returned only if the deletion operation failed.
 	PQDelete(ctx context.Context, jobPriority *BatchJobPriority) (nDeleted int, err error)
+
+	// PQGetIDs returns the set of all job IDs currently in the priority queue.
+	PQGetIDs(ctx context.Context) (map[string]bool, error)
 }
 
 // -- Batch jobs events and channels --
@@ -198,4 +214,29 @@ type BatchStatusClient interface {
 
 	// StatusDelete deletes the status data for a job.
 	StatusDelete(ctx context.Context, ID string) (nDeleted int, err error)
+}
+
+// -- In-flight job tracking --
+
+// InFlightEntry records which processor owns a dequeued job and when it last
+// reported liveness.
+type InFlightEntry struct {
+	ProcessorID string `json:"pid"`
+	LastSeen    int64  `json:"ls"`
+}
+
+// InFlightClient tracks jobs that have been dequeued and are being processed.
+type InFlightClient interface {
+	store.BatchClientAdmin
+
+	// InFlightSet records or refreshes the in-flight entry for a job.
+	// Called after dequeue and periodically as a heartbeat.
+	InFlightSet(ctx context.Context, jobID, processorID string) error
+
+	// InFlightDelete removes the in-flight entry for a job.
+	// Called when the job reaches a terminal state.
+	InFlightDelete(ctx context.Context, jobID string) error
+
+	// InFlightGetAll returns all in-flight entries keyed by job ID.
+	InFlightGetAll(ctx context.Context) (map[string]*InFlightEntry, error)
 }

@@ -20,7 +20,7 @@ func TestClientsetFields_Assigned(t *testing.T) {
 func TestNewProcessor_InvalidNumWorkers(t *testing.T) {
 	cfg := config.NewConfig()
 	cfg.NumWorkers = 0
-	_, err := NewProcessor(cfg, &clientset.Clientset{}, testLogger(t))
+	_, err := NewProcessor(cfg, &clientset.Clientset{}, "test-pod", testLogger(t))
 	if err == nil {
 		t.Fatalf("expected error for NumWorkers=0")
 	}
@@ -29,7 +29,7 @@ func TestNewProcessor_InvalidNumWorkers(t *testing.T) {
 func TestNewProcessor_InvalidGlobalConcurrency(t *testing.T) {
 	cfg := config.NewConfig()
 	cfg.Concurrency.Global = -1
-	_, err := NewProcessor(cfg, &clientset.Clientset{}, testLogger(t))
+	_, err := NewProcessor(cfg, &clientset.Clientset{}, "test-pod", testLogger(t))
 	if err == nil {
 		t.Fatalf("expected error for concurrency.global=-1")
 	}
@@ -111,6 +111,45 @@ func TestSemaphoreGuard_JobBaseCtxSurvives(t *testing.T) {
 
 	if parentCtx.Err() != nil {
 		t.Fatal("parentCtx (job base) must NOT be cancelled when the semaphore guard fires")
+	}
+}
+
+func TestHeartbeat_StopsOnContextCancel(t *testing.T) {
+	origInterval := heartbeatInterval
+	heartbeatInterval = 10 * time.Millisecond
+	t.Cleanup(func() { heartbeatInterval = origInterval })
+
+	mock := newCountingInFlightClient()
+	cfg := config.NewConfig()
+	p := mustNewProcessor(t, cfg, validProcessorClients(t))
+	p.inflight = mock
+
+	ctx, cancel := context.WithCancel(testLoggerCtx(t))
+	done := make(chan struct{})
+	go func() {
+		p.heartbeat(ctx, "job-1")
+		close(done)
+	}()
+
+	// Let a few heartbeats fire.
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("heartbeat goroutine did not stop after context cancel")
+	}
+
+	countAtStop := mock.setCount.Load()
+	if countAtStop == 0 {
+		t.Fatal("expected at least one InFlightSet call")
+	}
+
+	// Verify no more calls after cancel.
+	time.Sleep(30 * time.Millisecond)
+	if mock.setCount.Load() != countAtStop {
+		t.Fatal("InFlightSet called after context was cancelled")
 	}
 }
 
