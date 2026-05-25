@@ -1,6 +1,8 @@
 # Batch Gateway on Red Hat OpenShift AI (RHOAI)
 
-This guide demonstrates how to deploy batch-gateway on OpenShift with RHOAI (Red Hat OpenShift AI), using Red Hat Connectivity Link (Kuadrant) for authentication, authorization, and rate limiting.
+This guide demonstrates how to deploy batch-gateway on OpenShift with RHOAI (Red Hat OpenShift AI), using Red Hat Connectivity Link (RHCL/Kuadrant) for authentication, authorization, and rate limiting.
+
+> **Note**: The batch gateway does not depend on RHCL. This guide uses RHCL for gateway-level auth and rate limiting, but any policy engine that works with Gateway API can be used instead.
 
 ## 1. Architecture Overview
 
