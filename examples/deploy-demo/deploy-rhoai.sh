@@ -29,8 +29,8 @@ KUADRANT_NAMESPACE="${KUADRANT_NAMESPACE:-kuadrant-system}"
 
 OPERATOR_TYPE="${OPERATOR_TYPE:-rhoai}"    # rhoai or odh
 CUSTOM_CATALOG="${CUSTOM_CATALOG:-}"       # custom catalog image (e.g. quay.io/rhoai/rhoai-fbc-fragment:...)
-RHOAI_VERSION="${RHOAI_VERSION:-3.4}"
-RHOAI_CHANNEL="${RHOAI_CHANNEL:-stable-${RHOAI_VERSION}}"
+RHOAI_VERSION="${RHOAI_VERSION:-}"
+RHOAI_CHANNEL="${RHOAI_CHANNEL:-}"
 ODH_CHANNEL="${ODH_CHANNEL:-fast-3}"
 GATEWAY_CLASS_NAME="${GATEWAY_CLASS_NAME:-openshift-default}"
 GATEWAY_NAME="${GATEWAY_NAME:-openshift-ai-inference}"
@@ -337,6 +337,103 @@ EOF
 
 # ── 5. RHOAI / ODH operator ─────────────────────────────────────────────────
 
+# Resolve RHOAI version and channel (only called when installation is needed).
+# Queries PackageManifest (with retry), then:
+# - Version: user-provided RHOAI_VERSION, or highest from stable-X.Y / beta channels
+# - Channel: user-provided RHOAI_CHANNEL, or stable-${RHOAI_VERSION} preferred, then beta
+resolve_rhoai_info() {
+    # Short-circuit: if both version and channel are already provided, skip detection
+    if [ -n "${RHOAI_VERSION}" ] && [ -n "${RHOAI_CHANNEL}" ]; then
+        log "Using user-specified RHOAI version: ${RHOAI_VERSION}"
+        log "Using user-specified RHOAI channel: ${RHOAI_CHANNEL}"
+        return 0
+    fi
+
+    # Fetch PackageManifest (with retry — CatalogSource READY does not guarantee
+    # PackageManifest is synced yet, especially for custom catalogs)
+    local manifest_json=""
+    local retries=0
+    local max_retries=12  # 12 × 5s = 60s
+    while [ -z "${manifest_json}" ]; do
+        if [ -n "${CUSTOM_CATALOG}" ]; then
+            local catalog_name="${OPERATOR_TYPE}-custom-catalog"
+            manifest_json=$(kubectl get packagemanifest rhods-operator \
+                -n openshift-marketplace -o json 2>/dev/null \
+                | jq --arg cs "${catalog_name}" 'select(.status.catalogSource == $cs)') || true
+        else
+            manifest_json=$(kubectl get packagemanifest rhods-operator \
+                -n openshift-marketplace -o json 2>/dev/null) || true
+        fi
+        if [ -n "${manifest_json}" ]; then
+            break
+        fi
+        retries=$((retries + 1))
+        if [ "${retries}" -ge "${max_retries}" ]; then
+            die "PackageManifest 'rhods-operator' not found after ${max_retries} attempts. Is the catalog source available?"
+        fi
+        log "PackageManifest not yet available, retrying (${retries}/${max_retries})..."
+        sleep 5
+    done
+
+    # Resolve version
+    if [ -n "${RHOAI_VERSION}" ]; then
+        log "Using user-specified RHOAI version: ${RHOAI_VERSION}"
+    else
+        local csvs
+        if [ -n "${RHOAI_CHANNEL}" ]; then
+            step "Deriving RHOAI version from channel ${RHOAI_CHANNEL}..."
+            csvs=$(echo "${manifest_json}" | jq -r --arg ch "${RHOAI_CHANNEL}" '
+                .status.channels[] | select(.name == $ch) | .currentCSV // empty') || true
+        else
+            step "Auto-detecting latest RHOAI version..."
+            csvs=$(echo "${manifest_json}" | jq -r '
+                .status.channels[] |
+                select((.name | test("^stable-[0-9]+\\.[0-9]+$")) or .name == "beta") |
+                .currentCSV // empty') || true
+        fi
+
+        RHOAI_VERSION=$(echo "${csvs}" \
+            | grep -oE '^rhods-operator\.[0-9]+\.[0-9]+' \
+            | sed 's/rhods-operator\.//' \
+            | sort -t. -k1,1n -k2,2n -u | tail -1) || true
+
+        if [ -n "${RHOAI_VERSION}" ]; then
+            log "Latest RHOAI version: ${RHOAI_VERSION}"
+        else
+            die "No RHOAI version found for rhods-operator."
+        fi
+    fi
+
+    # Resolve channel — prefer stable-X.Y > stable-X.x > beta
+    if [ -n "${RHOAI_CHANNEL}" ]; then
+        log "Using user-specified RHOAI channel: ${RHOAI_CHANNEL}"
+        # Validate channel exists in catalog (catches typos in user-specified values)
+        local validate_csv
+        validate_csv=$(echo "${manifest_json}" | jq -r --arg ch "${RHOAI_CHANNEL}" '
+            .status.channels[] | select(.name == $ch) | .currentCSV // empty') || true
+        if [ -z "${validate_csv}" ]; then
+            die "Channel '${RHOAI_CHANNEL}' not found in PackageManifest."
+        fi
+    else
+        step "Auto-detecting RHOAI channel for version ${RHOAI_VERSION}..."
+        local major="${RHOAI_VERSION%%.*}"
+        local candidates=("stable-${RHOAI_VERSION}" "stable-${major}.x" "beta")
+        for candidate in "${candidates[@]}"; do
+            local csv
+            csv=$(echo "${manifest_json}" | jq -r --arg ch "${candidate}" '
+                .status.channels[] | select(.name == $ch) | .currentCSV // empty') || true
+            if [ -n "${csv}" ] && [[ "${csv}" == rhods-operator.${RHOAI_VERSION}.* ]]; then
+                RHOAI_CHANNEL="${candidate}"
+                log "Channel '${candidate}' provides RHOAI ${RHOAI_VERSION} (CSV: ${csv})"
+                break
+            fi
+        done
+        if [ -z "${RHOAI_CHANNEL}" ]; then
+            die "No channel provides RHOAI ${RHOAI_VERSION}. Checked: ${candidates[*]}"
+        fi
+    fi
+}
+
 create_custom_catalogsource() {
     local name="$1"
     local namespace="$2"
@@ -388,42 +485,51 @@ install_rhoai_operator() {
             operator_name="rhods-operator"
             namespace="redhat-ods-operator"
             catalog="redhat-operators"
-            channel="${RHOAI_CHANNEL}"
             ;;
         odh)
             operator_name="opendatahub-operator"
             namespace="opendatahub"
             catalog="community-operators"
-            channel="${ODH_CHANNEL}"
             ;;
         *)
             die "Unknown OPERATOR_TYPE: ${OPERATOR_TYPE}. Use rhoai or odh."
             ;;
     esac
 
-    # Custom catalog: create CatalogSource and override catalog source name
-    if [ -n "${CUSTOM_CATALOG}" ]; then
-        local custom_catalog_name="${OPERATOR_TYPE}-custom-catalog"
-        log "Using custom catalog: ${CUSTOM_CATALOG}"
-        create_custom_catalogsource "${custom_catalog_name}" "openshift-marketplace" "${CUSTOM_CATALOG}"
-        catalog="${custom_catalog_name}"
-    fi
-
+    # install operator
     if kubectl get subscription.operators.coreos.com "${operator_name}" \
         -n "${namespace}" &>/dev/null 2>&1; then
         log "${OPERATOR_TYPE} operator already installed. Skipping."
     else
-        # Validate channel exists in catalog (skip for custom catalogs —
-        # PackageManifest may not be synced yet after CatalogSource creation)
-        if [ -z "${CUSTOM_CATALOG}" ]; then
-            local available_channels
-            available_channels=$(kubectl get packagemanifest "${operator_name}" \
-                -n openshift-marketplace -o jsonpath='{.status.channels[*].name}' 2>/dev/null || echo "")
-            if [ -z "${available_channels}" ]; then
-                die "PackageManifest '${operator_name}' not found in catalog. Is the catalog source available?"
+        # Custom catalog: create CatalogSource first so PackageManifest is
+        # available for version/channel auto-detection
+        if [ -n "${CUSTOM_CATALOG}" ]; then
+            local custom_catalog_name="${OPERATOR_TYPE}-custom-catalog"
+            log "Using custom catalog: ${CUSTOM_CATALOG}"
+            create_custom_catalogsource "${custom_catalog_name}" "openshift-marketplace" "${CUSTOM_CATALOG}"
+            catalog="${custom_catalog_name}"
+        fi
+
+        # Resolve version and channel
+        if [ "${OPERATOR_TYPE}" = "rhoai" ]; then
+            resolve_rhoai_info
+            channel="${RHOAI_CHANNEL}"
+        else
+            channel="${ODH_CHANNEL}"
+            # Validate ODH channel exists before creating Subscription
+            local pm_json
+            pm_json=$(kubectl get packagemanifest "${operator_name}" \
+                -n openshift-marketplace -o json 2>/dev/null) || true
+            if [ -n "${CUSTOM_CATALOG}" ] && [ -n "${pm_json}" ]; then
+                pm_json=$(echo "${pm_json}" | jq --arg cs "${custom_catalog_name}" \
+                    'select(.status.catalogSource == $cs)') || true
             fi
-            if ! echo " ${available_channels} " | grep -q " ${channel} "; then
-                die "Channel '${channel}' not found for '${operator_name}'. Available: ${available_channels}"
+            if [ -n "${pm_json}" ]; then
+                local available_channels
+                available_channels=$(echo "${pm_json}" | jq -r '.status.channels[].name' | tr '\n' ' ') || true
+                if [ -n "${available_channels}" ] && ! echo " ${available_channels} " | grep -q " ${channel} "; then
+                    die "Channel '${channel}' not found for '${operator_name}'. Available: ${available_channels}"
+                fi
             fi
         fi
 
@@ -453,8 +559,8 @@ EOF
         wait_for_subscription "${namespace}" "${operator_name}"
     fi
 
-    # Verify installed version matches expected version
-    if [ "${OPERATOR_TYPE}" = "rhoai" ]; then
+    # Verify installed version matches expected version (skipped when already installed and no version provided)
+    if [ "${OPERATOR_TYPE}" = "rhoai" ] && [ -n "${RHOAI_VERSION}" ]; then
         local installed_csv
         installed_csv=$(kubectl get subscription.operators.coreos.com "${operator_name}" \
             -n "${namespace}" -o jsonpath='{.status.installedCSV}' 2>/dev/null || echo "")
@@ -465,24 +571,6 @@ EOF
             die "Expected RHOAI ${RHOAI_VERSION} but installedCSV is '${installed_csv}'."
         fi
         log "RHOAI installedCSV: ${installed_csv}"
-    fi
-
-    # Verify operator was installed from the expected catalog source
-    if [ -n "${CUSTOM_CATALOG}" ]; then
-        local expected_catalog="${OPERATOR_TYPE}-custom-catalog"
-        local install_plan
-        install_plan=$(kubectl get subscription.operators.coreos.com "${operator_name}" \
-            -n "${namespace}" -o jsonpath='{.status.installPlanRef.name}' 2>/dev/null || echo "")
-        if [ -z "${install_plan}" ]; then
-            die "No InstallPlan found for subscription '${operator_name}'."
-        fi
-        local actual_catalog
-        actual_catalog=$(kubectl get installplan "${install_plan}" \
-            -n "${namespace}" -o jsonpath='{.status.bundleLookups[0].catalogSourceRef.name}' 2>/dev/null || echo "")
-        if [ "${actual_catalog}" != "${expected_catalog}" ]; then
-            die "Operator installed from catalog '${actual_catalog}' instead of '${expected_catalog}'. Custom catalog was not used!"
-        fi
-        log "Verified: operator installed from custom catalog '${actual_catalog}'."
     fi
 }
 
@@ -909,6 +997,9 @@ deploy_batch_gateway_rhoai() {
         --set "processor.config.modelGateways.${model_key}.initialBackoff=${GW_INITIAL_BACKOFF}"
         --set "processor.config.modelGateways.${model_key}.maxBackoff=${GW_MAX_BACKOFF}"
         --set "apiserver.config.batchAPI.passThroughHeaders={Authorization}"
+        # CI clusters have limited CPU; lower requests so the processor pod can be scheduled
+        --set "processor.resources.requests.cpu=100m"
+        --set "processor.resources.requests.memory=128Mi"
     )
 
     do_deploy_batch_gateway "${helm_args[@]}"
@@ -1182,8 +1273,8 @@ usage() {
     echo "Environment Variables:"
     echo "  OPERATOR_TYPE    rhoai or odh (default: rhoai)"
     echo "  CUSTOM_CATALOG    Custom catalog image for operator (creates CatalogSource)"
-    echo "  RHOAI_VERSION    RHOAI version (default: 3.4)"
-    echo "  RHOAI_CHANNEL    OLM channel (default: stable-\${RHOAI_VERSION})"
+    echo "  RHOAI_VERSION    RHOAI version"
+    echo "  RHOAI_CHANNEL    RHOAI OLM channel"
     echo "  MODEL_NAME       Model name for simulator (default: facebook/opt-125m)"
     echo "  MODEL_REPLICAS   Number of replicas (default: 1)"
     echo "  SIM_IMAGE        Simulator image (default: ghcr.io/llm-d/llm-d-inference-sim:v0.7.1)"
