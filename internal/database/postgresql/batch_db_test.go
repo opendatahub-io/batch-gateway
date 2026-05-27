@@ -18,6 +18,7 @@ package postgresql
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -246,6 +247,67 @@ func TestBatchGet(t *testing.T) {
 		}
 	})
 
+	t.Run("gets non-terminal items", func(t *testing.T) {
+		client, mock := newTestBatchClient(t)
+		defer mock.Close()
+
+		item := newTestBatchItem("batch-1", testTenantID)
+		tags, _ := packTags(item.Tags)
+
+		rows := pgxmock.NewRows([]string{colID, colTenantID, colExpiry, colTags, colStatus, colSpec}).
+			AddRow(item.ID, item.TenantID, item.Expiry, &tags, item.Status, item.Spec)
+
+		mock.ExpectQuery("SELECT .+ FROM "+testTable+" WHERE .+NOT IN").
+			WithArgs(0, 11).
+			WillReturnRows(rows)
+
+		items, _, _, err := client.DBGet(ctx,
+			&api.BatchQuery{NonTerminal: true},
+			true, 0, 10)
+		if err != nil {
+			t.Fatalf("expected no error, got %v", err)
+		}
+		if len(items) != 1 {
+			t.Fatalf("expected 1 item, got %d", len(items))
+		}
+
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Fatalf("unmet expectations: %v", err)
+		}
+	})
+
+	t.Run("gets non-terminal items filtered by tenant", func(t *testing.T) {
+		client, mock := newTestBatchClient(t)
+		defer mock.Close()
+
+		item := newTestBatchItem("batch-1", testTenantID)
+		tags, _ := packTags(item.Tags)
+
+		rows := pgxmock.NewRows([]string{colID, colTenantID, colExpiry, colTags, colStatus, colSpec}).
+			AddRow(item.ID, item.TenantID, item.Expiry, &tags, item.Status, item.Spec)
+
+		mock.ExpectQuery("SELECT .+ FROM "+testTable+" WHERE .+NOT IN").
+			WithArgs(testTenantID, 0, 11).
+			WillReturnRows(rows)
+
+		items, _, _, err := client.DBGet(ctx,
+			&api.BatchQuery{
+				BaseQuery:   api.BaseQuery{TenantID: testTenantID},
+				NonTerminal: true,
+			},
+			true, 0, 10)
+		if err != nil {
+			t.Fatalf("expected no error, got %v", err)
+		}
+		if len(items) != 1 {
+			t.Fatalf("expected 1 item, got %d", len(items))
+		}
+
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Fatalf("unmet expectations: %v", err)
+		}
+	})
+
 	t.Run("gets items by tag selectors with OR", func(t *testing.T) {
 		client, mock := newTestBatchClient(t)
 		defer mock.Close()
@@ -292,7 +354,7 @@ func TestBatchUpdate(t *testing.T) {
 			WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg(), "batch-1").
 			WillReturnResult(pgxmock.NewResult("UPDATE", 1))
 
-		if err := client.DBUpdate(ctx, item); err != nil {
+		if err := client.DBUpdate(ctx, item, nil); err != nil {
 			t.Fatalf("expected no error, got %v", err)
 		}
 
@@ -301,11 +363,48 @@ func TestBatchUpdate(t *testing.T) {
 		}
 	})
 
+	t.Run("CAS succeeds when status matches", func(t *testing.T) {
+		client, mock := newTestBatchClient(t)
+		defer mock.Close()
+
+		item := newTestBatchItem("batch-1", testTenantID)
+		expectedStatus := []byte(`{"status":"validating"}`)
+
+		mock.ExpectExec("UPDATE "+testTable+" SET").
+			WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg(), "batch-1", expectedStatus).
+			WillReturnResult(pgxmock.NewResult("UPDATE", 1))
+
+		if err := client.DBUpdate(ctx, item, expectedStatus); err != nil {
+			t.Fatalf("expected no error, got %v", err)
+		}
+
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Fatalf("unmet expectations: %v", err)
+		}
+	})
+
+	t.Run("CAS returns ErrConflict when status differs", func(t *testing.T) {
+		client, mock := newTestBatchClient(t)
+		defer mock.Close()
+
+		item := newTestBatchItem("batch-1", testTenantID)
+		expectedStatus := []byte(`{"status":"validating"}`)
+
+		mock.ExpectExec("UPDATE "+testTable+" SET").
+			WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg(), "batch-1", expectedStatus).
+			WillReturnResult(pgxmock.NewResult("UPDATE", 0))
+
+		err := client.DBUpdate(ctx, item, expectedStatus)
+		if !errors.Is(err, api.ErrConflict) {
+			t.Fatalf("expected ErrConflict, got %v", err)
+		}
+	})
+
 	t.Run("returns error for nil item", func(t *testing.T) {
 		client, mock := newTestBatchClient(t)
 		defer mock.Close()
 
-		if err := client.DBUpdate(ctx, nil); err == nil {
+		if err := client.DBUpdate(ctx, nil, nil); err == nil {
 			t.Fatal("expected error for nil item")
 		}
 	})

@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -25,7 +26,9 @@ import (
 	"github.com/llm-d-incubation/batch-gateway/internal/shared/openai"
 	batch_types "github.com/llm-d-incubation/batch-gateway/internal/shared/types"
 	"github.com/llm-d-incubation/batch-gateway/internal/util/clientset"
+	"github.com/llm-d-incubation/batch-gateway/internal/util/ptr"
 
+	"github.com/llm-d-incubation/batch-gateway/internal/util/semaphore"
 	httpclient "github.com/llm-d-incubation/batch-gateway/pkg/clients/http"
 	"github.com/llm-d-incubation/batch-gateway/pkg/clients/inference"
 )
@@ -71,7 +74,7 @@ func TestExecuteOneRequest_Success(t *testing.T) {
 	ctx := testLoggerCtx(t)
 	sloCtx, sloCancel := context.WithDeadline(ctx, time.Now().Add(1*time.Second))
 	defer sloCancel()
-	result, err := env.p.executeOneRequest(ctx, sloCtx, inputFile, entries[0], "m1", nil)
+	result, err := env.p.executeOneRequest(ctx, sloCtx, inputFile, entries[0], "m1", nil, "")
 	if err != nil {
 		t.Fatalf("executeOneRequest error: %v", err)
 	}
@@ -89,6 +92,56 @@ func TestExecuteOneRequest_Success(t *testing.T) {
 	}
 	if result.Response.RequestID != "srv-123" {
 		t.Fatalf("RequestID = %q, want %q", result.Response.RequestID, "srv-123")
+	}
+}
+
+func TestExecuteOneRequest_SuccessWithCapacityRetry(t *testing.T) {
+	cfg := config.NewConfig()
+	cfg.WorkDir = t.TempDir()
+
+	mock := &mockInferenceClient{
+		generateFn: func(_ context.Context, _ *inference.GenerateRequest) (*inference.GenerateResponse, *inference.ClientError) {
+			return &inference.GenerateResponse{
+				RequestID:        "srv-123",
+				Response:         []byte(`{"result":"ok"}`),
+				HadCapacityRetry: true,
+			}, nil
+		},
+	}
+
+	requests := []batch_types.Request{
+		{CustomID: "req-1", Method: "POST", URL: "/v1/chat/completions", Body: map[string]interface{}{"model": "m1", "prompt": "hi"}},
+	}
+	env, jobInfo := setupExecutionJob(t, cfg, mock, requests, map[string]string{"m1": "m1"})
+
+	inputPath, _ := env.p.jobInputFilePath(jobInfo.JobID, jobInfo.TenantID)
+	inputFile, err := os.Open(inputPath)
+	if err != nil {
+		t.Fatalf("open input: %v", err)
+	}
+	defer inputFile.Close()
+
+	jobRootDir, _ := env.p.jobRootDir(jobInfo.JobID, jobInfo.TenantID)
+	entries := planEntriesFromLines(mustReadFile(t, filepath.Join(jobRootDir, "input.jsonl")))
+
+	ctx := testLoggerCtx(t)
+	sloCtx, sloCancel := context.WithDeadline(ctx, time.Now().Add(1*time.Second))
+	defer sloCancel()
+	result, err := env.p.executeOneRequest(ctx, sloCtx, inputFile, entries[0], "m1", nil, "")
+	if err != nil {
+		t.Fatalf("executeOneRequest error: %v", err)
+	}
+	if result.Error != nil {
+		t.Fatalf("expected no error in output line, got %+v", result.Error)
+	}
+	if result.Response == nil {
+		t.Fatal("expected response in output line")
+	}
+	if result.Response.StatusCode != 200 {
+		t.Fatalf("StatusCode = %d, want 200", result.Response.StatusCode)
+	}
+	if !result.hadCapacityRetry {
+		t.Fatal("expected hadCapacityRetry=true on successful retried response")
 	}
 }
 
@@ -120,7 +173,7 @@ func TestExecuteOneRequest_NonHTTPError(t *testing.T) {
 	ctx := testLoggerCtx(t)
 	sloCtx, sloCancel := context.WithDeadline(ctx, time.Now().Add(1*time.Second))
 	defer sloCancel()
-	result, err := env.p.executeOneRequest(ctx, sloCtx, inputFile, entries[0], "m1", nil)
+	result, err := env.p.executeOneRequest(ctx, sloCtx, inputFile, entries[0], "m1", nil, "")
 	if err != nil {
 		t.Fatalf("executeOneRequest should not return error for inference failure, got: %v", err)
 	}
@@ -203,7 +256,7 @@ func TestExecuteOneRequest_NilInferenceClient(t *testing.T) {
 
 	sloCtx, sloCancel := context.WithDeadline(ctx, time.Now().Add(1*time.Second))
 	defer sloCancel()
-	result, err := p.executeOneRequest(ctx, sloCtx, inputFile, allEntries[0], "m1", nil)
+	result, err := p.executeOneRequest(ctx, sloCtx, inputFile, allEntries[0], "m1", nil, "")
 	if err != nil {
 		t.Fatalf("executeOneRequest: %v", err)
 	}
@@ -249,7 +302,7 @@ func TestExecuteOneRequest_HTTPError(t *testing.T) {
 	ctx := testLoggerCtx(t)
 	sloCtx, sloCancel := context.WithDeadline(ctx, time.Now().Add(1*time.Second))
 	defer sloCancel()
-	result, err := env.p.executeOneRequest(ctx, sloCtx, inputFile, entries[0], "m1", nil)
+	result, err := env.p.executeOneRequest(ctx, sloCtx, inputFile, entries[0], "m1", nil, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -308,7 +361,7 @@ func TestExecuteOneRequest_HTTPErrorEmptyBody(t *testing.T) {
 	ctx := testLoggerCtx(t)
 	sloCtx, sloCancel := context.WithDeadline(ctx, time.Now().Add(1*time.Second))
 	defer sloCancel()
-	result, err := env.p.executeOneRequest(ctx, sloCtx, inputFile, entries[0], "m1", nil)
+	result, err := env.p.executeOneRequest(ctx, sloCtx, inputFile, entries[0], "m1", nil, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -357,7 +410,7 @@ func TestExecuteOneRequest_HTTPErrorNonJSONBody(t *testing.T) {
 	ctx := testLoggerCtx(t)
 	sloCtx, sloCancel := context.WithDeadline(ctx, time.Now().Add(1*time.Second))
 	defer sloCancel()
-	result, err := env.p.executeOneRequest(ctx, sloCtx, inputFile, entries[0], "m1", nil)
+	result, err := env.p.executeOneRequest(ctx, sloCtx, inputFile, entries[0], "m1", nil, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -402,7 +455,7 @@ func TestExecuteOneRequest_NilResponse(t *testing.T) {
 	ctx := testLoggerCtx(t)
 	sloCtx, sloCancel := context.WithDeadline(ctx, time.Now().Add(1*time.Second))
 	defer sloCancel()
-	result, err := env.p.executeOneRequest(ctx, sloCtx, inputFile, entries[0], "m1", nil)
+	result, err := env.p.executeOneRequest(ctx, sloCtx, inputFile, entries[0], "m1", nil, "")
 	if err != nil {
 		t.Fatalf("executeOneRequest should not return error, got: %v", err)
 	}
@@ -442,7 +495,7 @@ func TestExecuteOneRequest_BadJSONResponse(t *testing.T) {
 	ctx := testLoggerCtx(t)
 	sloCtx, sloCancel := context.WithDeadline(ctx, time.Now().Add(1*time.Second))
 	defer sloCancel()
-	result, err := env.p.executeOneRequest(ctx, sloCtx, inputFile, entries[0], "m1", nil)
+	result, err := env.p.executeOneRequest(ctx, sloCtx, inputFile, entries[0], "m1", nil, "")
 	if err != nil {
 		t.Fatalf("executeOneRequest should not return error, got: %v", err)
 	}
@@ -471,7 +524,7 @@ func TestExecuteOneRequest_BadOffset(t *testing.T) {
 	ctx := testLoggerCtx(t)
 	sloCtx, sloCancel := context.WithDeadline(ctx, time.Now().Add(1*time.Second))
 	defer sloCancel()
-	_, err := env.p.executeOneRequest(ctx, sloCtx, inputFile, badEntry, "m1", nil)
+	_, err := env.p.executeOneRequest(ctx, sloCtx, inputFile, badEntry, "m1", nil, "")
 	if err == nil {
 		t.Fatalf("expected error for bad offset")
 	}
@@ -502,7 +555,7 @@ func TestExecuteOneRequest_SLOExpiredBeforeExecution(t *testing.T) {
 	ctx := testLoggerCtx(t)
 	sloCtx, sloCancel := context.WithDeadline(ctx, time.Now().Add(-1*time.Second))
 	defer sloCancel()
-	result, err := env.p.executeOneRequest(ctx, sloCtx, inputFile, entries[0], "m1", nil)
+	result, err := env.p.executeOneRequest(ctx, sloCtx, inputFile, entries[0], "m1", nil, "")
 	if err != nil {
 		t.Fatalf("executeOneRequest error: %v", err)
 	}
@@ -542,7 +595,7 @@ func TestExecuteOneRequest_SLOExpiredDuringExecution(t *testing.T) {
 	ctx := testLoggerCtx(t)
 	sloCtx, sloCancel := context.WithDeadline(ctx, time.Now().Add(10*time.Nanosecond))
 	defer sloCancel()
-	result, err := env.p.executeOneRequest(ctx, sloCtx, inputFile, entries[0], "m1", nil)
+	result, err := env.p.executeOneRequest(ctx, sloCtx, inputFile, entries[0], "m1", nil, "")
 	if err != nil {
 		t.Fatalf("executeOneRequest error: %v", err)
 	}
@@ -555,6 +608,169 @@ func TestExecuteOneRequest_SLOExpiredDuringExecution(t *testing.T) {
 	if result.Error.Message != batch_types.ErrCodeBatchExpired.Message() {
 		t.Fatalf("error message = %q, want %q", result.Error.Message, batch_types.ErrCodeBatchExpired.Message())
 	}
+}
+
+func TestExecuteOneRequest_DroppedReasonTTLExpired(t *testing.T) {
+	cfg := config.NewConfig()
+	cfg.WorkDir = t.TempDir()
+
+	mock := &mockInferenceClient{
+		generateFn: func(_ context.Context, _ *inference.GenerateRequest) (*inference.GenerateResponse, *inference.ClientError) {
+			return nil, &inference.ClientError{
+				Category:      httpclient.ErrCategoryRateLimit,
+				Message:       "HTTP 429: Rate limit exceeded",
+				StatusCode:    429,
+				ResponseBody:  []byte(`{"error":{"message":"Rate limit exceeded"}}`),
+				DroppedReason: httpclient.DroppedReasonTTLExpired,
+			}
+		},
+	}
+
+	requests := []batch_types.Request{
+		{CustomID: "req-ttl", Method: "POST", URL: "/v1/chat/completions", Body: map[string]interface{}{"model": "m1"}},
+	}
+	env, jobInfo := setupExecutionJob(t, cfg, mock, requests, map[string]string{"m1": "m1"})
+
+	inputPath, _ := env.p.jobInputFilePath(jobInfo.JobID, jobInfo.TenantID)
+	inputFile, _ := os.Open(inputPath)
+	defer inputFile.Close()
+
+	jobRootDir, _ := env.p.jobRootDir(jobInfo.JobID, jobInfo.TenantID)
+	entries := planEntriesFromLines(mustReadFile(t, filepath.Join(jobRootDir, "input.jsonl")))
+
+	ctx := testLoggerCtx(t)
+	sloCtx, sloCancel := context.WithDeadline(ctx, time.Now().Add(1*time.Second))
+	defer sloCancel()
+	result, err := env.p.executeOneRequest(ctx, sloCtx, inputFile, entries[0], "m1", nil, "")
+	if err != nil {
+		t.Fatalf("executeOneRequest error: %v", err)
+	}
+	if result.Error == nil {
+		t.Fatalf("expected error for TTL-expired dropped reason")
+	}
+	if result.Error.Code != string(batch_types.ErrCodeBatchExpired) {
+		t.Fatalf("error code = %q, want %q", result.Error.Code, batch_types.ErrCodeBatchExpired)
+	}
+	if result.Error.Message != batch_types.ErrCodeBatchExpired.Message() {
+		t.Fatalf("error message = %q, want %q", result.Error.Message, batch_types.ErrCodeBatchExpired.Message())
+	}
+	if result.Response != nil {
+		t.Fatalf("expected nil response for TTL-expired, got: %+v", result.Response)
+	}
+}
+
+func TestExecuteOneRequest_DroppedReasonOther(t *testing.T) {
+	cfg := config.NewConfig()
+	cfg.WorkDir = t.TempDir()
+
+	mock := &mockInferenceClient{
+		generateFn: func(_ context.Context, _ *inference.GenerateRequest) (*inference.GenerateResponse, *inference.ClientError) {
+			return nil, &inference.ClientError{
+				Category:      httpclient.ErrCategoryRateLimit,
+				Message:       "HTTP 429: Rate limit exceeded",
+				StatusCode:    429,
+				ResponseBody:  []byte(`{"error":{"message":"Rate limit exceeded"}}`),
+				DroppedReason: "rejected-saturated",
+			}
+		},
+	}
+
+	requests := []batch_types.Request{
+		{CustomID: "req-saturated", Method: "POST", URL: "/v1/chat/completions", Body: map[string]interface{}{"model": "m1"}},
+	}
+	env, jobInfo := setupExecutionJob(t, cfg, mock, requests, map[string]string{"m1": "m1"})
+
+	inputPath, _ := env.p.jobInputFilePath(jobInfo.JobID, jobInfo.TenantID)
+	inputFile, _ := os.Open(inputPath)
+	defer inputFile.Close()
+
+	jobRootDir, _ := env.p.jobRootDir(jobInfo.JobID, jobInfo.TenantID)
+	entries := planEntriesFromLines(mustReadFile(t, filepath.Join(jobRootDir, "input.jsonl")))
+
+	ctx := testLoggerCtx(t)
+	sloCtx, sloCancel := context.WithDeadline(ctx, time.Now().Add(1*time.Second))
+	defer sloCancel()
+	result, err := env.p.executeOneRequest(ctx, sloCtx, inputFile, entries[0], "m1", nil, "")
+	if err != nil {
+		t.Fatalf("executeOneRequest error: %v", err)
+	}
+	if result.Error != nil {
+		t.Fatalf("expected nil error field for non-TTL dropped reason (HTTP error goes to response), got: %+v", result.Error)
+	}
+	if result.Response == nil {
+		t.Fatalf("expected response field for HTTP 429 with non-TTL dropped reason")
+	}
+	if result.Response.StatusCode != 429 {
+		t.Fatalf("status_code = %d, want 429", result.Response.StatusCode)
+	}
+}
+
+func TestExecuteOneRequest_FairnessHeader(t *testing.T) {
+	requests := []batch_types.Request{
+		{CustomID: "req-1", Method: "POST", URL: "/v1/chat/completions", Body: map[string]interface{}{"model": "m1"}},
+	}
+
+	t.Run("sent when SendFairnessHeader=true and tenantID non-empty", func(t *testing.T) {
+		cfg := config.NewConfig()
+		cfg.WorkDir = t.TempDir()
+		cfg.SendFairnessHeader = true
+
+		var gotHeaders map[string]string
+		mock := &mockInferenceClient{
+			generateFn: func(_ context.Context, req *inference.GenerateRequest) (*inference.GenerateResponse, *inference.ClientError) {
+				gotHeaders = req.Headers
+				return &inference.GenerateResponse{RequestID: "srv", Response: []byte(`{"ok":true}`)}, nil
+			},
+		}
+
+		env, jobInfo := setupExecutionJob(t, cfg, mock, requests, map[string]string{"m1": "m1"})
+		inputPath, _ := env.p.jobInputFilePath(jobInfo.JobID, jobInfo.TenantID)
+		inputFile, _ := os.Open(inputPath)
+		defer inputFile.Close()
+		jobRootDir, _ := env.p.jobRootDir(jobInfo.JobID, jobInfo.TenantID)
+		entries := planEntriesFromLines(mustReadFile(t, filepath.Join(jobRootDir, "input.jsonl")))
+
+		ctx := testLoggerCtx(t)
+		sloCtx, cancel := context.WithDeadline(ctx, time.Now().Add(time.Second))
+		defer cancel()
+		if _, err := env.p.executeOneRequest(ctx, sloCtx, inputFile, entries[0], "m1", nil, "tenant-x"); err != nil {
+			t.Fatalf("executeOneRequest error: %v", err)
+		}
+		if gotHeaders[fairnessIDHeader] != "tenant-x" {
+			t.Fatalf("fairness header: got %q, want %q", gotHeaders[fairnessIDHeader], "tenant-x")
+		}
+	})
+
+	t.Run("not sent when SendFairnessHeader=false", func(t *testing.T) {
+		cfg := config.NewConfig()
+		cfg.WorkDir = t.TempDir()
+		cfg.SendFairnessHeader = false
+
+		var gotHeaders map[string]string
+		mock := &mockInferenceClient{
+			generateFn: func(_ context.Context, req *inference.GenerateRequest) (*inference.GenerateResponse, *inference.ClientError) {
+				gotHeaders = req.Headers
+				return &inference.GenerateResponse{RequestID: "srv", Response: []byte(`{"ok":true}`)}, nil
+			},
+		}
+
+		env, jobInfo := setupExecutionJob(t, cfg, mock, requests, map[string]string{"m1": "m1"})
+		inputPath, _ := env.p.jobInputFilePath(jobInfo.JobID, jobInfo.TenantID)
+		inputFile, _ := os.Open(inputPath)
+		defer inputFile.Close()
+		jobRootDir, _ := env.p.jobRootDir(jobInfo.JobID, jobInfo.TenantID)
+		entries := planEntriesFromLines(mustReadFile(t, filepath.Join(jobRootDir, "input.jsonl")))
+
+		ctx := testLoggerCtx(t)
+		sloCtx, cancel := context.WithDeadline(ctx, time.Now().Add(time.Second))
+		defer cancel()
+		if _, err := env.p.executeOneRequest(ctx, sloCtx, inputFile, entries[0], "m1", nil, "tenant-x"); err != nil {
+			t.Fatalf("executeOneRequest error: %v", err)
+		}
+		if _, ok := gotHeaders[fairnessIDHeader]; ok {
+			t.Fatalf("fairness header should not be set when SendFairnessHeader=false, got %q", gotHeaders[fairnessIDHeader])
+		}
+	})
 }
 
 // =====================================================================
@@ -599,7 +815,7 @@ func TestProcessModel_Success(t *testing.T) {
 	writers := &outputWriters{output: writer, errors: bufio.NewWriter(&errBuf)}
 
 	ctx := testLoggerCtx(t)
-	err := env.p.processModel(ctx, ctx, ctx, context.Background(), inputFile, plansDir, "m1", "m1", writers, progress, nil)
+	err := env.p.processModel(ctx, ctx, ctx, context.Background(), inputFile, plansDir, "m1", "m1", writers, progress, nil, "")
 	if err != nil {
 		t.Fatalf("processModel error: %v", err)
 	}
@@ -661,7 +877,7 @@ func TestProcessModel_CancelStopsDispatch(t *testing.T) {
 	ctx, cancel := context.WithCancel(baseCtx)
 	cancel()
 
-	err := env.p.processModel(ctx, baseCtx, context.Background(), ctx, inputFile, plansDir, "m1", "m1", writers, progress, nil)
+	err := env.p.processModel(ctx, baseCtx, context.Background(), ctx, inputFile, plansDir, "m1", "m1", writers, progress, nil, "")
 	if !errors.Is(err, errCancelled) {
 		t.Fatalf("expected errCancelled, got: %v", err)
 	}
@@ -691,8 +907,8 @@ func TestProcessModel_CancelStopsDispatch(t *testing.T) {
 func TestProcessModel_CancelWritesInFlightToErrorFile(t *testing.T) {
 	cfg := config.NewConfig()
 	cfg.WorkDir = t.TempDir()
-	cfg.GlobalConcurrency = 10
-	cfg.PerModelMaxConcurrency = 10
+	cfg.Concurrency.Global = 10
+	cfg.Concurrency.PerEndpoint = 10
 
 	userCancelCtx, abortFn := context.WithCancel(context.Background())
 
@@ -726,7 +942,7 @@ func TestProcessModel_CancelWritesInFlightToErrorFile(t *testing.T) {
 	}
 
 	ctx := testLoggerCtx(t)
-	modelErr := env.p.processModel(ctx, ctx, ctx, userCancelCtx, inputFile, plansDir, "m1", "m1", writers, progress, nil)
+	modelErr := env.p.processModel(ctx, ctx, ctx, userCancelCtx, inputFile, plansDir, "m1", "m1", writers, progress, nil, "")
 	if !errors.Is(modelErr, errCancelled) {
 		t.Fatalf("expected errCancelled from processModel, got: %v", modelErr)
 	}
@@ -808,7 +1024,7 @@ func TestProcessModel_InferenceFatalError(t *testing.T) {
 	writers := &outputWriters{output: writer, errors: bufio.NewWriter(&errBuf)}
 
 	ctx := testLoggerCtx(t)
-	err := env.p.processModel(ctx, ctx, ctx, context.Background(), inputFile, plansDir, "m1", "m1", writers, progress, nil)
+	err := env.p.processModel(ctx, ctx, ctx, context.Background(), inputFile, plansDir, "m1", "m1", writers, progress, nil, "")
 	if err == nil {
 		t.Fatalf("expected error from closed input file")
 	}
@@ -817,8 +1033,8 @@ func TestProcessModel_InferenceFatalError(t *testing.T) {
 func TestProcessModel_ContextCancelledDuringDispatch(t *testing.T) {
 	cfg := config.NewConfig()
 	cfg.WorkDir = t.TempDir()
-	cfg.GlobalConcurrency = 1
-	cfg.PerModelMaxConcurrency = 1
+	cfg.Concurrency.Global = 1
+	cfg.Concurrency.PerEndpoint = 1
 
 	started := make(chan struct{})
 	block := make(chan struct{})
@@ -858,7 +1074,7 @@ func TestProcessModel_ContextCancelledDuringDispatch(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		done <- env.p.processModel(ctx, ctx, ctx, context.Background(), inputFile, plansDir, "m1", "m1", writers, progress, nil)
+		done <- env.p.processModel(ctx, ctx, ctx, context.Background(), inputFile, plansDir, "m1", "m1", writers, progress, nil, "")
 	}()
 
 	<-started
@@ -909,7 +1125,7 @@ func TestProcessModel_SiblingAbort_ReturnsNil(t *testing.T) {
 	requestAbortCtx, requestAbortFn := context.WithCancel(mainCtx)
 	requestAbortFn() // simulate sibling model calling requestAbortFn
 
-	err := env.p.processModel(requestAbortCtx, mainCtx, mainCtx, context.Background(), inputFile, plansDir, "m1", "m1", writers, progress, nil)
+	err := env.p.processModel(requestAbortCtx, mainCtx, mainCtx, context.Background(), inputFile, plansDir, "m1", "m1", writers, progress, nil, "")
 	// requestAbortCtx cancelled, but no SLO / user-cancel / SIGTERM → nil, not errShutdown
 	if err != nil {
 		t.Fatalf("expected nil when only requestAbortCtx is cancelled (sibling abort), got: %v", err)
@@ -1186,6 +1402,7 @@ func TestExecuteJob_SIGTERMAfterAllComplete(t *testing.T) {
 	}
 	if counts == nil {
 		t.Fatal("expected non-nil counts")
+		return
 	}
 	if counts.Total != 1 || counts.Completed != 1 {
 		t.Fatalf("counts = {Total:%d, Completed:%d, Failed:%d}, want {1,1,0}",
@@ -1339,8 +1556,8 @@ func TestExecuteJob_SLOExpiredBeforeDispatch(t *testing.T) {
 func TestExecuteJob_SLOExpiredDuringDispatch(t *testing.T) {
 	cfg := config.NewConfig()
 	cfg.WorkDir = t.TempDir()
-	cfg.GlobalConcurrency = 1
-	cfg.PerModelMaxConcurrency = 1
+	cfg.Concurrency.Global = 1
+	cfg.Concurrency.PerEndpoint = 1
 
 	// The mock blocks until the context is cancelled (SLO deadline fires).
 	// Concurrency = 1, so the first request holds the semaphore while blocking,
@@ -2789,11 +3006,11 @@ func TestJsonNumericToFloat64(t *testing.T) {
 
 func TestMergeInferenceHeaders(t *testing.T) {
 	t.Run("no deadline no objective leaves headers unchanged", func(t *testing.T) {
-		if got := mergeInferenceHeaders(nil, context.Background(), ""); got != nil {
+		if got := mergeInferenceHeaders(nil, context.Background(), "", ""); got != nil {
 			t.Fatalf("nil headers: got %v, want nil", got)
 		}
 		in := map[string]string{"a": "b"}
-		got := mergeInferenceHeaders(in, context.Background(), "")
+		got := mergeInferenceHeaders(in, context.Background(), "", "")
 		if len(got) != 1 {
 			t.Fatalf("expected no new keys, got len=%d %#v", len(got), got)
 		}
@@ -2809,7 +3026,7 @@ func TestMergeInferenceHeaders(t *testing.T) {
 		want := 5*time.Second + 123*time.Millisecond
 		ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(want))
 		defer cancel()
-		h := mergeInferenceHeaders(nil, ctx, "")
+		h := mergeInferenceHeaders(nil, ctx, "", "")
 		got, err := strconv.ParseInt(h[sloTTFTMSHeader], 10, 64)
 		if err != nil {
 			t.Fatalf("parse header: %v", err)
@@ -2825,11 +3042,11 @@ func TestMergeInferenceHeaders(t *testing.T) {
 	t.Run("deadline in the past leaves headers unchanged", func(t *testing.T) {
 		ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
 		defer cancel()
-		if got := mergeInferenceHeaders(nil, ctx, ""); got != nil {
+		if got := mergeInferenceHeaders(nil, ctx, "", ""); got != nil {
 			t.Fatalf("nil headers: got %v, want nil (expired deadline => no merge)", got)
 		}
 		in := map[string]string{"a": "b"}
-		got := mergeInferenceHeaders(in, ctx, "")
+		got := mergeInferenceHeaders(in, ctx, "", "")
 		if len(got) != 1 {
 			t.Fatalf("expected no new keys, got len=%d %#v", len(got), got)
 		}
@@ -2844,7 +3061,7 @@ func TestMergeInferenceHeaders(t *testing.T) {
 	t.Run("preserves existing headers", func(t *testing.T) {
 		ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(time.Minute))
 		defer cancel()
-		h := mergeInferenceHeaders(map[string]string{"a": "b"}, ctx, "")
+		h := mergeInferenceHeaders(map[string]string{"a": "b"}, ctx, "", "")
 		if h["a"] != "b" {
 			t.Fatal("lost existing header")
 		}
@@ -2859,7 +3076,7 @@ func TestMergeInferenceHeaders(t *testing.T) {
 		ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(want))
 		defer cancel()
 		in := map[string]string{}
-		h := mergeInferenceHeaders(in, ctx, "")
+		h := mergeInferenceHeaders(in, ctx, "", "")
 		got, err := strconv.ParseInt(in[sloTTFTMSHeader], 10, 64)
 		if err != nil {
 			t.Fatalf("parse: %v", err)
@@ -2876,7 +3093,7 @@ func TestMergeInferenceHeaders(t *testing.T) {
 	})
 
 	t.Run("objective header sent when configured", func(t *testing.T) {
-		h := mergeInferenceHeaders(nil, context.Background(), "batch-low-priority")
+		h := mergeInferenceHeaders(nil, context.Background(), "batch-low-priority", "")
 		if h[inferenceObjectiveHeader] != "batch-low-priority" {
 			t.Fatalf("got %q, want %q", h[inferenceObjectiveHeader], "batch-low-priority")
 		}
@@ -2886,7 +3103,7 @@ func TestMergeInferenceHeaders(t *testing.T) {
 	})
 
 	t.Run("objective header not sent when empty", func(t *testing.T) {
-		h := mergeInferenceHeaders(map[string]string{"a": "b"}, context.Background(), "")
+		h := mergeInferenceHeaders(map[string]string{"a": "b"}, context.Background(), "", "")
 		if _, ok := h[inferenceObjectiveHeader]; ok {
 			t.Fatal("objective header should not be set when empty")
 		}
@@ -2895,7 +3112,7 @@ func TestMergeInferenceHeaders(t *testing.T) {
 	t.Run("both SLO and objective headers", func(t *testing.T) {
 		ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(10*time.Second))
 		defer cancel()
-		h := mergeInferenceHeaders(nil, ctx, "batch-low-priority")
+		h := mergeInferenceHeaders(nil, ctx, "batch-low-priority", "")
 		if _, ok := h[sloTTFTMSHeader]; !ok {
 			t.Fatal("SLO header missing")
 		}
@@ -2907,7 +3124,7 @@ func TestMergeInferenceHeaders(t *testing.T) {
 	t.Run("objective only with expired deadline", func(t *testing.T) {
 		ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
 		defer cancel()
-		h := mergeInferenceHeaders(nil, ctx, "batch-low-priority")
+		h := mergeInferenceHeaders(nil, ctx, "batch-low-priority", "")
 		if _, ok := h[sloTTFTMSHeader]; ok {
 			t.Fatal("SLO header should not be set with expired deadline")
 		}
@@ -2915,4 +3132,585 @@ func TestMergeInferenceHeaders(t *testing.T) {
 			t.Fatalf("objective header: got %q, want %q", h[inferenceObjectiveHeader], "batch-low-priority")
 		}
 	})
+
+	t.Run("fairness header sent when tenantID is non-empty", func(t *testing.T) {
+		h := mergeInferenceHeaders(nil, context.Background(), "", "tenant-abc")
+		if h[fairnessIDHeader] != "tenant-abc" {
+			t.Fatalf("fairness header: got %q, want %q", h[fairnessIDHeader], "tenant-abc")
+		}
+	})
+
+	t.Run("fairness header not sent when tenantID is empty", func(t *testing.T) {
+		h := mergeInferenceHeaders(map[string]string{"a": "b"}, context.Background(), "", "")
+		if _, ok := h[fairnessIDHeader]; ok {
+			t.Fatal("fairness header should not be set when tenantID is empty")
+		}
+	})
+
+	t.Run("all three headers together", func(t *testing.T) {
+		ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(10*time.Second))
+		defer cancel()
+		h := mergeInferenceHeaders(nil, ctx, "batch-low-priority", "tenant-xyz")
+		if _, ok := h[sloTTFTMSHeader]; !ok {
+			t.Fatal("SLO header missing")
+		}
+		if h[inferenceObjectiveHeader] != "batch-low-priority" {
+			t.Fatalf("objective header: got %q, want %q", h[inferenceObjectiveHeader], "batch-low-priority")
+		}
+		if h[fairnessIDHeader] != "tenant-xyz" {
+			t.Fatalf("fairness header: got %q, want %q", h[fairnessIDHeader], "tenant-xyz")
+		}
+	})
+
+	t.Run("fairness header with default tenant", func(t *testing.T) {
+		h := mergeInferenceHeaders(nil, context.Background(), "", "default")
+		if h[fairnessIDHeader] != "default" {
+			t.Fatalf("fairness header: got %q, want %q", h[fairnessIDHeader], "default")
+		}
+	})
+
+	t.Run("fairness header honors pass-through value when present", func(t *testing.T) {
+		ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(5*time.Second))
+		defer cancel()
+		passThrough := map[string]string{
+			fairnessIDHeader:         "stale-value",
+			inferenceObjectiveHeader: "stale-objective",
+			sloTTFTMSHeader:          "9999",
+			"x-custom":               "keep-me",
+		}
+		h := mergeInferenceHeaders(passThrough, ctx, "batch-low-priority", "real-tenant")
+		if h[fairnessIDHeader] != "stale-value" {
+			t.Fatalf("fairness header: got %q, want pass-through value %q", h[fairnessIDHeader], "stale-value")
+		}
+		if h[inferenceObjectiveHeader] != "batch-low-priority" {
+			t.Fatalf("objective header: got %q, want %q", h[inferenceObjectiveHeader], "batch-low-priority")
+		}
+		if h[sloTTFTMSHeader] == "9999" {
+			t.Fatal("SLO header should be overwritten by processor-managed value")
+		}
+		if h["x-custom"] != "keep-me" {
+			t.Fatal("non-conflicting pass-through header was lost")
+		}
+	})
+}
+
+// =====================================================================
+// Tests: per-model inference objective in executeOneRequest
+// =====================================================================
+
+func TestExecuteOneRequest_PerModelInferenceObjective(t *testing.T) {
+	tests := []struct {
+		name          string
+		modelGateways map[string]config.ModelGatewayConfig
+		modelID       string
+		wantObjective string
+	}{
+		{
+			name: "per-model objective set",
+			modelGateways: map[string]config.ModelGatewayConfig{
+				"m1": {
+					URL:                "http://gw-a:8000",
+					InferenceObjective: "batch-sheddable-a",
+					RequestTimeout:     ptr.To(5 * time.Minute),
+					MaxRetries:         ptr.To(3),
+					InitialBackoff:     ptr.To(1 * time.Second),
+					MaxBackoff:         ptr.To(60 * time.Second),
+				},
+			},
+			modelID:       "m1",
+			wantObjective: "batch-sheddable-a",
+		},
+		{
+			name: "no per-model objective omits header",
+			modelGateways: map[string]config.ModelGatewayConfig{
+				"m1": {
+					URL:            "http://gw-a:8000",
+					RequestTimeout: ptr.To(5 * time.Minute),
+					MaxRetries:     ptr.To(3),
+					InitialBackoff: ptr.To(1 * time.Second),
+					MaxBackoff:     ptr.To(60 * time.Second),
+				},
+			},
+			modelID:       "m1",
+			wantObjective: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := config.NewConfig()
+			cfg.WorkDir = t.TempDir()
+			cfg.ModelGateways = tt.modelGateways
+
+			var gotObjective string
+			mock := &mockInferenceClient{
+				generateFn: func(_ context.Context, req *inference.GenerateRequest) (*inference.GenerateResponse, *inference.ClientError) {
+					gotObjective = req.Headers[inferenceObjectiveHeader]
+					return &inference.GenerateResponse{
+						RequestID: "srv-obj",
+						Response:  []byte(`{"result":"ok"}`),
+					}, nil
+				},
+			}
+
+			requests := []batch_types.Request{
+				{CustomID: "req-1", Method: "POST", URL: "/v1/chat/completions", Body: map[string]interface{}{"model": tt.modelID, "prompt": "hi"}},
+			}
+			env, jobInfo := setupExecutionJob(t, cfg, mock, requests, map[string]string{tt.modelID: tt.modelID})
+
+			inputPath, _ := env.p.jobInputFilePath(jobInfo.JobID, jobInfo.TenantID)
+			inputFile, err := os.Open(inputPath)
+			if err != nil {
+				t.Fatalf("open input: %v", err)
+			}
+			defer inputFile.Close()
+
+			jobRootDir, _ := env.p.jobRootDir(jobInfo.JobID, jobInfo.TenantID)
+			entries := planEntriesFromLines(mustReadFile(t, filepath.Join(jobRootDir, "input.jsonl")))
+
+			ctx := testLoggerCtx(t)
+			sloCtx, sloCancel := context.WithDeadline(ctx, time.Now().Add(5*time.Second))
+			defer sloCancel()
+
+			_, err = env.p.executeOneRequest(ctx, sloCtx, inputFile, entries[0], tt.modelID, nil, jobInfo.TenantID)
+			if err != nil {
+				t.Fatalf("executeOneRequest error: %v", err)
+			}
+
+			if gotObjective != tt.wantObjective {
+				t.Fatalf("objective header = %q, want %q", gotObjective, tt.wantObjective)
+			}
+		})
+	}
+}
+
+// =====================================================================
+// Tests: AIMD signaling in processModel
+// =====================================================================
+
+func TestProcessModel_AIMDSignaling(t *testing.T) {
+	const maxLimit = 20
+
+	makeRequests := func(n int) []batch_types.Request {
+		reqs := make([]batch_types.Request, n)
+		for i := range reqs {
+			reqs[i] = batch_types.Request{
+				CustomID: "r" + strconv.Itoa(i),
+				Method:   "POST",
+				URL:      "/v1/chat/completions",
+				Body:     map[string]interface{}{"model": "m1"},
+			}
+		}
+		return reqs
+	}
+
+	aimdCfg := func(t *testing.T) *config.ProcessorConfig {
+		cfg := config.NewConfig()
+		cfg.WorkDir = t.TempDir()
+		cfg.Concurrency.Global = 100
+		cfg.Concurrency.PerEndpoint = maxLimit
+		cfg.Concurrency.AIMD.Min = 5
+		return cfg
+	}
+
+	endpointAIMDLimit := func(p *Processor, modelID string) int {
+		client := p.inference.ClientFor(modelID)
+		return p.endpointLimits[client].aimd.Limit()
+	}
+
+	runProcessModel := func(t *testing.T, cfg *config.ProcessorConfig, mock inference.InferenceClient, requests []batch_types.Request) *Processor {
+		t.Helper()
+		env, jobInfo := setupExecutionJob(t, cfg, mock, requests, map[string]string{"m1": "m1"})
+
+		inputPath, _ := env.p.jobInputFilePath(jobInfo.JobID, jobInfo.TenantID)
+		inputFile, err := os.Open(inputPath)
+		if err != nil {
+			t.Fatalf("open input: %v", err)
+		}
+		defer inputFile.Close()
+
+		plansDir, _ := env.p.jobPlansDir(jobInfo.JobID, jobInfo.TenantID)
+
+		var outBuf, errBuf bytes.Buffer
+		writers := &outputWriters{
+			output: bufio.NewWriter(&outBuf),
+			errors: bufio.NewWriter(&errBuf),
+		}
+		progress := &executionProgress{
+			total:   int64(len(requests)),
+			updater: env.updater,
+			jobID:   jobInfo.JobID,
+		}
+
+		ctx := testLoggerCtx(t)
+		err = env.p.processModel(ctx, ctx, ctx, context.Background(), inputFile, plansDir, "m1", "m1", writers, progress, nil, jobInfo.TenantID)
+		if err != nil {
+			t.Fatalf("processModel error: %v", err)
+		}
+		return env.p
+	}
+
+	t.Run("clean 200 records success", func(t *testing.T) {
+		cfg := aimdCfg(t)
+		mock := &mockInferenceClient{
+			generateFn: func(_ context.Context, _ *inference.GenerateRequest) (*inference.GenerateResponse, *inference.ClientError) {
+				return &inference.GenerateResponse{RequestID: "srv", Response: []byte(`{"ok":true}`)}, nil
+			},
+		}
+
+		p := runProcessModel(t, cfg, mock, makeRequests(maxLimit))
+		if got := endpointAIMDLimit(p, "m1"); got != maxLimit {
+			t.Fatalf("Limit() = %d, want %d (no decrease for clean 200s)", got, maxLimit)
+		}
+	})
+
+	t.Run("429 records rate limit", func(t *testing.T) {
+		cfg := aimdCfg(t)
+		mock := &mockInferenceClient{
+			generateFn: func(_ context.Context, _ *inference.GenerateRequest) (*inference.GenerateResponse, *inference.ClientError) {
+				return nil, &inference.ClientError{
+					Category:     httpclient.ErrCategoryRateLimit,
+					Message:      "rate limited",
+					StatusCode:   429,
+					ResponseBody: []byte(`{"error":{"message":"rate limited"}}`),
+				}
+			},
+		}
+
+		p := runProcessModel(t, cfg, mock, makeRequests(1))
+		if got := endpointAIMDLimit(p, "m1"); got >= maxLimit {
+			t.Fatalf("Limit() = %d, want < %d (should decrease on 429)", got, maxLimit)
+		}
+	})
+
+	t.Run("5xx records rate limit", func(t *testing.T) {
+		cfg := aimdCfg(t)
+		mock := &mockInferenceClient{
+			generateFn: func(_ context.Context, _ *inference.GenerateRequest) (*inference.GenerateResponse, *inference.ClientError) {
+				return nil, &inference.ClientError{
+					Category:     httpclient.ErrCategoryServer,
+					Message:      "bad gateway",
+					StatusCode:   502,
+					ResponseBody: []byte(`{"error":{"message":"bad gateway"}}`),
+				}
+			},
+		}
+
+		p := runProcessModel(t, cfg, mock, makeRequests(1))
+		if got := endpointAIMDLimit(p, "m1"); got >= maxLimit {
+			t.Fatalf("Limit() = %d, want < %d (should decrease on 5xx)", got, maxLimit)
+		}
+	})
+
+	t.Run("200 with capacity retries records rate limit", func(t *testing.T) {
+		cfg := aimdCfg(t)
+		mock := &mockInferenceClient{
+			generateFn: func(_ context.Context, _ *inference.GenerateRequest) (*inference.GenerateResponse, *inference.ClientError) {
+				return &inference.GenerateResponse{
+					RequestID:        "srv",
+					Response:         []byte(`{"ok":true}`),
+					HadCapacityRetry: true,
+				}, nil
+			},
+		}
+
+		p := runProcessModel(t, cfg, mock, makeRequests(1))
+		if got := endpointAIMDLimit(p, "m1"); got >= maxLimit {
+			t.Fatalf("Limit() = %d, want < %d (should decrease on capacity-retried 200)", got, maxLimit)
+		}
+	})
+
+	t.Run("200 with network-only retries records success", func(t *testing.T) {
+		cfg := aimdCfg(t)
+		mock := &mockInferenceClient{
+			generateFn: func(_ context.Context, _ *inference.GenerateRequest) (*inference.GenerateResponse, *inference.ClientError) {
+				return &inference.GenerateResponse{
+					RequestID:        "srv",
+					Response:         []byte(`{"ok":true}`),
+					HadCapacityRetry: false,
+				}, nil
+			},
+		}
+
+		p := runProcessModel(t, cfg, mock, makeRequests(maxLimit))
+		if got := endpointAIMDLimit(p, "m1"); got != maxLimit {
+			t.Fatalf("Limit() = %d, want %d (network-only retries should not reduce limit)", got, maxLimit)
+		}
+	})
+
+	t.Run("4xx (not 429) records success", func(t *testing.T) {
+		cfg := aimdCfg(t)
+		mock := &mockInferenceClient{
+			generateFn: func(_ context.Context, _ *inference.GenerateRequest) (*inference.GenerateResponse, *inference.ClientError) {
+				return nil, &inference.ClientError{
+					Category:     httpclient.ErrCategoryInvalidReq,
+					Message:      "bad request",
+					StatusCode:   400,
+					ResponseBody: []byte(`{"error":{"message":"bad request"}}`),
+				}
+			},
+		}
+
+		p := runProcessModel(t, cfg, mock, makeRequests(maxLimit))
+		if got := endpointAIMDLimit(p, "m1"); got != maxLimit {
+			t.Fatalf("Limit() = %d, want %d (4xx should count as success for AIMD)", got, maxLimit)
+		}
+	})
+
+	t.Run("non-HTTP error skips AIMD", func(t *testing.T) {
+		cfg := aimdCfg(t)
+		mock := &mockInferenceClient{
+			generateFn: func(_ context.Context, _ *inference.GenerateRequest) (*inference.GenerateResponse, *inference.ClientError) {
+				return nil, &inference.ClientError{
+					Category: httpclient.ErrCategoryServer,
+					Message:  "connection refused",
+					RawError: errors.New("dial tcp: connection refused"),
+				}
+			},
+		}
+
+		// Reduce limit below maxLimit first so we can distinguish
+		// "skip" (limit stays reduced) from "RecordSuccess" (limit
+		// would recover after a full window of successes).
+		reducedLimit := maxLimit / 2 // 20 * 0.5 = 10
+		requests := makeRequests(reducedLimit)
+		env, jobInfo := setupExecutionJob(t, cfg, mock, requests, map[string]string{"m1": "m1"})
+		epLimit := env.p.endpointLimits[env.p.inference.ClientFor("m1")]
+		epLimit.aimd.RecordRateLimit("test")
+		if got := epLimit.aimd.Limit(); got != reducedLimit {
+			t.Fatalf("pre-condition: Limit() = %d, want %d after RecordRateLimit()", got, reducedLimit)
+		}
+
+		inputPath, _ := env.p.jobInputFilePath(jobInfo.JobID, jobInfo.TenantID)
+		inputFile, err := os.Open(inputPath)
+		if err != nil {
+			t.Fatalf("open input: %v", err)
+		}
+		defer inputFile.Close()
+
+		plansDir, _ := env.p.jobPlansDir(jobInfo.JobID, jobInfo.TenantID)
+
+		var outBuf, errBuf bytes.Buffer
+		writers := &outputWriters{
+			output: bufio.NewWriter(&outBuf),
+			errors: bufio.NewWriter(&errBuf),
+		}
+		progress := &executionProgress{
+			total:   int64(len(requests)),
+			updater: env.updater,
+			jobID:   jobInfo.JobID,
+		}
+
+		ctx := testLoggerCtx(t)
+		err = env.p.processModel(ctx, ctx, ctx, context.Background(), inputFile, plansDir, "m1", "m1", writers, progress, nil, jobInfo.TenantID)
+		if err != nil {
+			t.Fatalf("processModel error: %v", err)
+		}
+
+		// If non-HTTP errors were incorrectly counted as RecordSuccess,
+		// the window (size=reducedLimit) would fill and push the limit
+		// back up. Verify it stayed at reducedLimit.
+		if got := epLimit.aimd.Limit(); got != reducedLimit {
+			t.Fatalf("Limit() = %d, want %d (non-HTTP errors should not recover AIMD limit)", got, reducedLimit)
+		}
+	})
+}
+
+// TestProcessModel_AIMDEndpointIsolation verifies that 429s on one endpoint
+// only reduce AIMD concurrency for that endpoint, leaving other endpoints
+// unaffected. This is the core behavioral guarantee of per-endpoint AIMD.
+func TestProcessModel_AIMDEndpointIsolation(t *testing.T) {
+	const maxLimit = 20
+
+	// Two separate mock clients representing two different inference endpoints.
+	clientA := &mockInferenceClient{
+		generateFn: func(_ context.Context, _ *inference.GenerateRequest) (*inference.GenerateResponse, *inference.ClientError) {
+			return nil, &inference.ClientError{
+				Category:     httpclient.ErrCategoryRateLimit,
+				Message:      "rate limited",
+				StatusCode:   429,
+				ResponseBody: []byte(`{"error":{"message":"rate limited"}}`),
+			}
+		},
+	}
+	clientB := &mockInferenceClient{
+		generateFn: func(_ context.Context, _ *inference.GenerateRequest) (*inference.GenerateResponse, *inference.ClientError) {
+			return &inference.GenerateResponse{RequestID: "srv", Response: []byte(`{"ok":true}`)}, nil
+		},
+	}
+
+	resolver := inference.NewPerModelClientResolver(map[string]inference.InferenceClient{
+		"m1": clientA,
+		"m2": clientB,
+	})
+
+	cfg := config.NewConfig()
+	cfg.WorkDir = t.TempDir()
+	cfg.Concurrency.Global = 100
+	cfg.Concurrency.PerEndpoint = maxLimit
+	cfg.Concurrency.AIMD.Min = 5
+
+	dbClient := newMockBatchDBClient()
+	statusClient := mockdb.NewMockBatchStatusClient()
+
+	p, err := NewProcessor(cfg, &clientset.Clientset{
+		BatchDB:   dbClient,
+		FileDB:    newMockFileDBClient(),
+		File:      mockfiles.NewMockBatchFilesClient(t.TempDir()),
+		Queue:     mockdb.NewMockBatchPriorityQueueClient(),
+		Status:    statusClient,
+		Event:     mockdb.NewMockBatchEventChannelClient(),
+		InFlight:  mockdb.NewMockInFlightClient(),
+		Inference: resolver,
+	}, "test-processor", testLogger(t))
+	if err != nil {
+		t.Fatalf("NewProcessor: %v", err)
+	}
+	p.tokens, err = semaphore.New(cfg.NumWorkers, nil)
+	if err != nil {
+		t.Fatalf("worker semaphore: %v", err)
+	}
+	p.globalSem, err = semaphore.New(cfg.Concurrency.Global, nil)
+	if err != nil {
+		t.Fatalf("global semaphore: %v", err)
+	}
+	initTestEndpointLimits(t, p, cfg)
+
+	// Verify two distinct endpoint limits were created (clientA != clientB).
+	if len(p.endpointLimits) != 2 {
+		t.Fatalf("endpointLimits has %d entries, want 2 (one per distinct endpoint)", len(p.endpointLimits))
+	}
+
+	// Build job with requests for both models.
+	jobID := "test-job"
+	tenantID := "tenant-1"
+	jobRootDir, _ := p.jobRootDir(jobID, tenantID)
+	if err := os.MkdirAll(jobRootDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+
+	requests := []batch_types.Request{
+		{CustomID: "a1", Method: "POST", URL: "/v1/chat/completions", Body: map[string]interface{}{"model": "m1"}},
+		{CustomID: "a2", Method: "POST", URL: "/v1/chat/completions", Body: map[string]interface{}{"model": "m1"}},
+		{CustomID: "b1", Method: "POST", URL: "/v1/chat/completions", Body: map[string]interface{}{"model": "m2"}},
+		{CustomID: "b2", Method: "POST", URL: "/v1/chat/completions", Body: map[string]interface{}{"model": "m2"}},
+	}
+
+	inputPath := filepath.Join(jobRootDir, "input.jsonl")
+	rawInput := writeInputJSONL(t, inputPath, requests)
+	allEntries := planEntriesFromLines(rawInput)
+
+	plansDir := filepath.Join(jobRootDir, "plans")
+	writePlanFile(t, plansDir, "m1", allEntries[:2])
+	writePlanFile(t, plansDir, "m2", allEntries[2:])
+
+	inputFile, err := os.Open(inputPath)
+	if err != nil {
+		t.Fatalf("open input: %v", err)
+	}
+	defer inputFile.Close()
+
+	updater := NewStatusUpdater(dbClient, statusClient, 86400)
+	ctx := testLoggerCtx(t)
+
+	// Process m1 (429s) — should decrease m1's endpoint AIMD.
+	var outBuf, errBuf bytes.Buffer
+	writers := &outputWriters{
+		output: bufio.NewWriter(&outBuf),
+		errors: bufio.NewWriter(&errBuf),
+	}
+	progress := &executionProgress{total: 4, updater: updater, jobID: jobID}
+
+	_ = p.processModel(ctx, ctx, ctx, context.Background(), inputFile, plansDir, "m1", "m1", writers, progress, nil, tenantID)
+
+	// Process m2 (200s) — should NOT affect m2's endpoint AIMD.
+	_ = p.processModel(ctx, ctx, ctx, context.Background(), inputFile, plansDir, "m2", "m2", writers, progress, nil, tenantID)
+
+	limitA := p.endpointLimits[clientA].aimd.Limit()
+	limitB := p.endpointLimits[clientB].aimd.Limit()
+
+	if limitA >= maxLimit {
+		t.Fatalf("endpoint A (429s) Limit() = %d, want < %d", limitA, maxLimit)
+	}
+	if limitB != maxLimit {
+		t.Fatalf("endpoint B (200s) Limit() = %d, want %d (should be unaffected by A's 429s)", limitB, maxLimit)
+	}
+}
+
+// TestProcessModel_EndpointLimitNil_DrainsAsModelNotFound verifies that when
+// a model's client is not present in endpointLimits (e.g. during recovery when
+// plan files predate the current resolver config), all entries are drained as
+// model_not_found errors without panicking.
+func TestProcessModel_EndpointLimitNil_DrainsAsModelNotFound(t *testing.T) {
+	cfg := config.NewConfig()
+	cfg.WorkDir = t.TempDir()
+
+	mock := &mockInferenceClient{
+		generateFn: func(_ context.Context, _ *inference.GenerateRequest) (*inference.GenerateResponse, *inference.ClientError) {
+			t.Fatal("Generate should not be called when endpoint limit is nil")
+			return nil, nil
+		},
+	}
+
+	requests := []batch_types.Request{
+		{CustomID: "r0", Method: "POST", URL: "/v1/chat/completions", Body: map[string]interface{}{"model": "m1"}},
+		{CustomID: "r1", Method: "POST", URL: "/v1/chat/completions", Body: map[string]interface{}{"model": "m1"}},
+		{CustomID: "r2", Method: "POST", URL: "/v1/chat/completions", Body: map[string]interface{}{"model": "m1"}},
+	}
+
+	env, jobInfo := setupExecutionJob(t, cfg, mock, requests, map[string]string{"m1": "m1"})
+
+	// Clear endpointLimits to simulate a resolver config change between
+	// ingestion and execution (plan file references a model the resolver
+	// no longer knows about).
+	env.p.endpointLimits = make(map[inference.InferenceClient]*endpointLimit)
+
+	inputPath, _ := env.p.jobInputFilePath(jobInfo.JobID, jobInfo.TenantID)
+	inputFile, err := os.Open(inputPath)
+	if err != nil {
+		t.Fatalf("open input: %v", err)
+	}
+	defer inputFile.Close()
+
+	plansDir, _ := env.p.jobPlansDir(jobInfo.JobID, jobInfo.TenantID)
+
+	var outBuf, errBuf bytes.Buffer
+	writers := &outputWriters{
+		output: bufio.NewWriter(&outBuf),
+		errors: bufio.NewWriter(&errBuf),
+	}
+	progress := &executionProgress{
+		total:   int64(len(requests)),
+		updater: env.updater,
+		jobID:   jobInfo.JobID,
+	}
+
+	ctx := testLoggerCtx(t)
+	err = env.p.processModel(ctx, ctx, ctx, context.Background(), inputFile, plansDir, "m1", "m1", writers, progress, nil, jobInfo.TenantID)
+	if err != nil {
+		t.Fatalf("processModel error: %v", err)
+	}
+
+	if err := writers.errors.Flush(); err != nil {
+		t.Fatalf("flush errors: %v", err)
+	}
+	if err := writers.output.Flush(); err != nil {
+		t.Fatalf("flush output: %v", err)
+	}
+
+	// All requests should appear in the error file as model_not_found.
+	errLines := strings.Split(strings.TrimSpace(errBuf.String()), "\n")
+	if len(errLines) != len(requests) {
+		t.Fatalf("error lines = %d, want %d", len(errLines), len(requests))
+	}
+	for i, line := range errLines {
+		if !strings.Contains(line, `"model_not_found"`) {
+			t.Fatalf("error line %d missing model_not_found code: %s", i, line)
+		}
+	}
+
+	// Output file should be empty (no successful responses).
+	if outBuf.Len() != 0 {
+		t.Fatalf("output buffer should be empty, got %d bytes", outBuf.Len())
+	}
 }

@@ -48,6 +48,7 @@ const (
 	eventKeysPrefix      = keysPrefix + "event:"
 	statusKeysPrefix     = keysPrefix + "status:"
 	priorityQueueKeyName = queueKeysPrefix + "priority"
+	inFlightKeyName      = keysPrefix + "inflight"
 	eventChanSize        = 100
 	eventReadCount       = 4
 	eventReadTimeout     = 20 * time.Second
@@ -87,11 +88,24 @@ var (
 	getByTenantLua         string
 	redisScriptGetByTenant = goredis.NewScript(commonLua + "\n" + getByTenantLua)
 
+	//go:embed redis_get_by_non_terminal.lua
+	getByNonTerminalLua         string
+	redisScriptGetByNonTerminal = goredis.NewScript(commonLua + "\n" + getByNonTerminalLua)
+
+	//go:embed redis_update_cas.lua
+	updateCASLua         string
+	redisScriptUpdateCAS = goredis.NewScript(updateCASLua)
+
+	//go:embed redis_pq_get_ids.lua
+	pqGetIDsLua         string
+	redisScriptPQGetIDs = goredis.NewScript(pqGetIDsLua)
+
 	_ db_api.BatchDBClient            = (*BatchDBClientRedis)(nil)
 	_ db_api.FileDBClient             = (*FileDBClientRedis)(nil)
 	_ db_api.BatchPriorityQueueClient = (*ExchangeDBClientRedis)(nil)
 	_ db_api.BatchEventChannelClient  = (*ExchangeDBClientRedis)(nil)
 	_ db_api.BatchStatusClient        = (*ExchangeDBClientRedis)(nil)
+	_ db_api.InFlightClient           = (*ExchangeDBClientRedis)(nil)
 )
 
 type DSClientRedis struct {

@@ -24,6 +24,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -38,7 +39,6 @@ import (
 	"github.com/llm-d-incubation/batch-gateway/internal/shared/openai"
 	batch_types "github.com/llm-d-incubation/batch-gateway/internal/shared/types"
 	"github.com/llm-d-incubation/batch-gateway/internal/util/logging"
-	"github.com/llm-d-incubation/batch-gateway/internal/util/semaphore"
 	httpclient "github.com/llm-d-incubation/batch-gateway/pkg/clients/http"
 	"github.com/llm-d-incubation/batch-gateway/pkg/clients/inference"
 )
@@ -72,6 +72,11 @@ type outputLine struct {
 	CustomID string                    `json:"custom_id"`
 	Response *batch_types.ResponseData `json:"response"`
 	Error    *outputError              `json:"error"`
+
+	// hadCapacityRetry is true when at least one retry was caused by a
+	// capacity-related response (429/5xx). Network-error retries do not
+	// set this flag. Used for AIMD signaling.
+	hadCapacityRetry bool `json:"-"`
 }
 
 type outputError struct {
@@ -267,6 +272,8 @@ func (p *Processor) executeJob(ctx, sloCtx, userCancelCtx, requestAbortCtx conte
 	// from sloCtx (derived from context.Background), so SLO expiry and SIGTERM do
 	// not set it. processModel's drain phase checks sloCtx.Err() vs
 	// userCancelCtx.Err() to choose the right error code (errExpired vs errCancelled).
+	tenantID := params.jobInfo.TenantID
+
 	for safeModelID, modelID := range modelMap.SafeToModel {
 		// Ordering guarantee: processModel returns → requestAbortFn → errCh send.
 		// This ensures the first real error reaches errCh before any context.Canceled
@@ -282,6 +289,7 @@ func (p *Processor) executeJob(ctx, sloCtx, userCancelCtx, requestAbortCtx conte
 				writers,
 				progress,
 				passThroughHeaders,
+				tenantID,
 			)
 			// Abort all sibling models when any model hits a fatal I/O error
 			// (e.g. output file write failure). modelErr is only set for local
@@ -367,10 +375,11 @@ func (p *Processor) executeJob(ctx, sloCtx, userCancelCtx, requestAbortCtx conte
 
 // processModel processes all plan entries for a single model concurrently.
 // Concurrency is bounded by both a global semaphore (p.globalSem, shared across
-// all models/workers) and a per-model semaphore (PerModelMaxConcurrency).
+// all models/workers) and a per-endpoint adaptive semaphore controlled by AIMD.
+// Models sharing the same inference endpoint share one AIMD controller.
 //
-// Semaphore acquisition order: local (per-model) before global (shared).
-// This prevents starving other models — blocking on global only wastes a local slot.
+// Semaphore acquisition order: endpoint-local before global (shared).
+// This prevents starving other endpoints — blocking on global only wastes a local slot.
 //
 // Error strategy in this function: when a goroutine encounters a fatal error, modelErr is captured
 // via errOnce but the context is NOT cancelled within this function. Context cancellation is
@@ -387,6 +396,7 @@ func (p *Processor) processModel(
 	writers *outputWriters,
 	progress *executionProgress,
 	passThroughHeaders map[string]string,
+	tenantID string,
 ) error {
 	logger := logr.FromContextOrDiscard(requestAbortCtx).WithValues("model", modelID)
 	requestAbortCtx = logr.NewContext(requestAbortCtx, logger)
@@ -399,8 +409,20 @@ func (p *Processor) processModel(
 
 	logger.V(logging.INFO).Info("Processing requests for a model", "numEntries", len(entries))
 
-	// PerModelMaxConcurrency > 0 is enforced by config validation; this cannot fail.
-	modelSem, _ := semaphore.New(p.cfg.PerModelMaxConcurrency, p.guardCallback)
+	// Resolve the per-endpoint adaptive semaphore and AIMD controller for this
+	// model. Models sharing the same inference endpoint share the same pair.
+	// ClientFor can return nil after gateway config changes between ingestion and
+	// execution, or during recovery when model_map/plan files predate the current
+	// resolver. In that case, drain all entries as model_not_found.
+	client := p.inference.ClientFor(modelID)
+	epLimit := p.endpointLimits[client]
+	if epLimit == nil {
+		logger.V(logging.INFO).Info("No endpoint limit for model (client not in resolver), draining as model_not_found")
+		p.drainUnprocessedRequests(requestAbortCtx, inputFile, entries, writers, progress,
+			batch_types.BatchErrorCode(inference.ErrCodeModelNotFound))
+		return nil
+	}
+	endpointSem := epLimit.sem
 
 	var (
 		wg              sync.WaitGroup
@@ -418,14 +440,14 @@ dispatch:
 			break
 		}
 
-		// Acquire semaphores in order: local (per-model) before global (shared).
-		// This order prevents starving other models — blocking on global only wastes a local slot.
-		if err := modelSem.Acquire(requestAbortCtx); err != nil {
+		// Acquire semaphores in order: endpoint-local before global (shared).
+		// This order prevents starving other endpoints — blocking on global only wastes a local slot.
+		if err := endpointSem.Acquire(requestAbortCtx); err != nil {
 			break dispatch
 		}
 
 		if err := p.globalSem.Acquire(requestAbortCtx); err != nil {
-			modelSem.Release()
+			endpointSem.Release()
 			break dispatch
 		}
 
@@ -433,10 +455,46 @@ dispatch:
 		wg.Add(1)
 		go func(entry planEntry) {
 			defer wg.Done()
-			defer modelSem.Release()
+			defer endpointSem.Release()
 			defer p.globalSem.Release()
 
-			result, execErr := p.executeOneRequest(requestAbortCtx, sloCtx, inputFile, entry, modelID, passThroughHeaders)
+			result, execErr := p.executeOneRequest(requestAbortCtx, sloCtx, inputFile, entry, modelID, passThroughHeaders, tenantID)
+
+			// AIMD signal: adjust concurrency based on inference endpoint capacity.
+			//
+			// Signal semantics:
+			//   429          → RecordRateLimit (sustained overload after all retries)
+			//   5xx          → RecordRateLimit (server overload / unhealthy)
+			//   200 with capacity retries → RecordRateLimit (retry absorbed 429/5xx)
+			//   200 with network-only retries → RecordSuccess (no capacity signal)
+			//   200 clean    → RecordSuccess (genuine available capacity)
+			//   4xx (not 429) → RecordSuccess (gateway had capacity, request was malformed)
+			//   non-HTTP err → skip (no capacity signal — network, timeout, etc.)
+			//   fatal execErr → skip (local I/O, not related to gateway capacity)
+			//
+			// AIMD only affects future dispatch. It does not abort in-flight
+			// requests — those continue until completion or context cancellation.
+			if epLimit.aimd != nil && execErr == nil && result != nil && result.Response != nil {
+				sc := result.Response.StatusCode
+				switch {
+				case sc == http.StatusTooManyRequests:
+					epLimit.aimd.RecordRateLimit(metrics.AIMDSignal429)
+					metrics.RecordAIMDDecrease(epLimit.label, metrics.AIMDSignal429)
+				case sc >= http.StatusInternalServerError:
+					epLimit.aimd.RecordRateLimit(metrics.AIMDSignal5xx)
+					metrics.RecordAIMDDecrease(epLimit.label, metrics.AIMDSignal5xx)
+				case result.hadCapacityRetry:
+					epLimit.aimd.RecordRateLimit(metrics.AIMDSignalCapacityRetry)
+					metrics.RecordAIMDDecrease(epLimit.label, metrics.AIMDSignalCapacityRetry)
+				default:
+					oldLimit := epLimit.aimd.Limit()
+					epLimit.aimd.RecordSuccess()
+					if epLimit.aimd.Limit() != oldLimit {
+						metrics.RecordAIMDIncrease(epLimit.label)
+					}
+				}
+				metrics.SetAIMDConcurrencyLimit(epLimit.label, float64(epLimit.aimd.Limit()))
+			}
 			if execErr != nil {
 				// Fatal read failure: the input file is unreadable at this offset
 				// (e.g. disk corruption). We do not know the CustomID, so we cannot
@@ -621,17 +679,26 @@ func (p *Processor) drainUnprocessedRequests(
 const (
 	sloTTFTMSHeader          = "x-slo-ttft-ms"
 	inferenceObjectiveHeader = "x-gateway-inference-objective"
+	fairnessIDHeader         = "x-gateway-inference-fairness-id"
 )
 
 // mergeInferenceHeaders adds processor-managed headers to the outgoing inference request:
 //   - x-slo-ttft-ms: remaining milliseconds until the SLO deadline (>= 0).
 //   - x-gateway-inference-objective: name of the InferenceObjective CRD that
 //     determines the priority band for this request.
+//   - x-gateway-inference-fairness-id: tenant identifier for per-tenant fairness
+//     within a priority band.
 //
 // Headers are only added when the relevant value is available/configured.
 // If sloCtx has no deadline, is cancelled, or has an expired deadline, the SLO
 // header is not set. If inferenceObjective is empty, the objective header is not set.
-func mergeInferenceHeaders(headers map[string]string, sloCtx context.Context, inferenceObjective string) map[string]string {
+// If fairnessID is non-empty, the fairness header is set only when the outgoing
+// headers do not already include x-gateway-inference-fairness-id. Unlike SLO and
+// objective (which are processor-authoritative and always override), fairness is
+// user-overridable: callers can supply a custom flow key (e.g. API key, group ID)
+// via pass-through headers, and the processor falls back to tenantID only when no
+// override is present.
+func mergeInferenceHeaders(headers map[string]string, sloCtx context.Context, inferenceObjective, fairnessID string) map[string]string {
 	hasSLO := false
 	var sloMs int64
 	if sloCtx.Err() == nil {
@@ -644,8 +711,14 @@ func mergeInferenceHeaders(headers map[string]string, sloCtx context.Context, in
 		}
 	}
 	hasObjective := inferenceObjective != ""
+	hasFairness := fairnessID != ""
+	if hasFairness && headers != nil {
+		if _, exists := headers[fairnessIDHeader]; exists {
+			hasFairness = false
+		}
+	}
 
-	if !hasSLO && !hasObjective {
+	if !hasSLO && !hasObjective && !hasFairness {
 		return headers
 	}
 	if headers == nil {
@@ -656,6 +729,9 @@ func mergeInferenceHeaders(headers map[string]string, sloCtx context.Context, in
 	}
 	if hasObjective {
 		headers[inferenceObjectiveHeader] = inferenceObjective
+	}
+	if hasFairness {
+		headers[fairnessIDHeader] = fairnessID
 	}
 	return headers
 }
@@ -669,6 +745,7 @@ func (p *Processor) executeOneRequest(
 	entry planEntry,
 	modelID string,
 	passThroughHeaders map[string]string,
+	tenantID string,
 ) (*outputLine, error) {
 	// read the request line from input.jsonl at the given offset and length
 	buf := make([]byte, entry.Length)
@@ -718,8 +795,13 @@ func (p *Processor) executeOneRequest(
 		return result, nil
 	}
 
+	fairnessID := ""
+	if p.cfg.SendFairnessHeader {
+		fairnessID = tenantID
+	}
+
 	headers := maps.Clone(passThroughHeaders)
-	headers = mergeInferenceHeaders(headers, sloCtx, p.cfg.InferenceObjective)
+	headers = mergeInferenceHeaders(headers, sloCtx, p.cfg.InferenceObjectiveFor(modelID), fairnessID)
 
 	inferReq := &inference.GenerateRequest{
 		RequestID: newBatchRequestID(requestID),
@@ -770,6 +852,14 @@ func (p *Processor) executeOneRequest(
 	if inferErr != nil {
 		logger.V(logging.DEBUG).Info("Inference request failed", "error", inferErr.Message)
 		if inferErr.StatusCode > 0 {
+			if inferErr.DroppedReason == httpclient.DroppedReasonTTLExpired {
+				result.Error = &outputError{
+					Code:    string(batch_types.ErrCodeBatchExpired),
+					Message: batch_types.ErrCodeBatchExpired.Message(),
+				}
+				metrics.RecordRequestError(modelID)
+				return result, nil
+			}
 			// HTTP error (4xx/5xx) — populate response with status code and original body
 			// per OpenAI spec, error field is only for non-HTTP errors
 			// Ensure body is always a non-nil object to satisfy the OpenAI schema (type: object).
@@ -807,6 +897,7 @@ func (p *Processor) executeOneRequest(
 			Message: err.Error(),
 		}
 	} else {
+		result.hadCapacityRetry = inferResp.HadCapacityRetry
 		// success — unmarshal the response body
 		var body map[string]interface{}
 		if len(inferResp.Response) > 0 {

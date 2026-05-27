@@ -173,9 +173,10 @@ func (c *pgCore) store(ctx context.Context, idx *api.BaseIndexes, contents *api.
 
 // buildGetQuery constructs the SELECT SQL and args from the given query parameters.
 // extraFilters is keyed by column name and adds equality conditions for each entry.
+// rawConditions are appended verbatim to the WHERE clause (no parameterization).
 func (c *pgCore) buildGetQuery(
 	bq *api.BaseQuery, includeStatic bool, start, limit int,
-	extraFilters map[string]any,
+	extraFilters map[string]any, rawConditions []string,
 ) (string, []any) {
 	cols := c.selectColumns(includeStatic)
 
@@ -222,6 +223,8 @@ func (c *pgCore) buildGetQuery(
 		args = append(args, val)
 		argIdx++
 	}
+
+	conditions = append(conditions, rawConditions...)
 
 	if len(conditions) == 0 {
 		return "", nil
@@ -301,15 +304,16 @@ func (c *pgCore) scanRow(rows pgx.Rows, includeStatic bool) (*api.BaseIndexes, *
 
 // get retrieves items from the database.
 // extraFilters adds type-specific equality conditions (e.g., purpose = "batch").
+// rawConditions are appended verbatim to the WHERE clause.
 func (c *pgCore) get(
 	ctx context.Context, bq *api.BaseQuery, includeStatic bool, start, limit int,
-	extraFilters map[string]any,
+	extraFilters map[string]any, rawConditions []string,
 ) (
 	indexes []*api.BaseIndexes, contents []*api.BaseContents, extras []map[string]string,
 	cursor int, expectMore bool, err error,
 ) {
 	// Request one extra row beyond the limit to determine if more results exist.
-	sql, args := c.buildGetQuery(bq, includeStatic, start, limit+1, extraFilters)
+	sql, args := c.buildGetQuery(bq, includeStatic, start, limit+1, extraFilters, rawConditions)
 	if sql == "" {
 		return nil, nil, nil, 0, false, nil
 	}
@@ -352,7 +356,10 @@ func (c *pgCore) get(
 }
 
 // update updates the dynamic fields of an existing item.
-func (c *pgCore) update(ctx context.Context, idx *api.BaseIndexes, contents *api.BaseContents) error {
+// When expectedStatus is non-nil, the update is conditional (CAS): it only
+// succeeds if the current status column matches expectedStatus exactly.
+// Returns api.ErrConflict on mismatch.
+func (c *pgCore) update(ctx context.Context, idx *api.BaseIndexes, contents *api.BaseContents, expectedStatus []byte) error {
 	if err := idx.Validate(); err != nil {
 		return err
 	}
@@ -383,9 +390,17 @@ func (c *pgCore) update(ctx context.Context, idx *api.BaseIndexes, contents *api
 	}
 
 	args = append(args, idx.ID)
+	whereClause := fmt.Sprintf(colID+" = $%d", argIdx)
+	argIdx++
+
+	if len(expectedStatus) > 0 {
+		args = append(args, expectedStatus)
+		whereClause += fmt.Sprintf(" AND "+colStatus+" = $%d", argIdx)
+	}
+
 	sql := fmt.Sprintf(
-		"UPDATE %s SET %s WHERE "+colID+" = $%d",
-		c.desc.TableName(), strings.Join(setClauses, ", "), argIdx,
+		"UPDATE %s SET %s WHERE %s",
+		c.desc.TableName(), strings.Join(setClauses, ", "), whereClause,
 	)
 
 	result, err := c.pool.Exec(ctx, sql, args...)
@@ -394,6 +409,9 @@ func (c *pgCore) update(ctx context.Context, idx *api.BaseIndexes, contents *api
 	}
 
 	if result.RowsAffected() == 0 {
+		if len(expectedStatus) > 0 {
+			return fmt.Errorf("DBUpdate: %w", api.ErrConflict)
+		}
 		return fmt.Errorf("DBUpdate: item %s not found", idx.ID)
 	}
 

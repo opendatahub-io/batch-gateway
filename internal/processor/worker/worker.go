@@ -19,6 +19,7 @@ package worker
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"sync"
 	"time"
@@ -37,46 +38,69 @@ import (
 	"github.com/llm-d-incubation/batch-gateway/pkg/clients/inference"
 )
 
+// endpointLimit pairs an adaptive semaphore with its AIMD controller for a
+// single inference endpoint. Models sharing the same endpoint share one
+// endpointLimit, so a 429 from endpoint A only reduces concurrency for
+// models routed to A.
+type endpointLimit struct {
+	sem   *semaphore.AdaptiveSemaphore
+	aimd  *semaphore.AIMDController
+	label string // human-readable endpoint identifier for metrics/logs
+}
+
 type Processor struct {
-	cfg    *config.ProcessorConfig
-	tokens semaphore.Semaphore
-	wg     sync.WaitGroup
+	cfg         *config.ProcessorConfig
+	processorID string
+	tokens      semaphore.Semaphore
+	wg          sync.WaitGroup
 
 	// globalSem limits total in-flight inference requests across all workers.
+	// Fixed capacity — serves as a ceiling only.
 	globalSem semaphore.Semaphore
+
+	// endpointLimits maps each unique InferenceClient to its per-endpoint
+	// adaptive semaphore + AIMD controller. Created in Run() from the
+	// resolver's client set.
+	//
+	// IMPORTANT: map keys rely on concrete client identity (pointer-equal
+	// InferenceClient instances). This is safe because GatewayResolver deduplicates
+	// and reuses concrete clients for identical endpoint configs.
+	endpointLimits map[inference.InferenceClient]*endpointLimit
 
 	poller  *Poller
 	updater *StatusUpdater
 
+	batchDB   db.BatchDBClient           // job status lookups (heartbeat DB check)
 	event     db.BatchEventChannelClient // cancel-event subscription
+	inflight  db.InFlightClient          // in-flight job tracking for orphan recovery
 	inference *inference.GatewayResolver // model → gateway routing
 	files     *fileManager
-
-	// guardCallback is called when any semaphore detects a double-release.
-	// Set during Run(); passed to per-model semaphores in processModel.
-	guardCallback func()
 }
 
 func NewProcessor(
 	cfg *config.ProcessorConfig,
 	clients *clientset.Clientset,
+	processorID string,
 	logger logr.Logger,
 ) (*Processor, error) {
 	if cfg.NumWorkers <= 0 {
 		return nil, fmt.Errorf("worker semaphore (NumWorkers=%d): %w", cfg.NumWorkers, semaphore.ErrCap)
 	}
-	if cfg.GlobalConcurrency <= 0 {
-		return nil, fmt.Errorf("global semaphore (GlobalConcurrency=%d): %w", cfg.GlobalConcurrency, semaphore.ErrCap)
+	if cfg.Concurrency.Global <= 0 {
+		return nil, fmt.Errorf("global semaphore (concurrency.global=%d): %w", cfg.Concurrency.Global, semaphore.ErrCap)
 	}
 	poller := NewPoller(clients.Queue, clients.BatchDB)
 	updater := NewStatusUpdater(clients.BatchDB, clients.Status, cfg.ProgressTTLSeconds)
 	return &Processor{
-		cfg:       cfg,
-		poller:    poller,
-		updater:   updater,
-		event:     clients.Event,
-		inference: clients.Inference,
-		files:     newFileManager(clients.File, clients.FileDB),
+		cfg:         cfg,
+		processorID: processorID,
+		poller:      poller,
+		updater:     updater,
+		batchDB:     clients.BatchDB,
+		event:       clients.Event,
+		inflight:    clients.InFlight,
+		inference:   clients.Inference,
+		files:       newFileManager(clients.File, clients.FileDB),
 	}, nil
 }
 
@@ -118,16 +142,54 @@ func (p *Processor) Run(ctx context.Context, onReady func()) error {
 	if err != nil {
 		return fmt.Errorf("worker semaphore (NumWorkers=%d): %w", p.cfg.NumWorkers, err)
 	}
-	p.globalSem, err = semaphore.New(p.cfg.GlobalConcurrency, makeGuard("global-concurrency"))
+	cc := &p.cfg.Concurrency
+	p.globalSem, err = semaphore.New(cc.Global, makeGuard("global-concurrency"))
 	if err != nil {
-		return fmt.Errorf("global semaphore (GlobalConcurrency=%d): %w", p.cfg.GlobalConcurrency, err)
+		return fmt.Errorf("global semaphore (concurrency.global=%d): %w", cc.Global, err)
 	}
-	p.guardCallback = makeGuard("per-model-concurrency")
 
+	clients := p.inference.Clients()
+	p.endpointLimits = make(map[inference.InferenceClient]*endpointLimit, len(clients))
+	for _, client := range clients {
+		epLabel := p.inference.ClientLabel(client)
+		epSem, epErr := semaphore.NewAdaptive(cc.PerEndpoint, makeGuard("endpoint-concurrency"))
+		if epErr != nil {
+			return fmt.Errorf("endpoint semaphore (concurrency.per_endpoint=%d): %w", cc.PerEndpoint, epErr)
+		}
+		var epAIMD *semaphore.AIMDController
+		if cc.AIMD.Enabled {
+			epAIMD = semaphore.NewAIMDController(
+				semaphore.AIMDConfig{
+					MinLimit:         cc.AIMD.Min,
+					MaxLimit:         cc.PerEndpoint,
+					BackoffFactor:    cc.AIMD.BackoffFactor,
+					AdditiveIncrease: cc.AIMD.AdditiveIncrease,
+				},
+				cc.PerEndpoint,
+				func(limit int) { epSem.SetLimit(limit) },
+				logger.WithValues("endpoint", epLabel),
+			)
+			metrics.SetAIMDConcurrencyLimit(epLabel, float64(cc.PerEndpoint))
+		}
+		p.endpointLimits[client] = &endpointLimit{sem: epSem, aimd: epAIMD, label: epLabel}
+	}
+	const highCardinalityThreshold = 50
+	if cc.AIMD.Enabled && len(clients) > highCardinalityThreshold {
+		logger.Info("AIMD metrics may cause high cardinality: "+
+			"each endpoint creates up to 5 time series (1 gauge + 1 increase counter + 3 decrease counters by signal); "+
+			"verify your TSDB can handle the load or reduce the number of distinct gateway endpoints in config",
+			"num_endpoints", len(clients),
+			"estimated_series", len(clients)*5,
+		)
+	}
 	logger.V(logging.INFO).Info(
 		"Processor run started",
 		"loopInterval", p.cfg.PollInterval,
 		"maxWorkers", p.cfg.NumWorkers,
+		"concurrency.global", cc.Global,
+		"concurrency.per_endpoint", cc.PerEndpoint,
+		"concurrency.aimd.enabled", cc.AIMD.Enabled,
+		"num_endpoints", len(clients),
 	)
 
 	return p.runPollingLoop(pollingCtx, ctx)
@@ -178,6 +240,13 @@ func (p *Processor) runPollingLoop(pollingCtx, jobBaseCtx context.Context) error
 			continue
 		}
 
+		// Record in-flight entry immediately after dequeue so the orphan
+		// reconciler can track this job. Non-fatal on error: the reconciler
+		// can still detect orphans via DB + queue cross-reference.
+		if err := p.inflight.InFlightSet(pollingCtx, task.ID, p.processorID); err != nil {
+			logr.FromContextOrDiscard(pollingCtx).Error(err, "Failed to set in-flight entry", "jobId", task.ID)
+		}
+
 		// Pre-launch: use pollingCtx so guard cancel / SIGTERM interrupts
 		// DB fetch and validation promptly. jobBaseCtx is only used once
 		// we commit to launching the job goroutine.
@@ -195,8 +264,10 @@ func (p *Processor) runPollingLoop(pollingCtx, jobBaseCtx context.Context) error
 			bgCtx, bgSpan := uotel.DetachedContext(pollCtx, "re-enqueue-fetch-failure")
 			if reEnqueueErr := p.poller.enqueueOne(bgCtx, task); reEnqueueErr != nil {
 				pollLogger.Error(reEnqueueErr, "Failed to re-enqueue the job to the queue")
+				p.deleteInFlight(bgCtx, task.ID)
 				metrics.RecordJobProcessed(metrics.ResultFailed, metrics.ReasonSystemError)
 			} else {
+				p.deleteInFlight(bgCtx, task.ID)
 				metrics.RecordJobProcessed(metrics.ResultReEnqueued, metrics.ReasonDBTransient)
 				pollLogger.V(logging.INFO).Info("Re-enqueued the job to the queue")
 			}
@@ -208,6 +279,7 @@ func (p *Processor) runPollingLoop(pollingCtx, jobBaseCtx context.Context) error
 		if jobItem == nil {
 			pollLogger.Error(fmt.Errorf("job item is not found in the DB"), "Ignoring job (data inconsistency)")
 			p.releaseForNextPoll()
+			p.deleteInFlight(pollCtx, task.ID)
 			metrics.RecordJobProcessed(metrics.ResultSkipped, metrics.ReasonDBInconsistency)
 			continue
 		}
@@ -231,6 +303,7 @@ func (p *Processor) runPollingLoop(pollingCtx, jobBaseCtx context.Context) error
 			if failErr := p.handleFailed(pollCtx, p.updater, jobItem, nil, nil); failErr != nil {
 				pollLogger.Error(failErr, "Failed to mark malformed job as failed")
 			}
+			p.deleteInFlight(pollCtx, task.ID)
 			continue
 		}
 
@@ -251,6 +324,7 @@ func (p *Processor) runPollingLoop(pollingCtx, jobBaseCtx context.Context) error
 			}
 
 			p.releaseForNextPoll()
+			p.deleteInFlight(pollCtx, task.ID)
 			recordE2ELatency(jobInfo, metrics.E2EStatusExpired)
 			metrics.RecordJobProcessed(metrics.ResultExpired, metrics.ReasonExpiredDequeue)
 			continue
@@ -268,6 +342,7 @@ func (p *Processor) runPollingLoop(pollingCtx, jobBaseCtx context.Context) error
 					continue
 				}
 				p.releaseForNextPoll()
+				p.deleteInFlight(pollCtx, task.ID)
 				recordE2ELatency(jobInfo, metrics.E2EStatusCancelled)
 				metrics.RecordCancellation(metrics.CancelPhaseQueued)
 				metrics.RecordJobProcessed(metrics.ResultSuccess, metrics.ReasonNone)
@@ -277,6 +352,7 @@ func (p *Processor) runPollingLoop(pollingCtx, jobBaseCtx context.Context) error
 			pollLogger.V(logging.INFO).Info("job is not in processible state. skipping this job.", "status", jobInfo.BatchJob.Status)
 
 			p.releaseForNextPoll()
+			p.deleteInFlight(pollCtx, task.ID)
 			metrics.RecordJobProcessed(metrics.ResultSkipped, metrics.ReasonNotRunnableState)
 			continue
 		}
@@ -295,8 +371,10 @@ func (p *Processor) runPollingLoop(pollingCtx, jobBaseCtx context.Context) error
 				if failErr := p.handleFailed(bgCtx, p.updater, jobItem, nil, jobInfo); failErr != nil {
 					pollLogger.Error(failErr, "Failed to mark dequeued job as failed after re-enqueue failure")
 				}
+				p.deleteInFlight(bgCtx, task.ID)
 				metrics.RecordJobProcessed(metrics.ResultFailed, metrics.ReasonGuardShutdown)
 			} else {
+				p.deleteInFlight(bgCtx, task.ID)
 				metrics.RecordJobProcessed(metrics.ResultReEnqueued, metrics.ReasonGuardShutdown)
 				pollLogger.V(logging.INFO).Info("Re-enqueued the job to the queue during graceful shutdown")
 			}
@@ -343,6 +421,66 @@ func (p *Processor) releaseForNextPoll() {
 	p.release()
 }
 
+func (p *Processor) deleteInFlight(ctx context.Context, jobID string) {
+	if err := p.inflight.InFlightDelete(ctx, jobID); err != nil {
+		logr.FromContextOrDiscard(ctx).Error(err, "Failed to delete in-flight entry", "jobId", jobID)
+	}
+}
+
+func (p *Processor) heartbeat(ctx context.Context, jobID string, abortFn context.CancelFunc) {
+	logger := logr.FromContextOrDiscard(ctx).WithValues("jobId", jobID)
+	logger.V(logging.INFO).Info("Heartbeat: started")
+
+	ticker := time.NewTicker(heartbeatInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			logger.V(logging.INFO).Info("Heartbeat: stopped")
+			return
+		case <-ticker.C:
+			if err := p.inflight.InFlightSet(ctx, jobID, p.processorID); err != nil {
+				logger.Error(err, "Heartbeat: failed to refresh in-flight entry")
+			} else {
+				logger.V(logging.INFO).Info("Heartbeat: refreshed")
+			}
+
+			if p.checkReconcilerActed(ctx, jobID, logger) {
+				logger.Info("Heartbeat: reconciler acted on job, aborting")
+				abortFn()
+				return
+			}
+		}
+	}
+}
+
+func (p *Processor) checkReconcilerActed(ctx context.Context, jobID string, logger logr.Logger) bool {
+	query := &db.BatchQuery{BaseQuery: db.BaseQuery{IDs: []string{jobID}}}
+	items, _, _, err := p.batchDB.DBGet(ctx, query, false, 0, 1)
+	if err != nil {
+		logger.Error(err, "Heartbeat: DB status check failed")
+		return false
+	}
+	if len(items) == 0 {
+		logger.Info("Heartbeat: job not found in DB, reconciler may have acted")
+		return true
+	}
+
+	var statusInfo openai.BatchStatusInfo
+	if err := json.Unmarshal(items[0].Status, &statusInfo); err != nil {
+		logger.Error(err, "Heartbeat: failed to unmarshal job status")
+		return false
+	}
+
+	if statusInfo.Status.IsTerminal() || statusInfo.Status == openai.BatchStatusValidating {
+		logger.Info("Heartbeat: unexpected DB status, reconciler acted", "dbStatus", statusInfo.Status)
+		return true
+	}
+
+	return false
+}
+
 // pre-flight check
 func (p *Processor) prepare(ctx context.Context) error {
 	logger := logr.FromContextOrDiscard(ctx)
@@ -368,8 +506,14 @@ func (p *Processor) validate() error {
 	if err := p.updater.validate(); err != nil {
 		return err
 	}
+	if p.batchDB == nil {
+		return fmt.Errorf("batch DB client is missing")
+	}
 	if p.event == nil {
 		return fmt.Errorf("event channel client is missing")
+	}
+	if p.inflight == nil {
+		return fmt.Errorf("in-flight client is missing")
 	}
 	if p.inference == nil {
 		return fmt.Errorf("inference client is missing")

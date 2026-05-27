@@ -23,6 +23,9 @@ MINIO_SECRET_KEY="${MINIO_SECRET_KEY:-minioadmin}"
 MINIO_REGION="${MINIO_REGION:-us-east-1}"
 VLLM_SIM_MODEL="${VLLM_SIM_MODEL:-sim-model}"
 VLLM_SIM_B_MODEL="${VLLM_SIM_B_MODEL:-sim-model-b}"
+VLLM_SIM_429_MODEL="${VLLM_SIM_429_MODEL:-sim-model-429}"
+VLLM_SIM_ALWAYS_FAIL_MODEL="${VLLM_SIM_ALWAYS_FAIL_MODEL:-sim-model-always-fail}"
+VLLM_SIM_AIMD_MODEL="${VLLM_SIM_AIMD_MODEL:-sim-model-aimd}"
 VLLM_SIM_IMAGE="${VLLM_SIM_IMAGE:-ghcr.io/llm-d/llm-d-inference-sim:latest}"
 JAEGER_IMAGE="${JAEGER_IMAGE:-${IMAGE_REGISTRY}/jaegertracing/all-in-one:latest}"
 PROMETHEUS_IMAGE="${PROMETHEUS_IMAGE:-${IMAGE_REGISTRY}/prom/prometheus:latest}"
@@ -41,6 +44,25 @@ GC_IMG="${GC_IMG:-ghcr.io/llm-d-incubation/batch-gateway-gc:${IMAGE_TAG}}"
 # USE_KIND=true  → use kind; create cluster if it doesn't exist (default)
 # USE_KIND=false → use existing kubeconfig context (OpenShift / Kubernetes)
 USE_KIND="${USE_KIND:-true}"
+
+# ── GIE (Gateway API Inference Extension) flow control support ────────────────
+# Set ENABLE_GIE=true to deploy per-model EPP (standalone mode) in front of
+# each vllm-sim instance; processor routes through EPP and sends
+# x-gateway-inference-objective / x-slo-ttft-ms headers.
+#
+# Naming contract (referenced by dev-deploy, dev-clean, and e2e tests):
+#   EPP Helm release:      ${GIE_EPP_RELEASE}-${model}          e.g. epp-sim-model
+#   EPP deployment/service: ${GIE_EPP_RELEASE}-${model}-epp     e.g. epp-sim-model-epp
+#   InferencePool name:     ${GIE_EPP_RELEASE}-${model}          (created by Helm chart)
+#   InferenceObjective:     batch-sheddable-${model}             (GIE mode)
+#                           batch-sheddable                      (non-GIE mode)
+#   Managed-by label:       app.kubernetes.io/managed-by=batch-gateway-dev
+ENABLE_GIE="${ENABLE_GIE:-false}"
+GIE_REPO="${GIE_REPO:-}"
+GIE_UPSTREAM_REPO="https://github.com/kubernetes-sigs/gateway-api-inference-extension.git"
+GIE_VERSION="${GIE_VERSION:-v1.5.0}"
+GIE_EPP_RELEASE="${GIE_EPP_RELEASE:-epp}"
+GIE_OBJECTIVE_PREFIX="${GIE_OBJECTIVE_PREFIX:-batch-sheddable}"
 
 OS="$(uname -s)"
 ARCH="$(uname -m)"
@@ -758,13 +780,16 @@ install_vllm_sim() {
     local sim_model="$2"
     local time_to_first_token="$3"
     local inter_token_latency="$4"
+    shift 4
+    local extra_args=("$@")
 
     step "Installing vLLM simulator '${sim_name}' (model: ${sim_model})..."
 
-    if kubectl get deployment "${sim_name}" -n "${NAMESPACE}" &>/dev/null; then
-        log "vLLM simulator '${sim_name}' already exists. Skipping."
-        return
-    fi
+    local extra_args_yaml=""
+    for arg in "${extra_args[@]}"; do
+        extra_args_yaml="${extra_args_yaml}
+        - ${arg}"
+    done
 
     kubectl apply -f - <<EOF
 apiVersion: apps/v1
@@ -793,7 +818,7 @@ spec:
         - "8000"
         - --time-to-first-token=${time_to_first_token}
         - --inter-token-latency=${inter_token_latency}
-        - --v=5
+        - --v=5${extra_args_yaml}
         env:
         - name: POD_NAME
           valueFrom:
@@ -833,14 +858,164 @@ EOF
     log "vLLM simulator installed. Service: ${sim_name}:8000"
 }
 
+# ── GIE (Gateway API Inference Extension) ────────────────────────────────────
+
+ensure_gie_repo() {
+    if [ -n "${GIE_REPO}" ] && [ -d "${GIE_REPO}" ]; then
+        log "Using user-provided GIE repo at ${GIE_REPO}"
+    else
+        log "Cloning ${GIE_UPSTREAM_REPO} at ${GIE_VERSION}..."
+        GIE_REPO="$(mktemp -d)/gateway-api-inference-extension"
+        GIE_REPO_TMPDIR="$(dirname "${GIE_REPO}")"
+        git clone --depth 1 --branch "${GIE_VERSION}" "${GIE_UPSTREAM_REPO}" "${GIE_REPO}"
+        log "Cloned GIE repo to ${GIE_REPO}"
+    fi
+
+    if [ ! -f "${GIE_REPO}/config/charts/standalone/Chart.yaml" ]; then
+        die "GIE repo at ${GIE_REPO} does not contain config/charts/standalone/Chart.yaml"
+    fi
+}
+
+install_gie_crds() {
+    step "Installing GIE CRDs..."
+    kubectl apply -f "${GIE_REPO}/config/crd/bases/"
+    log "GIE CRDs installed."
+}
+
+install_gie_epp() {
+    local sim_name="$1"
+    local sim_model="$2"
+    local release_name="${GIE_EPP_RELEASE}-${sim_model}"
+    step "Installing GIE EPP (standalone) for model '${sim_model}'..."
+
+    local chart_dir="${GIE_REPO}/config/charts/standalone"
+    step "Building Helm dependencies for standalone chart..."
+    rm -rf "${chart_dir}/charts"
+    helm dependency build "${chart_dir}"
+
+    local values_file
+    values_file="$(mktemp)"
+    cat > "${values_file}" <<'VALUESEOF'
+inferenceExtension:
+  pluginsCustomConfig:
+    flow-control-plugins.yaml: |
+      apiVersion: inference.networking.x-k8s.io/v1alpha1
+      kind: EndpointPickerConfig
+      featureGates:
+        - "flowControl"
+      plugins:
+        - type: round-robin-fairness-policy
+        - type: global-strict-fairness-policy
+        - type: slo-deadline-ordering-policy
+        - type: utilization-detector
+          parameters:
+            queueDepthThreshold: 5
+            kvCacheUtilThreshold: 0.8
+      flowControl:
+        maxBytes: 4294967296
+        defaultRequestTTL: 30s
+        priorityBands:
+          - priority: 100
+            maxBytes: 1073741824
+            fairnessPolicyRef: round-robin-fairness-policy
+            orderingPolicyRef: fcfs-ordering-policy
+          - priority: -1
+            maxBytes: 3221225472
+            fairnessPolicyRef: global-strict-fairness-policy
+            orderingPolicyRef: slo-deadline-ordering-policy
+        defaultPriorityBand:
+          maxBytes: 536870912
+          fairnessPolicyRef: global-strict-fairness-policy
+          orderingPolicyRef: fcfs-ordering-policy
+      saturationDetector:
+        pluginRef: utilization-detector
+VALUESEOF
+
+    local helm_args=(
+        --namespace "${NAMESPACE}"
+        --set "inferenceExtension.image.tag=${GIE_VERSION}"
+        --set inferenceExtension.monitoring.prometheus.auth.enabled=false
+        --set inferenceExtension.sidecar.enabled=true
+        --set "inferenceExtension.sidecar.configMap.name=envoy-${sim_model}"
+        --set "inferenceExtension.sidecar.volumes[0].name=config"
+        --set "inferenceExtension.sidecar.volumes[0].configMap.name=envoy-${sim_model}"
+        --set inferenceExtension.sidecar.proxyType=envoy
+        --set inferenceExtension.endpointsServer.createInferencePool=true
+        --set "inferencePool.modelServers.matchLabels.app=${sim_name}"
+        --set "inferencePool.targetPorts[0].number=8000"
+        --set inferencePool.modelServerType=vllm
+        --set inferenceExtension.pluginsConfigFile=flow-control-plugins.yaml
+        --set inferenceExtension.resources.requests.cpu=100m
+        --set inferenceExtension.resources.requests.memory=256Mi
+        --set inferenceExtension.resources.limits.memory=512Mi
+        --set "inferenceExtension.flags.zap-log-level=${LOG_VERBOSITY}"
+        -f "${values_file}"
+    )
+
+    if helm status "${release_name}" -n "${NAMESPACE}" &>/dev/null; then
+        log "EPP release '${release_name}' already exists. Upgrading..."
+        helm upgrade "${release_name}" "${chart_dir}" "${helm_args[@]}"
+    else
+        helm install "${release_name}" "${chart_dir}" "${helm_args[@]}"
+    fi
+    rm -f "${values_file}"
+
+    wait_for_deployment "${release_name}-epp" "${NAMESPACE}" 180s
+    log "EPP installed for '${sim_model}'. Service: ${release_name}-epp:8081"
+}
+
+create_inference_objectives() {
+    step "Creating InferenceObjective CRDs..."
+
+    for sim_model in "${VLLM_SIM_MODEL}" "${VLLM_SIM_B_MODEL}"; do
+        local pool_name="${GIE_EPP_RELEASE}-${sim_model}"
+        kubectl apply -f - <<EOF
+apiVersion: inference.networking.x-k8s.io/v1alpha2
+kind: InferenceObjective
+metadata:
+  name: interactive-default-${sim_model}
+  namespace: ${NAMESPACE}
+  labels:
+    app.kubernetes.io/managed-by: batch-gateway-dev
+spec:
+  priority: 100
+  poolRef:
+    group: inference.networking.k8s.io
+    name: ${pool_name}
+---
+apiVersion: inference.networking.x-k8s.io/v1alpha2
+kind: InferenceObjective
+metadata:
+  name: ${GIE_OBJECTIVE_PREFIX}-${sim_model}
+  namespace: ${NAMESPACE}
+  labels:
+    app.kubernetes.io/managed-by: batch-gateway-dev
+spec:
+  priority: -1
+  poolRef:
+    group: inference.networking.k8s.io
+    name: ${pool_name}
+EOF
+    done
+
+    log "InferenceObjectives created per model (interactive-default: priority 100, ${GIE_OBJECTIVE_PREFIX}: priority -1)."
+}
+
 # ── Batch Gateway ─────────────────────────────────────────────────────────────
 
 install_batch_gateway() {
     step "Installing batch-gateway via Helm (version=${IMAGE_TAG})..."
     cd "${REPO_ROOT}"
 
-    local vllm_sim_url="http://${VLLM_SIM_NAME}.${NAMESPACE}.svc.cluster.local:8000"
-    local vllm_sim_b_url="http://${VLLM_SIM_B_NAME}.${NAMESPACE}.svc.cluster.local:8000"
+    local vllm_sim_url vllm_sim_b_url
+    if [ "${ENABLE_GIE}" = "true" ]; then
+        vllm_sim_url="http://${GIE_EPP_RELEASE}-${VLLM_SIM_MODEL}-epp.${NAMESPACE}.svc.cluster.local:8081"
+        vllm_sim_b_url="http://${GIE_EPP_RELEASE}-${VLLM_SIM_B_MODEL}-epp.${NAMESPACE}.svc.cluster.local:8081"
+        log "GIE enabled: routing both models through per-model EPP instances"
+    else
+        vllm_sim_url="http://${VLLM_SIM_NAME}.${NAMESPACE}.svc.cluster.local:8000"
+        vllm_sim_b_url="http://${VLLM_SIM_B_NAME}.${NAMESPACE}.svc.cluster.local:8000"
+    fi
 
     local helm_args=(
         --set "apiserver.image.repository=${APISERVER_IMG%:*}"
@@ -861,6 +1036,28 @@ install_batch_gateway() {
         --set "processor.config.modelGateways.${VLLM_SIM_B_MODEL}.maxRetries=3"
         --set "processor.config.modelGateways.${VLLM_SIM_B_MODEL}.initialBackoff=1s"
         --set "processor.config.modelGateways.${VLLM_SIM_B_MODEL}.maxBackoff=60s"
+        # 429 model always connects directly to the simulator (no EPP), even in GIE mode.
+        # This isolates the processor's HTTP-level retry behavior from EPP routing.
+        --set "processor.config.modelGateways.${VLLM_SIM_429_MODEL}.url=http://${VLLM_SIM_429_NAME}.${NAMESPACE}.svc.cluster.local:8000"
+        --set "processor.config.modelGateways.${VLLM_SIM_429_MODEL}.requestTimeout=2m"
+        --set "processor.config.modelGateways.${VLLM_SIM_429_MODEL}.maxRetries=20"
+        --set "processor.config.modelGateways.${VLLM_SIM_429_MODEL}.initialBackoff=500ms"
+        --set "processor.config.modelGateways.${VLLM_SIM_429_MODEL}.maxBackoff=5s"
+        # Always-fail model: 100% rate_limit injection, minimal retries for fast exhaustion.
+        --set "processor.config.modelGateways.${VLLM_SIM_ALWAYS_FAIL_MODEL}.url=http://${VLLM_SIM_ALWAYS_FAIL_NAME}.${NAMESPACE}.svc.cluster.local:8000"
+        --set "processor.config.modelGateways.${VLLM_SIM_ALWAYS_FAIL_MODEL}.requestTimeout=30s"
+        --set "processor.config.modelGateways.${VLLM_SIM_ALWAYS_FAIL_MODEL}.maxRetries=1"
+        --set "processor.config.modelGateways.${VLLM_SIM_ALWAYS_FAIL_MODEL}.initialBackoff=500ms"
+        --set "processor.config.modelGateways.${VLLM_SIM_ALWAYS_FAIL_MODEL}.maxBackoff=1s"
+        # AIMD recovery test model: starts at 100% rate_limit, patched to 0% mid-test.
+        --set "processor.config.modelGateways.${VLLM_SIM_AIMD_MODEL}.url=http://${VLLM_SIM_AIMD_NAME}.${NAMESPACE}.svc.cluster.local:8000"
+        --set "processor.config.modelGateways.${VLLM_SIM_AIMD_MODEL}.requestTimeout=2m"
+        --set "processor.config.modelGateways.${VLLM_SIM_AIMD_MODEL}.maxRetries=10"
+        --set "processor.config.modelGateways.${VLLM_SIM_AIMD_MODEL}.initialBackoff=500ms"
+        --set "processor.config.modelGateways.${VLLM_SIM_AIMD_MODEL}.maxBackoff=5s"
+        --set "processor.config.modelGateways.${VLLM_SIM_MODEL}.inferenceObjective=${GIE_OBJECTIVE_PREFIX}"
+        --set "processor.config.modelGateways.${VLLM_SIM_B_MODEL}.inferenceObjective=${GIE_OBJECTIVE_PREFIX}"
+        --set "processor.config.modelGateways.${VLLM_SIM_429_MODEL}.inferenceObjective=${GIE_OBJECTIVE_PREFIX}"
         --set "processor.logging.verbosity=${LOG_VERBOSITY}"
         --set "apiserver.logging.verbosity=${LOG_VERBOSITY}"
         --set "apiserver.config.batchAPI.passThroughHeaders={X-E2E-Pass-Through-1,X-E2E-Pass-Through-2}"
@@ -895,6 +1092,19 @@ install_batch_gateway() {
     else
         helm_args+=(
             --set "global.fileClient.fs.pvcName=${FILES_PVC_NAME}"
+        )
+    fi
+
+    if [ "${ENABLE_GIE}" = "true" ]; then
+        helm_args+=(
+            --set "processor.config.modelGateways.${VLLM_SIM_MODEL}.inferenceObjective=${GIE_OBJECTIVE_PREFIX}-${VLLM_SIM_MODEL}"
+            --set "processor.config.modelGateways.${VLLM_SIM_B_MODEL}.inferenceObjective=${GIE_OBJECTIVE_PREFIX}-${VLLM_SIM_B_MODEL}"
+            --set "processor.config.modelGateways.${VLLM_SIM_429_MODEL}.inferenceObjective=${GIE_OBJECTIVE_PREFIX}-${VLLM_SIM_429_MODEL}"
+            --set "processor.config.concurrency.perEndpoint=20"
+            --set "processor.config.modelGateways.${VLLM_SIM_MODEL}.initialBackoff=2s"
+            --set "processor.config.modelGateways.${VLLM_SIM_MODEL}.maxBackoff=30s"
+            --set "processor.config.modelGateways.${VLLM_SIM_B_MODEL}.initialBackoff=2s"
+            --set "processor.config.modelGateways.${VLLM_SIM_B_MODEL}.maxBackoff=30s"
         )
     fi
 
@@ -1095,8 +1305,18 @@ print_usage() {
     echo '       {"custom_id":"req-1","method":"POST","url":"/v1/chat/completions","body":{"model":"sim-model","messages":[{"role":"user","content":"Hello"}]}}'
     echo ""
     echo "     Available models in dev environment:"
-    echo "       - sim-model   (vLLM simulator at ${VLLM_SIM_NAME})"
-    echo "       - sim-model-b (vLLM simulator at ${VLLM_SIM_B_NAME})"
+    echo "       - sim-model     (vLLM simulator at ${VLLM_SIM_NAME})"
+    echo "       - sim-model-b   (vLLM simulator at ${VLLM_SIM_B_NAME})"
+    echo "       - sim-model-429 (vLLM simulator at ${VLLM_SIM_429_NAME}, 50% rate_limit failure injection)"
+    echo "       - sim-model-always-fail (vLLM simulator at ${VLLM_SIM_ALWAYS_FAIL_NAME}, 100% rate_limit failure injection)"
+    echo "       - sim-model-aimd (vLLM simulator at ${VLLM_SIM_AIMD_NAME}, AIMD recovery test — starts 100% rate_limit, patched to 0% mid-test)"
+    if [ "${ENABLE_GIE}" = "true" ]; then
+    echo ""
+    echo "     GIE (flow control) is enabled:"
+    echo "       - Requests route through per-model EPP instances"
+    echo "       - Each model has its own InferencePool and InferenceObjective"
+    echo "       - InferenceObjectives: interactive-default (priority 100), ${GIE_OBJECTIVE_PREFIX} (priority -1)"
+    fi
     echo ""
     echo "  3. Create a batch (replace FILE_ID with the id from step 2):"
     echo ""
@@ -1183,6 +1403,23 @@ main() {
     install_grafana
     install_vllm_sim "${VLLM_SIM_NAME}" "${VLLM_SIM_MODEL}" "50ms" "100ms"
     install_vllm_sim "${VLLM_SIM_B_NAME}" "${VLLM_SIM_B_MODEL}" "200ms" "500ms"
+    install_vllm_sim "${VLLM_SIM_429_NAME}" "${VLLM_SIM_429_MODEL}" "10ms" "10ms" \
+        "--failure-injection-rate=50" "--failure-types=rate_limit"
+    install_vllm_sim "${VLLM_SIM_ALWAYS_FAIL_NAME}" "${VLLM_SIM_ALWAYS_FAIL_MODEL}" "10ms" "10ms" \
+        "--failure-injection-rate=100" "--failure-types=rate_limit"
+    install_vllm_sim "${VLLM_SIM_AIMD_NAME}" "${VLLM_SIM_AIMD_MODEL}" "10ms" "10ms" \
+        "--failure-injection-rate=100" "--failure-types=rate_limit"
+    if [ "${ENABLE_GIE}" = "true" ]; then
+        ensure_gie_repo
+        install_gie_crds
+        install_gie_epp "${VLLM_SIM_NAME}" "${VLLM_SIM_MODEL}"
+        install_gie_epp "${VLLM_SIM_B_NAME}" "${VLLM_SIM_B_MODEL}"
+        create_inference_objectives
+        if [ -n "${GIE_REPO_TMPDIR:-}" ]; then
+            rm -rf "${GIE_REPO_TMPDIR}"
+            log "Cleaned up cloned GIE repo at ${GIE_REPO_TMPDIR}"
+        fi
+    fi
     install_batch_gateway
     verify_deployment
     if [ "${USE_KIND}" = true ]; then
