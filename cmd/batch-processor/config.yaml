@@ -16,10 +16,15 @@ e2e_latency_bucket:
   count: 12
 
 # Concurrency Control
-global_concurrency: 100
-per_model_max_concurrency: 10
-# Maximum number of concurrent job recoveries during startup
-recovery_max_concurrency: 5
+concurrency:
+  global: 100              # Fixed ceiling for total in-flight requests
+  per_endpoint: 10         # Initial/max concurrency per inference endpoint
+  recovery: 5              # Max concurrent job recoveries during startup
+  aimd:
+    enabled: true          # Set to false to disable adaptive concurrency
+    min: 5                 # AIMD floor per endpoint
+    backoff_factor: 0.5    # Multiplicative decrease on 429/5xx (must be in (0,1))
+    additive_increase: 1   # Slots added per successful window
 
 # Metrics & Health Check Server Address - ":PORT" format (e.g. ":9090")
 addr: ":9090"
@@ -41,6 +46,7 @@ work_dir: "/var/lib/batch-gateway/processor"
 # When set, model_gateways entries are ignored for routing.
 global_inference_gateway:
   url: "http://localhost:8000"
+  # inference_objective: ""    # InferenceObjective CRD name for x-gateway-inference-objective header
   request_timeout: "5m"
   max_retries: 3
   initial_backoff: "1s"
@@ -57,6 +63,7 @@ global_inference_gateway:
 # model_gateways:
 #   "llama-3":
 #     url: "http://gateway-a:8000"
+#     inference_objective: ""    # InferenceObjective CRD name for x-gateway-inference-objective header
 #     request_timeout: "5m"
 #     max_retries: 3
 #     initial_backoff: "1s"
@@ -77,3 +84,7 @@ default_output_expiration_seconds: 7776000  # 90 days
 
 # TTL for temporary progress updates in the status store (Redis), in seconds.
 progress_ttl_seconds: 86400  # 24 hours
+
+# Whether to send x-gateway-inference-fairness-id on inference requests.
+# false (default) omits the fairness header entirely.
+send_fairness_header: false

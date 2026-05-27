@@ -110,7 +110,7 @@ func getUpdateFields(status []byte, tags db_api.Tags) (
 	return
 }
 
-func (c *BatchDBClientRedis) DBUpdate(ctx context.Context, item *db_api.BatchItem) (err error) {
+func (c *BatchDBClientRedis) DBUpdate(ctx context.Context, item *db_api.BatchItem, expectedStatus []byte) (err error) {
 
 	if ctx == nil {
 		ctx = context.Background()
@@ -118,10 +118,10 @@ func (c *BatchDBClientRedis) DBUpdate(ctx context.Context, item *db_api.BatchIte
 	if err = item.Validate(); err != nil {
 		return
 	}
-	return c.dbUpdate(ctx, &item.BaseIndexes, &item.BaseContents, itemTypeBatch, "DBUpdate[Batch]")
+	return c.dbUpdate(ctx, &item.BaseIndexes, &item.BaseContents, itemTypeBatch, "DBUpdate[Batch]", expectedStatus)
 }
 
-func (c *FileDBClientRedis) DBUpdate(ctx context.Context, item *db_api.FileItem) (err error) {
+func (c *FileDBClientRedis) DBUpdate(ctx context.Context, item *db_api.FileItem, expectedStatus []byte) (err error) {
 
 	if ctx == nil {
 		ctx = context.Background()
@@ -129,12 +129,12 @@ func (c *FileDBClientRedis) DBUpdate(ctx context.Context, item *db_api.FileItem)
 	if err = item.Validate(); err != nil {
 		return
 	}
-	return c.dbUpdate(ctx, &item.BaseIndexes, &item.BaseContents, itemTypeFile, "DBUpdate[File]")
+	return c.dbUpdate(ctx, &item.BaseIndexes, &item.BaseContents, itemTypeFile, "DBUpdate[File]", expectedStatus)
 }
 
 func (c *DSClientRedis) dbUpdate(ctx context.Context,
 	indexes *db_api.BaseIndexes, contents *db_api.BaseContents,
-	itemType, logPref string) (err error) {
+	itemType, logPref string, expectedStatus []byte) (err error) {
 
 	if ctx == nil {
 		ctx = context.Background()
@@ -150,11 +150,30 @@ func (c *DSClientRedis) dbUpdate(ctx context.Context,
 		return nil
 	}
 
+	key := getKeyForStore(indexes.ID, itemType)
 	cctx, ccancel := context.WithTimeout(ctx, c.timeout)
 	defer ccancel()
-	err = c.redisClient.HSet(cctx, getKeyForStore(indexes.ID, itemType), fields...).Err()
-	if err != nil {
-		return
+
+	if len(expectedStatus) > 0 {
+		args := append([]any{expectedStatus}, fields...)
+		result, err := redisScriptUpdateCAS.Run(cctx, c.redisClient,
+			[]string{key}, args...).Text()
+		if err != nil {
+			return err
+		}
+		switch result {
+		case "OK":
+			// success
+		case "CONFLICT", "NOT_FOUND":
+			return fmt.Errorf("DBUpdate: %w", db_api.ErrConflict)
+		default:
+			return fmt.Errorf("DBUpdate: unexpected CAS script result %q", result)
+		}
+	} else {
+		err = c.redisClient.HSet(cctx, key, fields...).Err()
+		if err != nil {
+			return
+		}
 	}
 
 	logger.Info(logPref+": succeeded", "updatedStatus", updatedStatus, "updatedTags", updatedTags)
@@ -214,7 +233,7 @@ func (c *DSClientRedis) dBDelete(ctx context.Context, IDs []string, itemType, lo
 func (c *DSClientRedis) dbGet(
 	ctx context.Context, itemType, logPref string, start, limit int, includeStatic bool,
 	IDs []string, tagSelectors db_api.Tags, tagsLogicalCond db_api.LogicalCond,
-	expired bool, tenantID, purpose string) (res []any, err error) {
+	expired bool, tenantID, purpose string, nonTerminal bool) (res []any, err error) {
 
 	if ctx == nil {
 		ctx = context.Background()
@@ -274,6 +293,17 @@ func (c *DSClientRedis) dbGet(
 			return
 		}
 
+	} else if nonTerminal {
+
+		cctx, ccancel := context.WithTimeout(ctx, c.timeout)
+		defer ccancel()
+		res, err = redisScriptGetByNonTerminal.Run(cctx, c.redisClient,
+			[]string{}, getKeyPatternForStore(itemType),
+			start, limit, tenantID, includeSpec).Slice()
+		if err != nil {
+			return
+		}
+
 	} else if len(tenantID) > 0 {
 
 		cctx, ccancel := context.WithTimeout(ctx, c.timeout)
@@ -306,7 +336,7 @@ func (c *BatchDBClientRedis) DBGet(
 
 	var res []any
 	res, err = c.dbGet(ctx, itemTypeBatch, "DBGet[Batch]", start, limit, includeStatic,
-		query.IDs, query.TagSelectors, query.TagsLogicalCond, query.Expired, query.TenantID, "")
+		query.IDs, query.TagSelectors, query.TagsLogicalCond, query.Expired, query.TenantID, "", query.NonTerminal)
 	if err != nil {
 		return
 	}
@@ -337,7 +367,7 @@ func (c *FileDBClientRedis) DBGet(
 
 	var res []any
 	res, err = c.dbGet(ctx, itemTypeFile, "DBGet[File]", start, limit, includeStatic,
-		query.IDs, query.TagSelectors, query.TagsLogicalCond, query.Expired, query.TenantID, query.Purpose)
+		query.IDs, query.TagSelectors, query.TagsLogicalCond, query.Expired, query.TenantID, query.Purpose, false)
 	if err != nil {
 		return
 	}

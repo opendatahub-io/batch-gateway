@@ -103,6 +103,7 @@ apiserver:
     repository: quay.io/opendatahub/odh-llm-d-batch-gateway-apiserver
     pullPolicy: Always
     tag: "odh-stable"
+    digest: ""
 
   nameOverride: ""
   fullnameOverride: ""
@@ -240,6 +241,7 @@ processor:
     repository: quay.io/opendatahub/odh-llm-d-batch-gateway-processor
     pullPolicy: Always
     tag: "odh-stable"
+    digest: ""
 
   nameOverride: ""
   fullnameOverride: ""
@@ -303,10 +305,31 @@ processor:
     taskWaitTime: "1s"
     pollInterval: "5s"
     numWorkers: 20
-    globalConcurrency: 100
-    perModelMaxConcurrency: 10
-    # Maximum number of concurrent job recoveries during startup
-    recoveryMaxConcurrency: 5
+    concurrency:
+      # Fixed ceiling for total in-flight requests across all endpoints.
+      # When AIMD is enabled, per-endpoint limits self-regulate via backpressure,
+      # so this mostly acts as a burst ceiling. Size it high enough to avoid being
+      # the first bottleneck (e.g., perEndpoint × expected_endpoint_count × 2).
+      global: 100
+      # Initial (and maximum) concurrency per inference endpoint. Sizing depends
+      # on what sits behind the endpoint URL:
+      #   - Single vLLM instance: 10–20 is reasonable
+      #   - GIE/EPP pool routing to N replicas: can be much higher (e.g., 20 × N)
+      # With AIMD enabled, starting high is safer — AIMD backs off quickly on 429s
+      # but recovers slowly at +additiveIncrease per window.
+      perEndpoint: 10
+      recovery: 5            # Max concurrent job recoveries during startup
+      aimd:
+        enabled: true        # Set to false to disable adaptive concurrency
+        # AIMD floor per endpoint — even under sustained 429s, AIMD will never
+        # reduce concurrency below this value. The endpoint always keeps at
+        # least this many requests in flight.
+        # Too high: AIMD cannot back off enough when the backend is genuinely
+        # overloaded. Too low: a few 429s starve the endpoint and recovery is
+        # very slow at +additiveIncrease per window.
+        min: 5
+        backoffFactor: 0.5   # Multiplicative decrease on 429/5xx
+        additiveIncrease: 1  # Slots added per successful window
     queueTimeBucket:
       start: 0.1
       factor: 2
@@ -331,6 +354,7 @@ processor:
     # Mutually exclusive with modelGateways — the processor rejects config with both set.
     # globalInferenceGateway:
     #   url: "http://inference-gateway:8000"
+    #   inferenceObjective: ""        # InferenceObjective CRD name for x-gateway-inference-objective header
     #   requestTimeout: "5m"
     #   maxRetries: 3
     #   initialBackoff: "1s"
@@ -343,9 +367,13 @@ processor:
     # modelGateways maps specific model names to gateway configs.
     # Only models listed here are routed; unlisted models get a request-level error.
     # Either globalInferenceGateway or modelGateways must be configured.
+    # Each entry may set inferenceObjective to specify the InferenceObjective CRD name
+    # for the x-gateway-inference-objective header. This enables multi-pool deployments
+    # where each model routes through a separate InferencePool with its own priority band.
     # modelGateways:
     #   "llama-3":
-    #     url: "http://gateway-a:8000"
+    #     url: "http://gie-a-epp:8081"
+    #     inferenceObjective: "batch-sheddable-a"   # references gie-a pool
     #     requestTimeout: "5m"
     #     maxRetries: 3
     #     initialBackoff: "1s"
@@ -355,17 +383,15 @@ processor:
     #     tlsClientCertFile: ""
     #     tlsClientKeyFile: ""
     #   "mistral":
-    #     url: "http://gateway-b:8000"
-    #     apiKeyName: "gateway-b-api-key"
+    #     url: "http://gie-b-epp:8081"
+    #     inferenceObjective: "batch-sheddable-b"   # references gie-b pool
     #     requestTimeout: "2m"
     #     maxRetries: 1
     defaultOutputExpirationSeconds: 7776000  # 90 days
     progressTTLSeconds: 86400  # 24 hours
-    # Name of a GIE InferenceObjective CRD to reference in the
-    # x-gateway-inference-objective header on inference requests.
-    # Used by GIE flow control to assign batch requests to a priority band.
-    # Empty (default) means the header is not sent.
-    inferenceObjective: ""
+    # Whether to send x-gateway-inference-fairness-id on inference requests.
+    # false (default) omits the header entirely.
+    sendFairnessHeader: false
     # Enable pprof profiling endpoints on the observability server (/debug/pprof/)
     enablePprof: false
 
@@ -425,6 +451,7 @@ gc:
     repository: quay.io/opendatahub/odh-llm-d-batch-gateway-gc
     pullPolicy: IfNotPresent
     tag: "odh-stable"
+    digest: ""
 
   serviceAccount:
     create: true

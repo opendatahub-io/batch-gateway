@@ -20,13 +20,29 @@ import (
 	"context"
 	_ "embed"
 	"fmt"
+	"strings"
 
 	"github.com/go-logr/logr"
+
 	"github.com/llm-d-incubation/batch-gateway/internal/database/api"
+	"github.com/llm-d-incubation/batch-gateway/internal/shared/openai"
 )
 
 //go:embed batch_schema.sql
 var batchSchemaSql string
+
+// nonTerminalCondition is the SQL WHERE clause fragment that filters for
+// non-terminal batch statuses. Computed once since terminal statuses are fixed.
+var nonTerminalCondition = buildNonTerminalCondition()
+
+func buildNonTerminalCondition() string {
+	statuses := openai.TerminalStatuses()
+	quoted := make([]string, len(statuses))
+	for i, s := range statuses {
+		quoted[i] = "'" + string(s) + "'"
+	}
+	return colStatus + `::jsonb->>'status' NOT IN (` + strings.Join(quoted, ",") + `)`
+}
 
 // Compile-time check: batchDescriptor implements TableDescriptor.
 var _ TableDescriptor = (*batchDescriptor)(nil)
@@ -83,8 +99,13 @@ func (c *PostgresBatchDBClient) DBGet(
 		return
 	}
 
+	var rawConditions []string
+	if query.NonTerminal {
+		rawConditions = append(rawConditions, nonTerminalCondition)
+	}
+
 	indexes, contents, _, cursor, expectMore, err := c.get(
-		ctx, &query.BaseQuery, includeStatic, start, limit, nil)
+		ctx, &query.BaseQuery, includeStatic, start, limit, nil, rawConditions)
 	if err != nil {
 		return
 	}
@@ -100,12 +121,12 @@ func (c *PostgresBatchDBClient) DBGet(
 	return
 }
 
-func (c *PostgresBatchDBClient) DBUpdate(ctx context.Context, item *api.BatchItem) (err error) {
+func (c *PostgresBatchDBClient) DBUpdate(ctx context.Context, item *api.BatchItem, expectedStatus []byte) (err error) {
 	if item == nil {
 		err = fmt.Errorf("item is nil")
 		return
 	}
-	if err = c.update(ctx, &item.BaseIndexes, &item.BaseContents); err != nil {
+	if err = c.update(ctx, &item.BaseIndexes, &item.BaseContents, expectedStatus); err != nil {
 		return
 	}
 	return

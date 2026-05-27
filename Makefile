@@ -233,8 +233,7 @@ install-pre-commit-tools:
 	$(GO) install github.com/quasilyte/go-ruleguard/cmd/ruleguard@v0.4.5
 	@if command -v helm >/dev/null 2>&1; then \
 		helm plugin list | grep -q unittest || \
-			helm plugin install https://github.com/helm-unittest/helm-unittest.git || \
-			helm plugin install --verify=false https://github.com/helm-unittest/helm-unittest.git; \
+			helm plugin install --verify=false --version v1.0.3 https://github.com/helm-unittest/helm-unittest.git; \
 	else \
 		echo "helm not found, skipping helm-unittest plugin install"; \
 	fi
@@ -326,6 +325,10 @@ KIND_CLUSTER_NAME ?= batch-gateway-dev
 ## dev-deploy: Deploy batch-gateway to a local kind cluster with all dependencies
 dev-deploy:
 	@bash scripts/dev-deploy.sh
+
+## dev-deploy-gie: Deploy with GIE integration (per-model EPP + InferenceObjectives)
+dev-deploy-gie:
+	@ENABLE_GIE=true bash scripts/dev-deploy.sh
 
 ## dev-clean: Clean up dev deployment (removes all resources but keeps the kind cluster)
 dev-clean:

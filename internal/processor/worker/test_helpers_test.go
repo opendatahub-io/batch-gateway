@@ -217,6 +217,9 @@ func (s *spyPQ) PQDelete(ctx context.Context, jobPriority *db.BatchJobPriority) 
 func (s *spyPQ) GetContext(parentCtx context.Context, timeLimit time.Duration) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(parentCtx, timeLimit)
 }
+func (s *spyPQ) PQGetIDs(ctx context.Context) (map[string]bool, error) {
+	return s.inner.PQGetIDs(ctx)
+}
 func (s *spyPQ) Close() error { return s.inner.Close() }
 
 func (s *spyPQ) DeleteCalls() int {
@@ -252,7 +255,7 @@ func (s *spyBatchDB) DBGet(ctx context.Context, query *db.BatchQuery, includeSta
 	return s.inner.DBGet(ctx, query, includeStatic, start, limit)
 }
 
-func (s *spyBatchDB) DBUpdate(ctx context.Context, item *db.BatchItem) error {
+func (s *spyBatchDB) DBUpdate(ctx context.Context, item *db.BatchItem, expectedStatus []byte) error {
 	if len(item.Status) > 0 {
 		var st openai.BatchStatusInfo
 		if err := json.Unmarshal(item.Status, &st); err == nil {
@@ -261,7 +264,7 @@ func (s *spyBatchDB) DBUpdate(ctx context.Context, item *db.BatchItem) error {
 			s.mu.Unlock()
 		}
 	}
-	return s.inner.DBUpdate(ctx, item)
+	return s.inner.DBUpdate(ctx, item, expectedStatus)
 }
 
 func (s *spyBatchDB) DBDelete(ctx context.Context, IDs []string) ([]string, error) {
@@ -296,14 +299,14 @@ func (f *failOnStatusDB) DBStore(ctx context.Context, item *db.BatchItem) error 
 func (f *failOnStatusDB) DBGet(ctx context.Context, query *db.BatchQuery, includeStatic bool, start, limit int) ([]*db.BatchItem, int, bool, error) {
 	return f.inner.DBGet(ctx, query, includeStatic, start, limit)
 }
-func (f *failOnStatusDB) DBUpdate(ctx context.Context, item *db.BatchItem) error {
+func (f *failOnStatusDB) DBUpdate(ctx context.Context, item *db.BatchItem, expectedStatus []byte) error {
 	if len(item.Status) > 0 {
 		var st openai.BatchStatusInfo
 		if err := json.Unmarshal(item.Status, &st); err == nil && st.Status == f.failStatus {
 			return f.failErr
 		}
 	}
-	return f.inner.DBUpdate(ctx, item)
+	return f.inner.DBUpdate(ctx, item, expectedStatus)
 }
 func (f *failOnStatusDB) DBDelete(ctx context.Context, IDs []string) ([]string, error) {
 	return f.inner.DBDelete(ctx, IDs)
@@ -319,7 +322,10 @@ func (f *failOnStatusDB) Close() error { return f.inner.Close() }
 
 func mustNewProcessor(t *testing.T, cfg *config.ProcessorConfig, clients *clientset.Clientset) *Processor {
 	t.Helper()
-	p, err := NewProcessor(cfg, clients, testLogger(t))
+	if clients.InFlight == nil {
+		clients.InFlight = mockdb.NewMockInFlightClient()
+	}
+	p, err := NewProcessor(cfg, clients, "test-processor", testLogger(t))
 	if err != nil {
 		t.Fatalf("NewProcessor: %v", err)
 	}
@@ -330,10 +336,11 @@ func mustNewProcessor(t *testing.T, cfg *config.ProcessorConfig, clients *client
 	if err != nil {
 		t.Fatalf("worker semaphore: %v", err)
 	}
-	p.globalSem, err = semaphore.New(cfg.GlobalConcurrency, nil)
+	p.globalSem, err = semaphore.New(cfg.Concurrency.Global, nil)
 	if err != nil {
 		t.Fatalf("global semaphore: %v", err)
 	}
+	initTestEndpointLimits(t, p, cfg)
 	return p
 }
 
@@ -346,6 +353,7 @@ func validProcessorClients(t testing.TB) *clientset.Clientset {
 		Queue:     mockdb.NewMockBatchPriorityQueueClient(),
 		Status:    mockdb.NewMockBatchStatusClient(),
 		Event:     mockdb.NewMockBatchEventChannelClient(),
+		InFlight:  mockdb.NewMockInFlightClient(),
 		Inference: inference.NewSingleClientResolver(&fakeInferenceClient{}),
 	}
 }
@@ -374,8 +382,9 @@ func newTestProcessorEnv(t *testing.T, cfg *config.ProcessorConfig, inferClient 
 		Queue:     pqClient,
 		Status:    statusClient,
 		Event:     mockdb.NewMockBatchEventChannelClient(),
+		InFlight:  mockdb.NewMockInFlightClient(),
 		Inference: inference.NewSingleClientResolver(inferClient),
-	}, testLogger(t))
+	}, "test-processor", testLogger(t))
 	if err != nil {
 		t.Fatalf("NewProcessor: %v", err)
 	}
@@ -383,10 +392,11 @@ func newTestProcessorEnv(t *testing.T, cfg *config.ProcessorConfig, inferClient 
 	if err != nil {
 		t.Fatalf("worker semaphore: %v", err)
 	}
-	p.globalSem, err = semaphore.New(cfg.GlobalConcurrency, nil)
+	p.globalSem, err = semaphore.New(cfg.Concurrency.Global, nil)
 	if err != nil {
 		t.Fatalf("global semaphore: %v", err)
 	}
+	initTestEndpointLimits(t, p, cfg)
 	p.poller = NewPoller(pqClient, dbClient)
 
 	return &testProcessorEnv{
@@ -677,8 +687,69 @@ func readNonEmptyJSONLLines(t *testing.T, path string) [][]byte {
 	return lines
 }
 
+// initTestEndpointLimits creates per-endpoint AIMD+AdaptiveSemaphore pairs for
+// each unique client in the processor's resolver.
+func initTestEndpointLimits(t *testing.T, p *Processor, cfg *config.ProcessorConfig) {
+	t.Helper()
+	if p.inference == nil {
+		p.endpointLimits = make(map[inference.InferenceClient]*endpointLimit)
+		return
+	}
+	cc := &cfg.Concurrency
+	clients := p.inference.Clients()
+	p.endpointLimits = make(map[inference.InferenceClient]*endpointLimit, len(clients))
+	for _, client := range clients {
+		epLabel := p.inference.ClientLabel(client)
+		epSem, err := semaphore.NewAdaptive(cc.PerEndpoint, nil)
+		if err != nil {
+			t.Fatalf("endpoint semaphore: %v", err)
+		}
+		var epAIMD *semaphore.AIMDController
+		if cc.AIMD.Enabled {
+			epAIMD = semaphore.NewAIMDController(
+				semaphore.AIMDConfig{
+					MinLimit:         cc.AIMD.Min,
+					MaxLimit:         cc.PerEndpoint,
+					BackoffFactor:    cc.AIMD.BackoffFactor,
+					AdditiveIncrease: cc.AIMD.AdditiveIncrease,
+				},
+				cc.PerEndpoint,
+				func(limit int) { epSem.SetLimit(limit) },
+				logr.Discard(),
+			)
+		}
+		p.endpointLimits[client] = &endpointLimit{sem: epSem, aimd: epAIMD, label: epLabel}
+	}
+}
+
 func uniqueTestFolder(t *testing.T, base string) string {
 	t.Helper()
 	testName := strings.ReplaceAll(t.Name(), "/", "_")
 	return filepath.Join(base, testName, fmt.Sprintf("%d", time.Now().UnixNano()))
+}
+
+type countingInFlightClient struct {
+	inner    *mockdb.MockInFlightClient
+	setCount atomic.Int32
+}
+
+func newCountingInFlightClient() *countingInFlightClient {
+	return &countingInFlightClient{inner: mockdb.NewMockInFlightClient()}
+}
+
+func (c *countingInFlightClient) InFlightSet(ctx context.Context, jobID, processorID string) error {
+	c.setCount.Add(1)
+	return c.inner.InFlightSet(ctx, jobID, processorID)
+}
+
+func (c *countingInFlightClient) InFlightDelete(ctx context.Context, jobID string) error {
+	return c.inner.InFlightDelete(ctx, jobID)
+}
+
+func (c *countingInFlightClient) InFlightGetAll(ctx context.Context) (map[string]*db.InFlightEntry, error) {
+	return c.inner.InFlightGetAll(ctx)
+}
+
+func (c *countingInFlightClient) Close() error {
+	return c.inner.Close()
 }

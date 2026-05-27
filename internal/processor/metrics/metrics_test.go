@@ -182,8 +182,8 @@ func TestInitMetrics_AndRecorders(t *testing.T) {
 		if v := gaugeValue(f["processor_inflight_requests"]); v != 1 {
 			t.Fatalf("processor_inflight_requests=%v, want 1", v)
 		}
-		if v := gaugeValue(f["processor_max_inflight_concurrency"]); v != float64(cfg.GlobalConcurrency) {
-			t.Fatalf("processor_max_inflight_concurrency=%v, want %v", v, cfg.GlobalConcurrency)
+		if v := gaugeValue(f["processor_max_inflight_concurrency"]); v != float64(cfg.Concurrency.Global) {
+			t.Fatalf("processor_max_inflight_concurrency=%v, want %v", v, cfg.Concurrency.Global)
 		}
 
 		if v := counterWithLabels(f["jobs_processed_total"], map[string]string{"result": ResultSuccess, "reason": ReasonNone}); v != 1 {
@@ -319,6 +319,59 @@ func TestCancellationMetric(t *testing.T) {
 			t.Fatalf("cancellation{finalizing}=%v, want 1", v)
 		}
 		assertLabelNames(t, f["batch_cancellation_total"], []string{"phase"})
+	})
+}
+
+func TestAIMDMetrics(t *testing.T) {
+	withIsolatedPromRegistry(t, func(reg *prometheus.Registry) {
+		cfg := *config.NewConfig()
+		if err := InitMetrics(cfg); err != nil {
+			t.Fatalf("InitMetrics: %v", err)
+		}
+
+		SetAIMDConcurrencyLimit("ep-a", 20)
+		SetAIMDConcurrencyLimit("ep-b", 10)
+
+		RecordAIMDDecrease("ep-a", AIMDSignal429)
+		RecordAIMDDecrease("ep-a", AIMDSignal429)
+		RecordAIMDDecrease("ep-a", AIMDSignal5xx)
+		RecordAIMDDecrease("ep-b", AIMDSignalCapacityRetry)
+
+		RecordAIMDIncrease("ep-a")
+		RecordAIMDIncrease("ep-b")
+		RecordAIMDIncrease("ep-b")
+
+		SetAIMDConcurrencyLimit("ep-a", 15)
+
+		f := collectFamilies(t, reg)
+
+		if v := gaugeWithLabel(f["batch_processor_aimd_concurrency_limit"], "endpoint", "ep-a"); v != 15 {
+			t.Fatalf("aimd_limit{ep-a}=%v, want 15", v)
+		}
+		if v := gaugeWithLabel(f["batch_processor_aimd_concurrency_limit"], "endpoint", "ep-b"); v != 10 {
+			t.Fatalf("aimd_limit{ep-b}=%v, want 10", v)
+		}
+
+		if v := counterWithLabels(f["batch_processor_aimd_decreases_total"], map[string]string{"endpoint": "ep-a", "signal": AIMDSignal429}); v != 2 {
+			t.Fatalf("aimd_decreases{ep-a,429}=%v, want 2", v)
+		}
+		if v := counterWithLabels(f["batch_processor_aimd_decreases_total"], map[string]string{"endpoint": "ep-a", "signal": AIMDSignal5xx}); v != 1 {
+			t.Fatalf("aimd_decreases{ep-a,5xx}=%v, want 1", v)
+		}
+		if v := counterWithLabels(f["batch_processor_aimd_decreases_total"], map[string]string{"endpoint": "ep-b", "signal": AIMDSignalCapacityRetry}); v != 1 {
+			t.Fatalf("aimd_decreases{ep-b,capacity_retry}=%v, want 1", v)
+		}
+
+		if v := counterWithLabels(f["batch_processor_aimd_increases_total"], map[string]string{"endpoint": "ep-a"}); v != 1 {
+			t.Fatalf("aimd_increases{ep-a}=%v, want 1", v)
+		}
+		if v := counterWithLabels(f["batch_processor_aimd_increases_total"], map[string]string{"endpoint": "ep-b"}); v != 2 {
+			t.Fatalf("aimd_increases{ep-b}=%v, want 2", v)
+		}
+
+		assertLabelNames(t, f["batch_processor_aimd_concurrency_limit"], []string{"endpoint"})
+		assertLabelNames(t, f["batch_processor_aimd_decreases_total"], []string{"endpoint", "signal"})
+		assertLabelNames(t, f["batch_processor_aimd_increases_total"], []string{"endpoint"})
 	})
 }
 

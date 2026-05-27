@@ -384,6 +384,7 @@ func TestPost_RetryOn500(t *testing.T) {
 	if attemptCount.Load() != 3 {
 		t.Errorf("Expected 3 attempts, got %d", attemptCount.Load())
 	}
+
 }
 
 // TestPost_RetryOn429 tests that 429 (rate limit) errors are retried
@@ -424,6 +425,7 @@ func TestPost_RetryOn429(t *testing.T) {
 	if attemptCount.Load() != 2 {
 		t.Errorf("Expected 2 attempts, got %d", attemptCount.Load())
 	}
+
 }
 
 // TestPost_NoRetryOn400 tests that 400 errors are not retried
@@ -459,6 +461,7 @@ func TestPost_NoRetryOn400(t *testing.T) {
 	if attemptCount.Load() != 1 {
 		t.Errorf("Expected 1 attempt (no retry), got %d", attemptCount.Load())
 	}
+
 }
 
 // TestRetryAfter_429WithRetryAfterHeader tests that 429 responses with Retry-After header
@@ -1185,6 +1188,332 @@ func containsString(s, substr string) bool {
 		}
 	}
 	return false
+}
+
+func TestCapacityRetryTracking(t *testing.T) {
+	t.Run("429 retry sets capacity flag", func(t *testing.T) {
+		var attempts atomic.Int32
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			if attempts.Add(1) == 1 {
+				w.WriteHeader(http.StatusTooManyRequests)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"ok":true}`))
+		}))
+		defer server.Close()
+
+		client, err := NewHTTPClient(Config{
+			BaseURL:        server.URL,
+			MaxRetries:     2,
+			InitialBackoff: time.Millisecond,
+			MaxBackoff:     10 * time.Millisecond,
+		}, testLogger(t))
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		ctx, hadCapacity := NewCapacityRetryContext(context.Background())
+		_, statusCode, err := client.Post(ctx, "/test", nil, nil, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if statusCode != http.StatusOK {
+			t.Fatalf("status = %d, want 200", statusCode)
+		}
+		if !hadCapacity() {
+			t.Fatal("expected HadCapacityRetry=true after 429 retry")
+		}
+	})
+
+	t.Run("5xx retry sets capacity flag", func(t *testing.T) {
+		var attempts atomic.Int32
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			if attempts.Add(1) == 1 {
+				w.WriteHeader(http.StatusBadGateway)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"ok":true}`))
+		}))
+		defer server.Close()
+
+		client, err := NewHTTPClient(Config{
+			BaseURL:        server.URL,
+			MaxRetries:     2,
+			InitialBackoff: time.Millisecond,
+			MaxBackoff:     10 * time.Millisecond,
+		}, testLogger(t))
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		ctx, hadCapacity := NewCapacityRetryContext(context.Background())
+		_, statusCode, err := client.Post(ctx, "/test", nil, nil, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if statusCode != http.StatusOK {
+			t.Fatalf("status = %d, want 200", statusCode)
+		}
+		if !hadCapacity() {
+			t.Fatal("expected HadCapacityRetry=true after 502 retry")
+		}
+	})
+
+	t.Run("network-only retry does not set capacity flag", func(t *testing.T) {
+		var attempts atomic.Int32
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			attempts.Add(1)
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"ok":true}`))
+		}))
+		defer server.Close()
+
+		client, err := NewHTTPClient(Config{
+			BaseURL:        server.URL,
+			MaxRetries:     2,
+			InitialBackoff: time.Millisecond,
+			MaxBackoff:     10 * time.Millisecond,
+		}, testLogger(t))
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		ctx, hadCapacity := NewCapacityRetryContext(context.Background())
+		_, statusCode, err := client.Post(ctx, "/test", nil, nil, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if statusCode != http.StatusOK {
+			t.Fatalf("status = %d, want 200", statusCode)
+		}
+		if hadCapacity() {
+			t.Fatal("expected HadCapacityRetry=false when no retries occurred")
+		}
+	})
+
+	t.Run("no tracking context is safe", func(t *testing.T) {
+		var attempts atomic.Int32
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			if attempts.Add(1) == 1 {
+				w.WriteHeader(http.StatusTooManyRequests)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"ok":true}`))
+		}))
+		defer server.Close()
+
+		client, err := NewHTTPClient(Config{
+			BaseURL:        server.URL,
+			MaxRetries:     2,
+			InitialBackoff: time.Millisecond,
+			MaxBackoff:     10 * time.Millisecond,
+		}, testLogger(t))
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// No capacity tracking context — should not panic
+		_, statusCode, err := client.Post(context.Background(), "/test", nil, nil, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if statusCode != http.StatusOK {
+			t.Fatalf("status = %d, want 200", statusCode)
+		}
+	})
+}
+
+func TestDroppedReasonHandling(t *testing.T) {
+	t.Run("503 with rejected-ttl-expired is not retried", func(t *testing.T) {
+		var attempts atomic.Int32
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			attempts.Add(1)
+			w.Header().Set(HeaderDroppedReason, DroppedReasonTTLExpired)
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte(`{"error":"ttl expired"}`))
+		}))
+		defer server.Close()
+
+		client, err := NewHTTPClient(Config{
+			BaseURL:        server.URL,
+			MaxRetries:     3,
+			InitialBackoff: time.Millisecond,
+			MaxBackoff:     10 * time.Millisecond,
+		}, testLogger(t))
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		_, statusCode, err := client.Post(context.Background(), "/test", nil, nil, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if statusCode != http.StatusServiceUnavailable {
+			t.Fatalf("status = %d, want 503", statusCode)
+		}
+		if attempts.Load() != 1 {
+			t.Fatalf("expected 1 attempt (no retries), got %d", attempts.Load())
+		}
+	})
+
+	t.Run("429 with rejected-ttl-expired is not retried", func(t *testing.T) {
+		var attempts atomic.Int32
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			attempts.Add(1)
+			w.Header().Set(HeaderDroppedReason, DroppedReasonTTLExpired)
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte(`{"error":"ttl expired"}`))
+		}))
+		defer server.Close()
+
+		client, err := NewHTTPClient(Config{
+			BaseURL:        server.URL,
+			MaxRetries:     3,
+			InitialBackoff: time.Millisecond,
+			MaxBackoff:     10 * time.Millisecond,
+		}, testLogger(t))
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		_, statusCode, err := client.Post(context.Background(), "/test", nil, nil, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if statusCode != http.StatusTooManyRequests {
+			t.Fatalf("status = %d, want 429", statusCode)
+		}
+		if attempts.Load() != 1 {
+			t.Fatalf("expected 1 attempt (no retries), got %d", attempts.Load())
+		}
+	})
+
+	t.Run("429 with other dropped reason is retried", func(t *testing.T) {
+		var attempts atomic.Int32
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			count := attempts.Add(1)
+			if count < 3 {
+				w.Header().Set(HeaderDroppedReason, "rejected-saturated")
+				w.WriteHeader(http.StatusTooManyRequests)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"ok":true}`))
+		}))
+		defer server.Close()
+
+		client, err := NewHTTPClient(Config{
+			BaseURL:        server.URL,
+			MaxRetries:     3,
+			InitialBackoff: time.Millisecond,
+			MaxBackoff:     10 * time.Millisecond,
+		}, testLogger(t))
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		_, statusCode, err := client.Post(context.Background(), "/test", nil, nil, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if statusCode != http.StatusOK {
+			t.Fatalf("status = %d, want 200", statusCode)
+		}
+		if attempts.Load() != 3 {
+			t.Fatalf("expected 3 attempts, got %d", attempts.Load())
+		}
+	})
+
+	t.Run("503 with other dropped reason is retried", func(t *testing.T) {
+		var attempts atomic.Int32
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			count := attempts.Add(1)
+			if count < 3 {
+				w.Header().Set(HeaderDroppedReason, "rejected-saturated")
+				w.WriteHeader(http.StatusServiceUnavailable)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"ok":true}`))
+		}))
+		defer server.Close()
+
+		client, err := NewHTTPClient(Config{
+			BaseURL:        server.URL,
+			MaxRetries:     3,
+			InitialBackoff: time.Millisecond,
+			MaxBackoff:     10 * time.Millisecond,
+		}, testLogger(t))
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		_, statusCode, err := client.Post(context.Background(), "/test", nil, nil, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if statusCode != http.StatusOK {
+			t.Fatalf("status = %d, want 200", statusCode)
+		}
+		if attempts.Load() != 3 {
+			t.Fatalf("expected 3 attempts, got %d", attempts.Load())
+		}
+	})
+
+	t.Run("dropped reason captured via context", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set(HeaderDroppedReason, DroppedReasonTTLExpired)
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte(`{"error":"ttl expired"}`))
+		}))
+		defer server.Close()
+
+		client, err := NewHTTPClient(Config{
+			BaseURL:        server.URL,
+			MaxRetries:     1,
+			InitialBackoff: time.Millisecond,
+			MaxBackoff:     10 * time.Millisecond,
+		}, testLogger(t))
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		ctx, droppedReason := NewDroppedReasonContext(context.Background())
+		_, _, err = client.Post(ctx, "/test", nil, nil, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if droppedReason() != DroppedReasonTTLExpired {
+			t.Fatalf("droppedReason = %q, want %q", droppedReason(), DroppedReasonTTLExpired)
+		}
+	})
+
+	t.Run("no dropped reason header leaves context empty", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"ok":true}`))
+		}))
+		defer server.Close()
+
+		client, err := NewHTTPClient(Config{
+			BaseURL: server.URL,
+		}, testLogger(t))
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		ctx, droppedReason := NewDroppedReasonContext(context.Background())
+		_, _, err = client.Post(ctx, "/test", nil, nil, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if droppedReason() != "" {
+			t.Fatalf("droppedReason = %q, want empty", droppedReason())
+		}
+	})
 }
 
 func pemEncodeCert(derBytes []byte) []byte {

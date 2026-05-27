@@ -32,6 +32,68 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// ConcurrencyConfig groups all dispatch-rate and concurrency control knobs.
+type ConcurrencyConfig struct {
+	// Global limits total in-flight inference requests across all workers.
+	// Acts as a fixed ceiling — the sum of all per-endpoint concurrency
+	// is bounded by this value.
+	Global int `yaml:"global"`
+
+	// PerEndpoint is the initial and maximum concurrency per inference endpoint.
+	// Models sharing the same gateway endpoint share one semaphore controlled
+	// by this value.
+	PerEndpoint int `yaml:"per_endpoint"`
+
+	// Recovery limits concurrent job recoveries during startup.
+	// Each recovery can involve DB lookups, S3 uploads, and status updates.
+	Recovery int `yaml:"recovery"`
+
+	// AIMD holds adaptive concurrency control parameters.
+	AIMD AIMDConfig `yaml:"aimd"`
+}
+
+// AIMDConfig holds parameters for Additive Increase / Multiplicative Decrease
+// concurrency control per inference endpoint.
+type AIMDConfig struct {
+	// Enabled controls whether AIMD adaptive concurrency is active.
+	// When false, per-endpoint concurrency is fixed at ConcurrencyConfig.PerEndpoint.
+	Enabled bool `yaml:"enabled"`
+
+	// Min is the floor for per-endpoint adaptive concurrency.
+	// AIMD will never reduce a single endpoint's effective limit below this value.
+	Min int `yaml:"min"`
+
+	// BackoffFactor is the multiplicative decrease applied to the per-endpoint
+	// concurrency limit when the endpoint signals overload (429/5xx). Must be
+	// in (0, 1). Default: 0.5.
+	BackoffFactor float64 `yaml:"backoff_factor"`
+
+	// AdditiveIncrease is the number of concurrency slots added after a full
+	// window of consecutive successes per endpoint. Default: 1.
+	AdditiveIncrease int `yaml:"additive_increase"`
+}
+
+// DispatchMode selects the inference dispatch backend.
+type DispatchMode string
+
+const (
+	DispatchModeSync  DispatchMode = "sync"
+	DispatchModeAsync DispatchMode = "async"
+)
+
+// AsyncDispatchConfig holds configuration for the llm-d-async dispatch backend.
+// Only used when DispatchMode == "async".
+type AsyncDispatchConfig struct {
+	// RedisURL is the full Redis connection URL (e.g. "redis://host:6379",
+	// "rediss://user:pass@host:6379" for TLS). Read from the mounted secret
+	// at runtime (SecretKeyRedisURL)
+	RedisURL string `yaml:"-"`
+
+	// ResultPollTimeout is the timeout per GetResult poll cycle.
+	// Controls how long each blocking poll waits before retrying.
+	ResultPollTimeout time.Duration `yaml:"result_poll_timeout"`
+}
+
 type ProcessorConfig struct {
 	// TaskWaitTime is the timeout parameter used when dequeueing from the priority queue
 	// This should be shorter than PollInterval
@@ -40,13 +102,8 @@ type ProcessorConfig struct {
 	// NumWorkers is the fixed number of worker goroutines spawned to process jobs
 	NumWorkers int `yaml:"num_workers"`
 
-	// GlobalConcurrency limits total in-flight inference requests across all workers in a processor.
-	// Protects system resources (goroutines, sockets, memory) from unbounded growth.
-	GlobalConcurrency int `yaml:"global_concurrency"`
-
-	// PerModelMaxConcurrency limits concurrent inference requests per individual model.
-	// Protects downstream inference gateway from being overwhelmed by a single model's requests.
-	PerModelMaxConcurrency int `yaml:"per_model_max_concurrency"`
+	// Concurrency groups all dispatch-rate and concurrency control settings.
+	Concurrency ConcurrencyConfig `yaml:"concurrency"`
 
 	// PollInterval defines how frequently the processor checks the database for new jobs
 	PollInterval time.Duration `yaml:"poll_interval"`
@@ -96,15 +153,10 @@ type ProcessorConfig struct {
 	// ProgressTTLSeconds is the TTL for temporary progress updates in the status store (Redis).
 	ProgressTTLSeconds int `yaml:"progress_ttl_seconds"`
 
-	// RecoveryMaxConcurrency limits concurrent job recoveries during startup.
-	// Each recovery can involve DB lookups, S3 uploads, and status updates.
-	RecoveryMaxConcurrency int `yaml:"recovery_max_concurrency"`
-
-	// InferenceObjective is the name of a GIE InferenceObjective CRD to reference
-	// in the x-gateway-inference-objective header on inference requests.
-	// Used by GIE's flow control to assign batch requests to a priority band.
-	// Empty (default) means the header is not sent.
-	InferenceObjective string `yaml:"inference_objective"`
+	// SendFairnessHeader controls whether the processor sends
+	// x-gateway-inference-fairness-id on inference requests.
+	// false (default) omits the fairness header.
+	SendFairnessHeader bool `yaml:"send_fairness_header"`
 
 	// EnablePprof enables pprof profiling endpoints on the observability server.
 	EnablePprof bool `yaml:"enable_pprof"`
@@ -114,6 +166,14 @@ type ProcessorConfig struct {
 
 	// FileClient holds configuration for the shared file storage client (fs or s3).
 	FileClientCfg sharedcfg.FileClientConfig `yaml:"file_client"`
+
+	// DispatchMode selects the inference dispatch backend.
+	// "sync" (default): direct HTTP via InferenceClient.
+	// "async": submit via llm-d-async producer, collect from result queue.
+	DispatchMode DispatchMode `yaml:"dispatch_mode"`
+
+	// AsyncDispatchConfig holds llm-d-async dispatch settings. Only used when DispatchMode == "async".
+	AsyncDispatchConfig AsyncDispatchConfig `yaml:"async_dispatch"`
 }
 
 // ModelGatewayConfig describes the full gateway and HTTP/TLS settings for one
@@ -135,6 +195,12 @@ type ModelGatewayConfig struct {
 	APIKeyName string `yaml:"api_key_name"`
 	APIKeyFile string `yaml:"api_key_file"`
 
+	// InferenceObjective is the name of a GIE InferenceObjective CRD sent in
+	// the x-gateway-inference-objective header on inference requests. Use this
+	// to target per-model InferencePools in multi-pool GIE deployments.
+	// When empty, the header is not sent.
+	InferenceObjective string `yaml:"inference_objective"`
+
 	RequestTimeout *time.Duration `yaml:"request_timeout"`
 	MaxRetries     *int           `yaml:"max_retries"`
 	InitialBackoff *time.Duration `yaml:"initial_backoff"`
@@ -144,6 +210,10 @@ type ModelGatewayConfig struct {
 	TLSCACertFile         string `yaml:"tls_ca_cert_file,omitempty"`
 	TLSClientCertFile     string `yaml:"tls_client_cert_file,omitempty"`
 	TLSClientKeyFile      string `yaml:"tls_client_key_file,omitempty"`
+
+	// InferencePoolName identifies the async dispatch pool for this model/gateway.
+	// Required when dispatch_mode is "async". Ignored in sync mode.
+	InferencePoolName string `yaml:"inference_pool_name"`
 }
 
 type BucketConfig struct {
@@ -152,7 +222,39 @@ type BucketConfig struct {
 	BucketCount  int     `yaml:"count"`
 }
 
-// LoadFromYaml loads the configuration from a YAML file.
+const asyncTenantID = "$batch"
+
+// RequestQueueName returns the Redis sorted-set name for submitting async requests to the given pool.
+func RequestQueueName(poolName string) string {
+	return "llm-d-async:requests:" + poolName
+}
+
+// ResultQueueName returns the Redis list name for collecting async results from the given pool.
+func ResultQueueName(poolName string) string {
+	return "llm-d-async:results:" + poolName + ":" + asyncTenantID
+}
+
+// IsAsync returns true when the processor is configured for async dispatch.
+func (c *ProcessorConfig) IsAsync() bool {
+	return c.DispatchMode == DispatchModeAsync
+}
+
+// InferenceObjectiveFor returns the inference objective configured on the
+// gateway that will handle requests for modelID.
+// Returns "" when no objective is configured, which means the header is not sent.
+func (c *ProcessorConfig) InferenceObjectiveFor(modelID string) string {
+	if c.GlobalInferenceGateway != nil {
+		return c.GlobalInferenceGateway.InferenceObjective
+	}
+	if gw, ok := c.ModelGateways[modelID]; ok {
+		return gw.InferenceObjective
+	}
+	return ""
+}
+
+// LoadFromYAML loads the configuration from a YAML file.
+// Callers should start from NewConfig() so that concurrency/AIMD defaults
+// are already set; YAML values then override only what is explicitly specified.
 func (pc *ProcessorConfig) LoadFromYAML(filePath string) error {
 	file, err := os.Open(filePath)
 	if err != nil {
@@ -188,10 +290,19 @@ func NewConfig() *ProcessorConfig {
 			BucketCount:  12,
 		},
 
-		GlobalConcurrency:      100,
-		PerModelMaxConcurrency: 10,
-		NumWorkers:             1,
-		Addr:                   ":9090",
+		Concurrency: ConcurrencyConfig{
+			Global:      100,
+			PerEndpoint: 10,
+			Recovery:    5,
+			AIMD: AIMDConfig{
+				Enabled:          true,
+				Min:              5,
+				BackoffFactor:    0.5,
+				AdditiveIncrease: 1,
+			},
+		},
+		NumWorkers: 1,
+		Addr:       ":9090",
 		// Keep observability as best-effort by default.
 		TerminateOnObservabilityFailure: false,
 		ShutdownTimeout:                 30 * time.Second,
@@ -209,7 +320,11 @@ func NewConfig() *ProcessorConfig {
 		},
 		DefaultOutputExpirationSeconds: 90 * 24 * 60 * 60, // 90 days
 		ProgressTTLSeconds:             24 * 60 * 60,      // 24 hours
-		RecoveryMaxConcurrency:         5,
+
+		DispatchMode: DispatchModeSync,
+		AsyncDispatchConfig: AsyncDispatchConfig{
+			ResultPollTimeout: 5 * time.Second,
+		},
 	}
 }
 
@@ -226,15 +341,11 @@ func (c *ProcessorConfig) Validate() error {
 	if c.NumWorkers <= 0 {
 		return fmt.Errorf("num_workers must be > 0")
 	}
-	if c.GlobalConcurrency <= 0 {
-		return fmt.Errorf("global_concurrency must be > 0")
+
+	if err := c.Concurrency.validate(); err != nil {
+		return err
 	}
-	if c.PerModelMaxConcurrency <= 0 {
-		return fmt.Errorf("per_model_max_concurrency must be > 0")
-	}
-	if c.PerModelMaxConcurrency > c.GlobalConcurrency {
-		return fmt.Errorf("per_model_max_concurrency (%d) must be <= global_concurrency (%d)", c.PerModelMaxConcurrency, c.GlobalConcurrency)
-	}
+
 	if c.ShutdownTimeout <= 0 {
 		return fmt.Errorf("shutdown_timeout must be > 0")
 	}
@@ -255,11 +366,46 @@ func (c *ProcessorConfig) Validate() error {
 		return fmt.Errorf("e2e_latency_bucket must satisfy: start > 0, factor > 1, count > 0")
 	}
 
+	if err := c.FileClientCfg.Retry.Validate(); err != nil {
+		return fmt.Errorf("file_client.retry: %w", err)
+	}
+
+	if c.ProgressTTLSeconds <= 0 {
+		return fmt.Errorf("progress_ttl_seconds must be > 0")
+	}
+
+	if err := c.validateDispatchMode(); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (c *ProcessorConfig) validateDispatchMode() error {
+	switch c.DispatchMode {
+	case DispatchModeSync, DispatchMode(""):
+		c.DispatchMode = DispatchModeSync
+		return c.validateSyncDispatchConfig()
+	case DispatchModeAsync:
+		return c.validateAsyncDispatchConfig()
+	default:
+		return fmt.Errorf("dispatch_mode must be %q or %q, got %q", DispatchModeSync, DispatchModeAsync, c.DispatchMode)
+	}
+}
+
+func (c *ProcessorConfig) validateGateways() error {
 	if c.GlobalInferenceGateway == nil && len(c.ModelGateways) == 0 {
 		return fmt.Errorf("either global_inference_gateway or model_gateways must be configured")
 	}
 	if c.GlobalInferenceGateway != nil && len(c.ModelGateways) > 0 {
 		return fmt.Errorf("global_inference_gateway and model_gateways are mutually exclusive")
+	}
+	return nil
+}
+
+func (c *ProcessorConfig) validateSyncDispatchConfig() error {
+	if err := c.validateGateways(); err != nil {
+		return err
 	}
 
 	if c.GlobalInferenceGateway != nil {
@@ -272,18 +418,56 @@ func (c *ProcessorConfig) Validate() error {
 			return err
 		}
 	}
+	return nil
+}
 
-	if err := c.FileClientCfg.Retry.Validate(); err != nil {
-		return fmt.Errorf("file_client.retry: %w", err)
+func (c *ProcessorConfig) validateAsyncDispatchConfig() error {
+	if c.AsyncDispatchConfig.ResultPollTimeout <= 0 {
+		return fmt.Errorf("async.result_poll_timeout must be > 0")
 	}
+	if err := c.validateGateways(); err != nil {
+		return err
+	}
+	if c.GlobalInferenceGateway != nil {
+		if c.GlobalInferenceGateway.InferencePoolName == "" {
+			return fmt.Errorf("global_inference_gateway.inference_pool_name must be set when dispatch_mode is %q", DispatchModeAsync)
+		}
+	}
+	for model, gw := range c.ModelGateways {
+		if gw.InferencePoolName == "" {
+			return fmt.Errorf("model_gateways[%s].inference_pool_name must be set when dispatch_mode is %q", model, DispatchModeAsync)
+		}
+	}
+	return nil
+}
 
-	if c.ProgressTTLSeconds <= 0 {
-		return fmt.Errorf("progress_ttl_seconds must be > 0")
+func (cc *ConcurrencyConfig) validate() error {
+	if cc.Global <= 0 {
+		return fmt.Errorf("concurrency.global must be > 0")
 	}
-	if c.RecoveryMaxConcurrency <= 0 {
-		return fmt.Errorf("recovery_max_concurrency must be > 0")
+	if cc.PerEndpoint <= 0 {
+		return fmt.Errorf("concurrency.per_endpoint must be > 0")
 	}
-
+	if cc.PerEndpoint > cc.Global {
+		return fmt.Errorf("concurrency.per_endpoint (%d) must be <= concurrency.global (%d)", cc.PerEndpoint, cc.Global)
+	}
+	if cc.Recovery <= 0 {
+		return fmt.Errorf("concurrency.recovery must be > 0")
+	}
+	if cc.AIMD.Enabled {
+		if cc.AIMD.Min <= 0 {
+			return fmt.Errorf("concurrency.aimd.min must be > 0")
+		}
+		if cc.AIMD.BackoffFactor <= 0 || cc.AIMD.BackoffFactor >= 1 {
+			return fmt.Errorf("concurrency.aimd.backoff_factor must be in (0, 1), got %f", cc.AIMD.BackoffFactor)
+		}
+		if cc.AIMD.AdditiveIncrease <= 0 {
+			return fmt.Errorf("concurrency.aimd.additive_increase must be > 0")
+		}
+		if cc.AIMD.Min > cc.PerEndpoint {
+			return fmt.Errorf("concurrency.aimd.min (%d) must be <= concurrency.per_endpoint (%d)", cc.AIMD.Min, cc.PerEndpoint)
+		}
+	}
 	return nil
 }
 
