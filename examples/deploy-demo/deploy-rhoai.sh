@@ -45,6 +45,19 @@ MODEL_REPLICAS="${MODEL_REPLICAS:-1}"
 ISVC_NAME="${ISVC_NAME:-$(echo "${MODEL_NAME}" | tr '/' '-' | tr '[:upper:]' '[:lower:]')}"
 SIM_IMAGE="${SIM_IMAGE:-ghcr.io/llm-d/llm-d-inference-sim:v0.7.1}"
 
+# Flow control: GIE priority-based dispatch (interactive > batch).
+# When enabled, EPP is configured with flow control plugins and InferenceObjective
+# CRDs are created so batch requests are sheddable (priority -1) while interactive
+# requests get priority 100.
+ENABLE_FLOW_CONTROL="${ENABLE_FLOW_CONTROL:-true}"
+INTERACTIVE_FLOW_CONTROL_OBJECTIVE="${INTERACTIVE_FLOW_CONTROL_OBJECTIVE:-interactive-default}"
+BATCH_FLOW_CONTROL_OBJECTIVE="${BATCH_FLOW_CONTROL_OBJECTIVE:-batch-sheddable}"
+
+if [ -n "${RHOAI_VERSION}" ]; then
+    if ! [[ "${RHOAI_VERSION}" =~ ^[0-9]+\.[0-9]+ ]]; then
+        die "RHOAI_VERSION must be at least major.minor (e.g. 3.4 or 3.4.0), got '${RHOAI_VERSION}'."
+    fi
+fi
 # ── 1. cert-manager ─────────────────────────────────────────────────────────
 
 install_cert_manager_operator() {
@@ -342,13 +355,6 @@ EOF
 # - Version: user-provided RHOAI_VERSION, or highest from stable-X.Y / beta channels
 # - Channel: user-provided RHOAI_CHANNEL, or stable-${RHOAI_VERSION} preferred, then beta
 resolve_rhoai_info() {
-    # Short-circuit: if both version and channel are already provided, skip detection
-    if [ -n "${RHOAI_VERSION}" ] && [ -n "${RHOAI_CHANNEL}" ]; then
-        log "Using user-specified RHOAI version: ${RHOAI_VERSION}"
-        log "Using user-specified RHOAI channel: ${RHOAI_CHANNEL}"
-        return 0
-    fi
-
     # Fetch PackageManifest (with retry — CatalogSource READY does not guarantee
     # PackageManifest is synced yet, especially for custom catalogs)
     local manifest_json=""
@@ -379,23 +385,35 @@ resolve_rhoai_info() {
     if [ -n "${RHOAI_VERSION}" ]; then
         log "Using user-specified RHOAI version: ${RHOAI_VERSION}"
     else
-        local csvs
+        local selected_csv
         if [ -n "${RHOAI_CHANNEL}" ]; then
             step "Deriving RHOAI version from channel ${RHOAI_CHANNEL}..."
-            csvs=$(echo "${manifest_json}" | jq -r --arg ch "${RHOAI_CHANNEL}" '
+            selected_csv=$(echo "${manifest_json}" | jq -r --arg ch "${RHOAI_CHANNEL}" '
                 .status.channels[] | select(.name == $ch) | .currentCSV // empty') || true
         else
             step "Auto-detecting latest RHOAI version..."
-            csvs=$(echo "${manifest_json}" | jq -r '
+            # Collect CSVs from all stable-X.Y and beta channels, pick highest version.
+            # Sort: higher major.minor.patch wins; within same base version:
+            # patch (3.4.0.1) > GA (3.4.0) > pre-release (3.4.0-ea.2).
+            selected_csv=$(echo "${manifest_json}" | jq -r '
                 .status.channels[] |
                 select((.name | test("^stable-[0-9]+\\.[0-9]+$")) or .name == "beta") |
-                .currentCSV // empty') || true
+                .currentCSV // empty' \
+                | sort -u \
+                | sed -n 's/^rhods-operator\.//p' \
+                | awk '{
+                    ver = $0
+                    split(ver, p, /[.-]/)
+                    base = sprintf("%04d%04d%04d", p[1], p[2], p[3])
+                    if (index(ver, "-") > 0) type = 0
+                    else if (split(ver, d, ".") > 3) type = 2
+                    else type = 1
+                    printf "%s.%d\t%s\n", base, type, ver
+                }' | sort | tail -1 | cut -f2) || true
+            [ -n "${selected_csv}" ] && selected_csv="rhods-operator.${selected_csv}"
         fi
 
-        RHOAI_VERSION=$(echo "${csvs}" \
-            | grep -oE '^rhods-operator\.[0-9]+\.[0-9]+' \
-            | sed 's/rhods-operator\.//' \
-            | sort -t. -k1,1n -k2,2n -u | tail -1) || true
+        RHOAI_VERSION=$(echo "${selected_csv}" | sed -n 's/^rhods-operator\.//p') || true
 
         if [ -n "${RHOAI_VERSION}" ]; then
             log "Latest RHOAI version: ${RHOAI_VERSION}"
@@ -416,22 +434,44 @@ resolve_rhoai_info() {
         fi
     else
         step "Auto-detecting RHOAI channel for version ${RHOAI_VERSION}..."
-        local major="${RHOAI_VERSION%%.*}"
-        local candidates=("stable-${RHOAI_VERSION}" "stable-${major}.x" "beta")
+        local minor_ver
+        minor_ver=$(echo "${RHOAI_VERSION}" | grep -oE '^[0-9]+\.[0-9]+')
+        local major="${minor_ver%%.*}"
+        local candidates=("stable-${minor_ver}" "stable-${major}.x" "beta")
         for candidate in "${candidates[@]}"; do
             local csv
             csv=$(echo "${manifest_json}" | jq -r --arg ch "${candidate}" '
                 .status.channels[] | select(.name == $ch) | .currentCSV // empty') || true
-            if [ -n "${csv}" ] && [[ "${csv}" == rhods-operator.${RHOAI_VERSION}.* ]]; then
+            if [ -z "${csv}" ]; then
+                continue
+            fi
+            local csv_ver
+            csv_ver=$(echo "${csv}" | sed -n 's/^rhods-operator\.//p')
+            if [[ "${csv_ver}" == ${RHOAI_VERSION} || "${csv_ver}" == ${RHOAI_VERSION}.* || "${csv_ver}" == ${RHOAI_VERSION}-* ]]; then
                 RHOAI_CHANNEL="${candidate}"
-                log "Channel '${candidate}' provides RHOAI ${RHOAI_VERSION} (CSV: ${csv})"
+                log "Channel '${candidate}' provides CSV: ${csv}"
                 break
             fi
+            log "Channel '${candidate}' provides ${csv}, skipping (does not match ${RHOAI_VERSION})."
         done
         if [ -z "${RHOAI_CHANNEL}" ]; then
             die "No channel provides RHOAI ${RHOAI_VERSION}. Checked: ${candidates[*]}"
         fi
     fi
+
+    # Final validation: verify the channel's CSV matches RHOAI_VERSION
+    local channel_csv
+    channel_csv=$(echo "${manifest_json}" | jq -r --arg ch "${RHOAI_CHANNEL}" '
+        .status.channels[] | select(.name == $ch) | .currentCSV // empty') || true
+    if [ -z "${channel_csv}" ]; then
+        die "Channel '${RHOAI_CHANNEL}' not found in PackageManifest."
+    fi
+    local channel_ver
+    channel_ver=$(echo "${channel_csv}" | sed -n 's/^rhods-operator\.//p')
+    if [[ "${channel_ver}" != ${RHOAI_VERSION} && "${channel_ver}" != ${RHOAI_VERSION}.* && "${channel_ver}" != ${RHOAI_VERSION}-* ]]; then
+        die "Channel '${RHOAI_CHANNEL}' provides ${channel_csv}, but RHOAI_VERSION is '${RHOAI_VERSION}'."
+    fi
+    log "Validated: channel '${RHOAI_CHANNEL}' provides ${channel_csv}"
 }
 
 create_custom_catalogsource() {
@@ -567,7 +607,7 @@ EOF
         if [ -z "${installed_csv}" ]; then
             die "No installedCSV found for subscription '${operator_name}'."
         fi
-        if [[ "${installed_csv}" != rhods-operator.${RHOAI_VERSION}.* ]]; then
+        if [[ "${installed_csv}" != rhods-operator.${RHOAI_VERSION} && "${installed_csv}" != rhods-operator.${RHOAI_VERSION}.* && "${installed_csv}" != rhods-operator.${RHOAI_VERSION}-* ]]; then
             die "Expected RHOAI ${RHOAI_VERSION} but installedCSV is '${installed_csv}'."
         fi
         log "RHOAI installedCSV: ${installed_csv}"
@@ -654,6 +694,48 @@ deploy_llm_inference_service() {
 
     wait_for_crd "llminferenceservices.serving.kserve.io"
 
+    # Build scheduler config: with or without flow control
+    local scheduler_yaml
+    if [ "${ENABLE_FLOW_CONTROL}" = "true" ]; then
+        log "Flow control enabled: EPP will use EndpointPickerConfig with flowControl feature gate"
+        scheduler_yaml=$(cat <<'SCHEDULER_EOF'
+    scheduler:
+      config:
+        inline:
+          apiVersion: inference.networking.x-k8s.io/v1alpha1
+          kind: EndpointPickerConfig
+          featureGates:
+            - "flowControl"
+          plugins:
+            - type: round-robin-fairness-policy
+            - type: global-strict-fairness-policy
+            - type: slo-deadline-ordering-policy
+          schedulingProfiles: []
+          saturationDetector:
+            queueDepthThreshold: 5
+            kvCacheUtilThreshold: 0.8
+          flowControl:
+            maxBytes: 4294967296
+            defaultRequestTTL: 30s
+            priorityBands:
+              - priority: 100
+                maxBytes: 1073741824
+                fairnessPolicyRef: round-robin-fairness-policy
+                orderingPolicyRef: fcfs-ordering-policy
+              - priority: -1
+                maxBytes: 3221225472
+                fairnessPolicyRef: global-strict-fairness-policy
+                orderingPolicyRef: slo-deadline-ordering-policy
+            defaultPriorityBand:
+              maxBytes: 536870912
+              fairnessPolicyRef: global-strict-fairness-policy
+              orderingPolicyRef: fcfs-ordering-policy
+SCHEDULER_EOF
+        )
+    else
+        scheduler_yaml="    scheduler: {}"
+    fi
+
     kubectl apply -f - <<EOF
 apiVersion: serving.kserve.io/v1alpha1
 kind: LLMInferenceService
@@ -676,7 +758,7 @@ spec:
     #      namespace: ${GATEWAY_NAMESPACE}
     # No gateway.refs needed: KServe uses the default gateway configured in
     # inferenceservice-config ConfigMap (kserveIngressGateway: openshift-ingress/openshift-ai-inference).
-    scheduler: {}
+${scheduler_yaml}
   template:
     containers:
       - name: main
@@ -754,7 +836,57 @@ EOF
     die "LLMInferenceService '${isvc_name}' not ready after 600s. Check operator logs."
 }
 
-# ── 6b. Batch LLM HTTPRoute on Internal Gateway ─────────────────────────────
+# ── 6b. InferencePool discovery helper ──────────────────────────────────────
+
+discover_inference_pool() {
+    local isvc_name="${ISVC_NAME}"
+    local pool_name
+    pool_name=$(kubectl get inferencepool -n "${LLM_NAMESPACE}" -o json | \
+        jq -r --arg owner "${isvc_name}" \
+        '.items[] | select(.metadata.ownerReferences[]?.name == $owner) | .metadata.name' \
+        2>/dev/null | head -1)
+    [ -z "${pool_name}" ] && die "No InferencePool owned by LLMInferenceService '${isvc_name}' found in namespace '${LLM_NAMESPACE}'."
+    echo "${pool_name}"
+}
+
+# ── 6c. InferenceObjective CRDs for flow control ──────────────────────────────
+
+create_inference_objectives() {
+    local isvc_name="${ISVC_NAME}"
+
+    step "Discovering InferencePool for InferenceObjective CRDs..."
+    local pool_name
+    pool_name=$(discover_inference_pool)
+    log "InferencePool: ${pool_name} (owned by ${isvc_name})"
+
+    step "Creating InferenceObjective CRDs..."
+    kubectl apply -f - <<EOF
+apiVersion: inference.networking.x-k8s.io/v1alpha2
+kind: InferenceObjective
+metadata:
+  name: ${INTERACTIVE_FLOW_CONTROL_OBJECTIVE}
+  namespace: ${LLM_NAMESPACE}
+spec:
+  priority: 100
+  poolRef:
+    group: inference.networking.k8s.io
+    name: ${pool_name}
+---
+apiVersion: inference.networking.x-k8s.io/v1alpha2
+kind: InferenceObjective
+metadata:
+  name: ${BATCH_FLOW_CONTROL_OBJECTIVE}
+  namespace: ${LLM_NAMESPACE}
+spec:
+  priority: -1
+  poolRef:
+    group: inference.networking.k8s.io
+    name: ${pool_name}
+EOF
+    log "InferenceObjectives created (${INTERACTIVE_FLOW_CONTROL_OBJECTIVE}: priority 100, ${BATCH_FLOW_CONTROL_OBJECTIVE}: priority -1)."
+}
+
+# ── 6d. Batch LLM HTTPRoute on Internal Gateway ─────────────────────────────
 # Routes batch processor inference traffic through the Internal Gateway (ClusterIP)
 # to the same InferencePool, preserving EPP but bypassing TokenRateLimitPolicy.
 
@@ -763,11 +895,7 @@ create_batch_llm_httproute() {
 
     step "Discovering InferencePool for LLMInferenceService '${isvc_name}'..."
     local pool_name
-    pool_name=$(kubectl get inferencepool -n "${LLM_NAMESPACE}" -o json | \
-        jq -r --arg owner "${isvc_name}" \
-        '.items[] | select(.metadata.ownerReferences[]?.name == $owner) | .metadata.name' \
-        2>/dev/null | head -1)
-    [ -z "${pool_name}" ] && die "No InferencePool owned by LLMInferenceService '${isvc_name}' found in namespace '${LLM_NAMESPACE}'."
+    pool_name=$(discover_inference_pool)
     log "InferencePool: ${pool_name} (owned by ${isvc_name})"
 
     step "Creating batch-llm-route on Internal Gateway..."
@@ -829,7 +957,7 @@ EOF
     log "batch-llm-route created: /${LLM_NAMESPACE}/${isvc_name}/* -> InferencePool/${pool_name} (via Internal Gateway)"
 }
 
-# ── 6c. AuthPolicy for batch LLM route (Internal Gateway) ──────────────────
+# ── 6e. AuthPolicy for batch LLM route (Internal Gateway) ──────────────────
 # Same authentication + model-level authorization as the external LLM route,
 # but NO TokenRateLimitPolicy — batch requests are exempt from token rate limits.
 
@@ -874,7 +1002,7 @@ EOF
     log "Batch LLM AuthPolicy applied."
 }
 
-# ── 6d. TokenRateLimitPolicy for inference ───────────────────────────────────
+# ── 6f. TokenRateLimitPolicy for inference ───────────────────────────────────
 
 apply_llm_token_rate_limit() {
     local isvc_name="${ISVC_NAME}"
@@ -913,7 +1041,7 @@ EOF
     log "TokenRateLimitPolicy applied."
 }
 
-# ── 6e. AuthPolicy for batch route ────────────────────────────────────────────
+# ── 6g. AuthPolicy for batch route ────────────────────────────────────────────
 # The batch API paths (/v1/batches, /v1/files) don't match the /{ns}/{model}
 # pattern used for model-level authorization. Authentication only here;
 # model-level authorization happens when the batch processor forwards requests
@@ -942,7 +1070,7 @@ EOF
     log "Batch AuthPolicy applied."
 }
 
-# ── 6f. RateLimitPolicy for batch route ───────────────────────────────────────
+# ── 6h. RateLimitPolicy for batch route ───────────────────────────────────────
 
 apply_batch_request_rate_limit() {
     step "Creating batch-route RateLimitPolicy (20 req/1m per user)..."
@@ -967,6 +1095,154 @@ spec:
 EOF
 
     log "RateLimitPolicy applied (20 req/min per user)."
+}
+
+# ── 6i. Flow control verification ────────────────────────────────────────────
+
+verify_flow_control_config() {
+    banner "Verifying Flow Control configuration"
+
+    local isvc_name="${ISVC_NAME}"
+    local errors=0
+
+    # 1. EPP scheduler pod config
+    step "Checking EPP scheduler pod config..."
+    local epp_pod
+    epp_pod=$(kubectl get pod -n "${LLM_NAMESPACE}" \
+        -l "app.kubernetes.io/name=${isvc_name},app.kubernetes.io/component=llminferenceservice-router-scheduler" \
+        -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
+    if [ -z "${epp_pod}" ]; then
+        warn "No EPP scheduler pod found for '${isvc_name}'. Cannot verify config."
+        errors=$((errors + 1))
+    else
+        local pod_args
+        pod_args=$(kubectl get pod -n "${LLM_NAMESPACE}" "${epp_pod}" \
+            -o jsonpath='{.spec.containers[0].args}' 2>/dev/null || echo "")
+        if echo "${pod_args}" | grep -q "flowControl"; then
+            log "EPP scheduler is configured with flowControl."
+        else
+            warn "EPP scheduler does not appear to have flow control config."
+            errors=$((errors + 1))
+        fi
+    fi
+
+    # 2. InferenceObjective CRDs
+    step "Checking InferenceObjective CRDs..."
+    for obj in "${INTERACTIVE_FLOW_CONTROL_OBJECTIVE}" "${BATCH_FLOW_CONTROL_OBJECTIVE}"; do
+        if kubectl get inferenceobjective "${obj}" -n "${LLM_NAMESPACE}" &>/dev/null; then
+            log "InferenceObjective '${obj}' exists."
+        else
+            warn "InferenceObjective '${obj}' not found."
+            errors=$((errors + 1))
+        fi
+    done
+
+    # 3. Batch processor inferenceObjective config
+    step "Checking batch processor config..."
+    if kubectl get configmap "${BATCH_HELM_RELEASE}-processor-config" -n "${BATCH_NAMESPACE}" \
+        -o jsonpath='{.data}' 2>/dev/null | grep "inference_objective" | grep -q "${BATCH_FLOW_CONTROL_OBJECTIVE}"; then
+        log "Processor configured with inferenceObjective: ${BATCH_FLOW_CONTROL_OBJECTIVE}"
+    else
+        warn "Processor configmap does not contain inference_objective: ${BATCH_FLOW_CONTROL_OBJECTIVE}"
+        errors=$((errors + 1))
+    fi
+
+    if [ "${errors}" -gt 0 ]; then
+        die "Flow control verification failed with ${errors} error(s). Review output above."
+    fi
+    log "Flow control verification passed."
+}
+
+verify_flow_control_runtime() {
+    banner "Verifying Flow Control runtime (metrics)"
+
+    local isvc_name="${ISVC_NAME}"
+    local errors=0
+
+    step "Fetching EPP flow control metrics..."
+
+    # Try to find a metrics-reader SA token secret (name varies across RHOAI versions).
+    local metrics_token=""
+    local metrics_secret
+    metrics_secret=$(kubectl get secret -n "${LLM_NAMESPACE}" -o json \
+        | jq -r '.items[] | select(.type=="kubernetes.io/service-account-token")
+        | select(.metadata.name | test("metrics-reader"))
+        | .metadata.name' 2>/dev/null | head -1)
+    if [ -n "${metrics_secret}" ]; then
+        metrics_token=$(kubectl get secret "${metrics_secret}" -n "${LLM_NAMESPACE}" \
+            -o jsonpath='{.data.token}' 2>/dev/null | base64 -d) || true
+        log "Using metrics token from secret '${metrics_secret}'."
+    else
+        log "No metrics-reader secret found. Trying unauthenticated access."
+    fi
+
+    local epp_pod
+    epp_pod=$(kubectl get pod -n "${LLM_NAMESPACE}" \
+        -l "app.kubernetes.io/name=${isvc_name},app.kubernetes.io/component=llminferenceservice-router-scheduler" \
+        -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
+    if [ -z "${epp_pod}" ]; then
+        die "No EPP scheduler pod found for '${isvc_name}'."
+    fi
+
+    local curl_args=(-sk)
+    if [ -n "${metrics_token}" ]; then
+        curl_args+=(-H "Authorization: Bearer ${metrics_token}")
+    fi
+
+    local metrics_response
+    metrics_response=$(kubectl exec -n "${LLM_NAMESPACE}" "${epp_pod}" -c main -- \
+        curl "${curl_args[@]}" -w "\n%{http_code}" http://localhost:9090/metrics)
+
+    local metrics_http_code metrics_body
+    metrics_http_code=$(echo "${metrics_response}" | tail -1)
+    metrics_body=$(echo "${metrics_response}" | sed '$d')
+    if [ "${metrics_http_code}" != "200" ]; then
+        die "EPP metrics endpoint returned HTTP ${metrics_http_code}."
+    fi
+    if [ -z "${metrics_body}" ]; then
+        die "EPP metrics response body is empty."
+    fi
+
+    # 1. Interactive requests enqueued (priority 0)
+    step "Checking flow control metrics for interactive requests (priority 0)..."
+    local interactive_count
+    interactive_count=$(echo "${metrics_body}" | grep 'inference_extension_flow_control_request_enqueue_duration_seconds_count' \
+        | grep 'priority="0"' | grep -oE '[0-9]+$' || echo "0")
+    if [ "${interactive_count}" -gt 0 ] 2>/dev/null; then
+        log "Flow control enqueued ${interactive_count} interactive request(s) (priority 0)."
+    else
+        warn "No interactive requests (priority 0) found in flow control metrics."
+        errors=$((errors + 1))
+    fi
+
+    # 2. Batch requests enqueued (priority -1)
+    step "Checking flow control metrics for batch requests (priority -1)..."
+    local batch_count
+    batch_count=$(echo "${metrics_body}" | grep 'inference_extension_flow_control_request_enqueue_duration_seconds_count' \
+        | grep 'priority="-1"' | grep -oE '[0-9]+$' || echo "0")
+    if [ "${batch_count}" -gt 0 ] 2>/dev/null; then
+        log "Flow control enqueued ${batch_count} batch request(s) (priority -1)."
+    else
+        warn "No batch requests (priority -1) found in flow control metrics."
+        errors=$((errors + 1))
+    fi
+
+    # 3. Pool saturation metric exists
+    step "Checking pool saturation metric..."
+    if echo "${metrics_body}" | grep -q 'inference_extension_flow_control_pool_saturation'; then
+        local saturation
+        saturation=$(echo "${metrics_body}" | grep 'inference_extension_flow_control_pool_saturation{' \
+            | grep -oE '[0-9.]+$' | head -1)
+        log "Pool saturation: ${saturation}"
+    else
+        warn "Pool saturation metric not found."
+        errors=$((errors + 1))
+    fi
+
+    if [ "${errors}" -gt 0 ]; then
+        die "Flow control runtime verification failed with ${errors} error(s). Review output above."
+    fi
+    log "Flow control runtime verification passed."
 }
 
 # ── 7. Batch Gateway ─────────────────────────────────────────────────────────
@@ -1002,6 +1278,13 @@ deploy_batch_gateway_rhoai() {
         --set "processor.resources.requests.memory=128Mi"
     )
 
+    if [ "${ENABLE_FLOW_CONTROL}" = "true" ]; then
+        helm_args+=(
+            --set "processor.config.modelGateways.${model_key}.inferenceObjective=${BATCH_FLOW_CONTROL_OBJECTIVE}"
+        )
+        log "Flow control: processor will send x-gateway-inference-objective: ${BATCH_FLOW_CONTROL_OBJECTIVE}"
+    fi
+
     do_deploy_batch_gateway "${helm_args[@]}"
 }
 
@@ -1035,6 +1318,9 @@ cmd_install() {
     apply_dsci_and_dsc
 
     deploy_llm_inference_service
+    if [ "${ENABLE_FLOW_CONTROL}" = "true" ]; then
+        create_inference_objectives
+    fi
     apply_llm_token_rate_limit
 
     create_batch_internal_gateway
@@ -1046,11 +1332,16 @@ cmd_install() {
     apply_batch_auth_policy
     apply_batch_request_rate_limit
 
+    if [ "${ENABLE_FLOW_CONTROL}" = "true" ]; then
+        verify_flow_control_config
+    fi
+
     echo ""
     log "Setup complete."
     log "  Operator: ${OPERATOR_TYPE}"
     [ -n "${CUSTOM_CATALOG}" ] && log "  Catalog:  ${CUSTOM_CATALOG} (custom)"
     log "  Model: ${MODEL_NAME} (simulator, ${MODEL_REPLICAS} replicas, no GPU)"
+    log "  Flow Control: ${ENABLE_FLOW_CONTROL}"
     log "  Batch Gateway: ${BATCH_HELM_RELEASE} (${BATCH_NAMESPACE})"
     if [ -n "${BATCH_IMAGE_TAG}" ]; then
         log "  Batch Gateway image tag: ${BATCH_IMAGE_TAG}"
@@ -1138,6 +1429,9 @@ EOF
         "Authorization: Bearer ${unauth_token}" \
         "${inference_payload}"
 
+    if [ "${ENABLE_FLOW_CONTROL}" = "true" ]; then
+        verify_flow_control_runtime
+    fi
 }
 
 # ── Uninstall ────────────────────────────────────────────────────────────────
@@ -1167,6 +1461,10 @@ cmd_uninstall() {
 
     # DestinationRule (in GATEWAY_NAMESPACE, not deleted with batch namespace)
     kubectl delete destinationrule "${BATCH_HELM_RELEASE}-backend-tls" -n "${GATEWAY_NAMESPACE}" 2>/dev/null || true
+
+    # InferenceObjective CRDs (flow control)
+    step "Removing InferenceObjective resources..."
+    kubectl delete inferenceobjective --all -n "${LLM_NAMESPACE}" 2>/dev/null || true
 
     # Internal Gateway resources (batch-llm-route)
     step "Removing Internal Gateway resources..."
@@ -1286,6 +1584,8 @@ usage() {
     echo "  BATCH_RELEASE_VERSION  Install released OCI chart (e.g. v1.0.0)"
     echo "  BATCH_DB_TYPE          Database: postgresql or redis (default: postgresql)"
     echo "  BATCH_STORAGE_TYPE     File storage: fs or s3 (default: s3)"
+    echo "  ENABLE_FLOW_CONTROL   Enable GIE flow control (default: true)"
+    echo "  BATCH_FLOW_CONTROL_OBJECTIVE InferenceObjective name for batch (default: batch-sheddable)"
     echo "  UNINSTALL_ALL            Set to 1 to remove RHOAI operators, Kuadrant, cert-manager, etc. (ephemeral clusters only)"
     exit "${1:-0}"
 }

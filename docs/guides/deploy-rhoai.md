@@ -18,7 +18,7 @@ This guide demonstrates how to deploy batch-gateway on OpenShift with RHOAI (Red
 | `redhat-ods-operator` | RHOAI operator |
 | `redhat-ods-applications` | RHOAI controllers (KServe, model controller) |
 | `batch-api` | batch-gateway (apiserver + processor), Redis, PostgreSQL |
-| `llm` | LLMInferenceService, model servers, InferencePool, EPP |
+| `llm` | LLMInferenceService, model servers, InferencePool, EPP, InferenceObjective CRDs |
 
 ### 1.2 Data Flow
 
@@ -35,7 +35,7 @@ This guide demonstrates how to deploy batch-gateway on OpenShift with RHOAI (Red
 4. The Internal Gateway matches `/{ns}/{isvc}/v1/*` → **batch-llm-route** (HTTPRoute)
     - **AuthPolicy** on the batch-llm-route performs authentication and authorization (SubjectAccessReview — checks if the original user can `get llminferenceservices/<name>`) — if the user lacks permission, the request is rejected with 403
     - **No TokenRateLimitPolicy** — batch inference requests are exempt from per-user token rate limits
-5. Request is routed to **InferencePool** → **EPP** (endpoint picker) → **vLLM** model server, and the response is returned to the Processor, which adds the response to the batch job's output file
+5. Request is routed to **InferencePool** → **EPP** (endpoint picker) → **vLLM** model server. EPP uses **flow control** to prioritize interactive requests over batch requests (see [1.6 Flow Control](#16-flow-control)). The response is returned to the Processor, which adds the response to the batch job's output file
 
 ### 1.3 Authentication
 
@@ -59,6 +59,26 @@ For security and operations readers: **admission on the batch API is not the sam
 - **batch-llm-route** (on the Internal Gateway) runs **authentication and authorization** (SubjectAccessReview on `llminferenceservices` as above) on each inference request the processor sends. The Internal Gateway is ClusterIP-only — it has no external Route or Ingress, ensuring batch inference traffic stays cluster-internal. **No TokenRateLimitPolicy** is applied, so batch requests are exempt from per-user token rate limits. A user can create a batch job and still see **per-request failures** (often surfaced as failed lines or job errors) when the batch-llm-route returns **403** — this is **by design**, not a bypass of model access control.
 
 The `Authorization` header is included in `passThroughHeaders` by default. Without it, the Internal Gateway cannot attribute inference traffic to the original caller and model-level checks cannot run as intended.
+
+### 1.6 Flow Control
+
+Flow control ensures interactive inference requests are always served before batch requests. The EPP (Endpoint Picker Plugin) uses GIE's flow control feature to assign requests to priority bands based on the `x-gateway-inference-objective` header:
+
+| Priority Band | Priority | Workload | Behavior Under Saturation |
+|---------------|----------|----------|---------------------------|
+| Interactive | 100 | Interactive requests | Dispatched first |
+| Default | 0 | Requests without an objective header | Dispatched before batch |
+| Batch | -1 (sheddable) | Batch requests | Shed immediately; processor retries with backoff |
+
+When the backend is not saturated, both interactive and batch requests are dispatched freely. When saturation reaches 1.0, batch requests (priority -1) are shed at admission while interactive requests continue to be served.
+
+This is configured through three components:
+
+1. **EndpointPickerConfig** in the LLMInferenceService CR (`spec.router.scheduler.config.inline`) enables the `flowControl` feature gate and defines priority bands, fairness policies, and saturation detection thresholds.
+2. **InferenceObjective CRDs** map objective names to priority levels. The batch processor sends the `x-gateway-inference-objective: batch-sheddable` header, which EPP resolves to priority -1.
+3. **Batch processor `inferenceObjective` config** sets which `InferenceObjective` name is sent in the header on each inference request.
+
+For full details on flow control configuration, see the [Flow Control Setup Guide](flow-control-setup.md).
 
 ## 2. Prerequisites
 - OpenShift cluster 4.20 or later (required for Distributed Inference with llm-d).
@@ -486,7 +506,37 @@ spec:
   replicas: 2
   router:
     route: {}
-    scheduler: {}
+    scheduler:
+      config:
+        inline:
+          apiVersion: inference.networking.x-k8s.io/v1alpha1
+          kind: EndpointPickerConfig
+          featureGates:
+            - "flowControl"
+          plugins:
+            - type: round-robin-fairness-policy
+            - type: global-strict-fairness-policy
+            - type: slo-deadline-ordering-policy
+          schedulingProfiles: []
+          saturationDetector:
+            queueDepthThreshold: 5
+            kvCacheUtilThreshold: 0.8
+          flowControl:
+            maxBytes: 4294967296
+            defaultRequestTTL: 30s
+            priorityBands:
+              - priority: 100
+                maxBytes: 1073741824
+                fairnessPolicyRef: round-robin-fairness-policy
+                orderingPolicyRef: fcfs-ordering-policy
+              - priority: -1
+                maxBytes: 3221225472
+                fairnessPolicyRef: global-strict-fairness-policy
+                orderingPolicyRef: slo-deadline-ordering-policy
+            defaultPriorityBand:
+              maxBytes: 536870912
+              fairnessPolicyRef: global-strict-fairness-policy
+              orderingPolicyRef: fcfs-ordering-policy
   template:
     containers:
       - name: main
@@ -529,6 +579,8 @@ oc wait llminferenceservice/${ISVC_NAME} -n ${LLM_NS} \
     --for=condition=Ready --timeout=600s
 ```
 > **Key annotation**: `security.opendatahub.io/enable-auth: "true"` enables the Gateway-level AuthPolicy that uses SubjectAccessReview to check if the user has RBAC permission to `get` the specific `LLMInferenceService` resource.
+
+> **Flow control config**: The `scheduler.config.inline` EndpointPickerConfig enables the `flowControl` feature gate with two priority bands: interactive (priority 100, round-robin fairness, FCFS ordering) and batch (priority -1, sheddable, SLO-deadline ordering). The `saturationDetector` monitors backend queue depth and KV-cache utilization to trigger head-of-line blocking when the system is saturated. See [1.6 Flow Control](#16-flow-control) for details.
 </details>
 
 <details>
@@ -562,7 +614,51 @@ facebook-opt-125m-kserve-route               13m
 ```
 </details>
 
-### 3.7 Configure TokenRateLimitPolicy for LLMInferenceService
+### 3.7 Create InferenceObjective CRDs
+
+Create `InferenceObjective` resources that map the `x-gateway-inference-objective` header value to a priority band in EPP's flow control. The batch processor sends the `batch-sheddable` objective on each inference request.
+
+<details>
+<summary>Create InferenceObjective CRDs</summary>
+
+```bash
+# Discover the InferencePool created by the LLMInferenceService
+POOL_NAME=$(oc get inferencepool -n ${LLM_NS} -o json | \
+    jq -r --arg owner "${ISVC_NAME}" \
+    '.items[] | select(.metadata.ownerReferences[]?.name == $owner) | .metadata.name' | head -1)
+
+oc apply -f - <<EOF
+apiVersion: inference.networking.x-k8s.io/v1alpha2
+kind: InferenceObjective
+metadata:
+  name: interactive-default
+  namespace: ${LLM_NS}
+spec:
+  priority: 100
+  poolRef:
+    group: inference.networking.k8s.io
+    name: ${POOL_NAME}
+---
+apiVersion: inference.networking.x-k8s.io/v1alpha2
+kind: InferenceObjective
+metadata:
+  name: batch-sheddable
+  namespace: ${LLM_NS}
+spec:
+  priority: -1
+  poolRef:
+    group: inference.networking.k8s.io
+    name: ${POOL_NAME}
+EOF
+```
+
+> **`interactive-default` (priority 100)**: Interactive clients can optionally send `x-gateway-inference-objective: interactive-default` to get the highest priority. Without this header, requests default to priority 0, which still outranks batch.
+
+> **`batch-sheddable` (priority -1)**: Negative priority means sheddable — when the backend is saturated, these requests are rejected immediately instead of queued. The batch processor handles retries with exponential backoff.
+
+</details>
+
+### 3.8 Configure TokenRateLimitPolicy for LLMInferenceService
 
 Configure per-user token rate limiting for inference requests. See [Red Hat Connectivity Link docs](https://docs.redhat.com/en/documentation/red_hat_connectivity_link/1.3) for details. The following is an example configuration.
 
@@ -601,7 +697,7 @@ oc wait tokenratelimitpolicy/inference-token-limit \
 ```
 </details>
 
-### 3.8 Install Batch Gateway
+### 3.9 Install Batch Gateway
 
 The batch processor routes inference requests through a separate, ClusterIP-only Internal Gateway to bypass the TokenRateLimitPolicy on the external Gateway while still enforcing model-level authorization (AuthPolicy).
 
@@ -927,6 +1023,7 @@ helm upgrade --install batch-gateway ./charts/batch-gateway \
     --set "processor.config.modelGateways.${MODEL_NAME}.maxRetries=3" \
     --set "processor.config.modelGateways.${MODEL_NAME}.initialBackoff=1s" \
     --set "processor.config.modelGateways.${MODEL_NAME}.maxBackoff=60s" \
+    --set "processor.config.modelGateways.${MODEL_NAME}.inferenceObjective=batch-sheddable" \
     --set apiserver.tls.enabled=true \
     --set apiserver.tls.certManager.enabled=true \
     --set apiserver.tls.certManager.issuerName=selfsigned-issuer \
@@ -934,6 +1031,7 @@ helm upgrade --install batch-gateway ./charts/batch-gateway \
     --set "apiserver.tls.certManager.dnsNames={batch-gateway-apiserver,batch-gateway-apiserver.${BATCH_NS}.svc.cluster.local,localhost}"
 ```
 
+> - **`modelGateways.<model>.inferenceObjective`**: The `InferenceObjective` CRD name sent as the `x-gateway-inference-objective` header. EPP uses this to assign the request to the batch priority band (priority -1, sheddable). Without this, batch requests default to priority 0 and compete equally with interactive traffic.
 > - **`modelGateways.<model>.url`**: The processor uses this URL to send inference requests. It points to the Internal Gateway's model endpoint (discovered from the Internal Gateway Service), not the external Gateway or the model server directly. The Internal Gateway enforces AuthPolicy (model access check) but not TokenRateLimitPolicy.
 > - **`passThroughHeaders`**: Defaults to `[Authorization]`, so the processor forwards the end user's bearer token on inference calls without extra configuration. Override this only if you need a different set of headers.
 >
@@ -949,7 +1047,7 @@ helm upgrade --install batch-gateway ./charts/batch-gateway \
 </details>
 
 
-### 3.9 Configure HTTPRoute and Policies for Batch Gateway
+### 3.10 Configure HTTPRoute and Policies for Batch Gateway
 
 Set the variable used throughout this section (re-set if starting a new shell):
 ```bash
