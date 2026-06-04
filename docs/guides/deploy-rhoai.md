@@ -46,7 +46,7 @@ Both the LLM route and the batch route use **kubernetesTokenReview** for authent
 
 ### 1.4 Authorization Model
 
-Model access is controlled through Kubernetes RBAC. Users need `get` permission on the specific `LLMInferenceService` resource to access a model. This is granted by creating a Role and RoleBinding in the model's namespace (see [Enabling authentication and authorization for LLM inference service](https://docs.redhat.com/en/documentation/red_hat_openshift_ai_self-managed/latest/html/deploying_models/deploying_models#enabling-authentication-and-authorization-for-llm-inference-service_rhoai-user) for details).
+Model access is controlled through Kubernetes RBAC. Users need `get` permission on the specific `LLMInferenceService` resource to access a model. This is granted by creating a Role and RoleBinding in the model's namespace (see [Enabling authentication and authorization for LLM inference service](https://docs.redhat.com/en/documentation/red_hat_openshift_ai_self-managed/3.4/html/deploy_models_using_distributed_inference_with_llm-d/enabling-authentication-and-authorization-for-llm-inference-service_distributed-inference) for details).
 
 - **LLM route**: SubjectAccessReview checks if user can `get llminferenceservices/<name>` — unauthorized requests are rejected with **403**
 - **Batch route**: No authorization check — authorization is enforced by the batch-llm-route on the Internal Gateway when the processor forwards inference requests with the user's original token
@@ -472,7 +472,7 @@ oc wait datasciencecluster/default-dsc --for=jsonpath='{.status.phase}'=Ready --
 
 ### 3.6 Deploy model with llm-d
 
-Follow [deploy model doc](https://docs.redhat.com/en/documentation/red_hat_openshift_ai_self-managed/latest/html/deploying_models/deploying_models#deploying-models-using-distributed-inference_rhoai-user) to deploy model with LLM-D
+Follow [deploy model doc](https://docs.redhat.com/en/documentation/red_hat_openshift_ai_self-managed/3.4/html/deploy_models_using_distributed_inference_with_llm-d/index) to deploy model with LLM-D
 
 For more examples: [kserve samples repo](https://github.com/red-hat-data-services/kserve/tree/main/docs/samples/llmisvc) (switch to the `rhoai-<version>` branch matching your RHOAI version for version-specific samples)
 
