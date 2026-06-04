@@ -24,15 +24,21 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"net"
+	"net/http"
 	"os"
+	"sync/atomic"
+	"time"
 
 	"github.com/go-logr/logr"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"k8s.io/klog/v2"
 
 	"golang.org/x/sync/errgroup"
 
 	"github.com/llm-d-incubation/batch-gateway/internal/gc/collector"
 	gcconfig "github.com/llm-d-incubation/batch-gateway/internal/gc/config"
+	gcmetrics "github.com/llm-d-incubation/batch-gateway/internal/gc/metrics"
 	"github.com/llm-d-incubation/batch-gateway/internal/gc/reconciler"
 	"github.com/llm-d-incubation/batch-gateway/internal/util/clientset"
 	ucom "github.com/llm-d-incubation/batch-gateway/internal/util/com"
@@ -62,7 +68,11 @@ func run() error {
 		return fmt.Errorf("failed to load config: %w", err)
 	}
 
-	logger.Info("Starting batch garbage collector", "dryRun", cfg.DryRun, "interval", cfg.Interval)
+	logger.Info("Starting batch garbage collector", "dryRun", cfg.DryRun, "interval", cfg.Collector.Interval)
+
+	if err := gcmetrics.InitMetrics(); err != nil {
+		return fmt.Errorf("failed to initialize metrics: %w", err)
+	}
 
 	ctx, cancel := interrupt.ContextWithSignal(ctx)
 	defer cancel()
@@ -83,18 +93,47 @@ func run() error {
 	}
 	defer func() { _ = clients.Close() }()
 
-	gc := collector.NewGarbageCollector(clients.BatchDB, clients.FileDB, clients.File, cfg.DryRun, cfg.Interval, cfg.MaxConcurrency, nil)
+	var ready atomic.Bool
+	metricsErrCh, err := startMetricsServer(ctx, cfg.MetricsAddr, logger, &ready)
+	if err != nil {
+		return err
+	}
+
+	gc := collector.NewGarbageCollector(clients.BatchDB, clients.FileDB, clients.File, cfg.DryRun, cfg.Collector.Interval, cfg.Collector.MaxConcurrency, nil)
 
 	g, gCtx := errgroup.WithContext(ctx)
+	g.Go(func() error {
+		select {
+		case err := <-metricsErrCh:
+			return err
+		case <-gCtx.Done():
+			return gCtx.Err()
+		}
+	})
 	g.Go(func() error { return gc.RunLoop(gCtx) })
 
 	if cfg.Reconciler.Enabled {
-		rec, err := reconciler.NewReconciler(clients.BatchDB, clients.Queue, clients.InFlight, cfg.Reconciler.Interval, cfg.DryRun, nil)
+		onCycle := func(r *reconciler.Result) {
+			gcmetrics.RecordCycleDuration(r.Duration)
+			if !cfg.DryRun {
+				gcmetrics.RecordOrphansRecovered(gcmetrics.ActionCancelled, r.Cancelled)
+				gcmetrics.RecordOrphansRecovered(gcmetrics.ActionExpired, r.Expired)
+				gcmetrics.RecordOrphansRecovered(gcmetrics.ActionReEnqueued, r.ReEnqueued)
+				gcmetrics.RecordOrphansRecovered(gcmetrics.ActionFailed, r.Failed)
+				gcmetrics.RecordStaleCleanup(r.StaleCleanup)
+			}
+			gcmetrics.RecordCASConflicts(r.Conflicts)
+			gcmetrics.RecordErrors(r.Errors)
+		}
+		rec, err := reconciler.NewReconciler(clients.BatchDB, clients.Queue, clients.InFlight, cfg.Reconciler.Interval, cfg.DryRun, onCycle)
 		if err != nil {
 			return fmt.Errorf("failed to create reconciler: %w", err)
 		}
 		g.Go(func() error { return rec.RunLoop(gCtx) })
 	}
+
+	ready.Store(true)
+	logger.Info("GC workers started, marking ready")
 
 	if err := g.Wait(); err != nil && ctx.Err() == nil {
 		return fmt.Errorf("gc/reconciler failed: %w", err)
@@ -102,4 +141,48 @@ func run() error {
 
 	logger.Info("Garbage collector shut down gracefully")
 	return nil
+}
+
+func startMetricsServer(ctx context.Context, addr string, logger logr.Logger, ready *atomic.Bool) (<-chan error, error) {
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", promhttp.Handler())
+	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
+		if !ready.Load() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte("not ready"))
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("OK"))
+	})
+
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return nil, fmt.Errorf("metrics server listen on %s: %w", addr, err)
+	}
+
+	server := &http.Server{
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+
+	go func() {
+		<-ctx.Done()
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer shutdownCancel()
+		if err := server.Shutdown(shutdownCtx); err != nil {
+			logger.Error(err, "Metrics server shutdown failed")
+		}
+	}()
+
+	errCh := make(chan error, 1)
+	go func() {
+		logger.Info("Metrics server listening", "addr", ln.Addr())
+		if err := server.Serve(ln); err != nil && err != http.ErrServerClosed {
+			logger.Error(err, "Metrics server failed")
+			errCh <- fmt.Errorf("metrics server: %w", err)
+		}
+	}()
+
+	return errCh, nil
 }

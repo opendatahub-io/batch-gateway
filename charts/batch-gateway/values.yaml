@@ -221,7 +221,9 @@ apiserver:
     enabled: false
     interval: "30s"
     # Extra labels to match Prometheus Operator's serviceMonitorSelector.
-    labels: {}
+    # The RHOAI monitoring label enables metrics scraping by the ODH observability stack.
+    labels:
+      monitoring.opendatahub.io/scrape: "true"
 
   # Logging configuration
   logging:
@@ -402,7 +404,9 @@ processor:
     enabled: false
     interval: "30s"
     # Extra labels to match Prometheus Operator's podMonitorSelector.
-    labels: {}
+    # The RHOAI monitoring label enables metrics scraping by the ODH observability stack.
+    labels:
+      monitoring.opendatahub.io/scrape: "true"
 
   # Logging configuration
   logging:
@@ -440,6 +444,13 @@ prometheusRule:
       enabled: true
       thresholdRatio: 0.9
       for: "15m"
+    reconcilerErrors:
+      enabled: true
+      # window must be >= reconciler interval (default 60m in gc config) + ~5m scrape buffer.
+      # Uses increase(), not rate(), because errors arrive at most once per cycle.
+      window: "65m"
+      # Suppress brief eval/scrape jitter once the condition is true.
+      for: "5m"
 
 # Garbage Collector configuration
 gc:
@@ -462,10 +473,13 @@ gc:
   # GC application config (rendered into a ConfigMap and mounted as config.yaml)
   config:
     dryRun: false
-    # Interval between garbage collection cycles (Go duration format)
-    interval: "30m"
-    # Maximum number of concurrent item deletions per GC cycle
-    maxConcurrency: 10
+    collector:
+      # Interval between garbage collection cycles (Go duration format)
+      interval: "30m"
+      # Maximum number of concurrent item deletions per GC cycle
+      maxConcurrency: 10
+    # Metrics HTTP server listen address (must be ":PORT" format, e.g. ":9091")
+    metricsAddr: ":9091"
 
   # Per-component podSecurityContext override (optional).
   # If not set, inherits global.podSecurityContext.
@@ -488,6 +502,13 @@ gc:
 
   logging:
     verbosity: 2
+
+  # PodMonitor for Prometheus Operator scraping of GC metrics.
+  podMonitor:
+    enabled: false
+    interval: "30s"
+    # Extra labels to match Prometheus Operator's podMonitorSelector.
+    labels: {}
 
   nodeSelector: {}
   tolerations: []

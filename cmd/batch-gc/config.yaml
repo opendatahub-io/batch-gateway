@@ -3,11 +3,15 @@
 # If true, only log what would be deleted without actually deleting
 dry_run: false
 
-# Interval between garbage collection cycles
-interval: 1h
+# Collector-specific settings
+collector:
+  # Interval between garbage collection cycles
+  interval: 1h
+  # Maximum number of concurrent item deletions per GC cycle (default: 10)
+  max_concurrency: 10
 
-# Maximum number of concurrent item deletions per GC cycle (default: 10)
-max_concurrency: 10
+# Metrics HTTP server listen address (default: ":9091")
+metrics_addr: ":9091"
 
 # Database client configuration
 db_client:

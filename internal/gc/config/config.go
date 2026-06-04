@@ -19,7 +19,9 @@ package config
 
 import (
 	"fmt"
+	"net"
 	"os"
+	"strconv"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -42,11 +44,22 @@ type ReconcilerConfig struct {
 	Interval time.Duration `yaml:"interval"`
 }
 
-// Config holds the garbage collector configuration.
-type Config struct {
-	DryRun         bool          `yaml:"dry_run"`
+// CollectorConfig holds collector-specific settings (interval and concurrency).
+type CollectorConfig struct {
 	Interval       time.Duration `yaml:"interval"`
 	MaxConcurrency int           `yaml:"max_concurrency"`
+}
+
+// DefaultMetricsAddr is the default listen address for the metrics HTTP server.
+const DefaultMetricsAddr = ":9091"
+
+// Config holds the garbage collector configuration.
+type Config struct {
+	DryRun      bool   `yaml:"dry_run"`
+	MetricsAddr string `yaml:"metrics_addr"`
+
+	// Collector holds the collector-specific configuration (interval, concurrency).
+	Collector CollectorConfig `yaml:"collector"`
 
 	// Reconciler configures the orphan reconciler that detects and recovers
 	// batch jobs stuck in non-terminal states.
@@ -67,8 +80,11 @@ func Load(path string) (*Config, error) {
 	}
 
 	cfg := &Config{
-		Interval:       1 * time.Hour,
-		MaxConcurrency: DefaultMaxConcurrency,
+		Collector: CollectorConfig{
+			Interval:       1 * time.Hour,
+			MaxConcurrency: DefaultMaxConcurrency,
+		},
+		MetricsAddr: DefaultMetricsAddr,
 		Reconciler: ReconcilerConfig{
 			Enabled:  true,
 			Interval: DefaultReconcilerInterval,
@@ -78,16 +94,20 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("failed to parse config file: %w", err)
 	}
 
-	if cfg.MaxConcurrency <= 0 {
-		return nil, fmt.Errorf("max_concurrency must be positive, got %d", cfg.MaxConcurrency)
+	if cfg.Collector.MaxConcurrency <= 0 {
+		return nil, fmt.Errorf("collector.max_concurrency must be positive, got %d", cfg.Collector.MaxConcurrency)
 	}
 
-	if cfg.Interval <= 0 {
-		return nil, fmt.Errorf("interval must be positive, got %v", cfg.Interval)
+	if cfg.Collector.Interval <= 0 {
+		return nil, fmt.Errorf("collector.interval must be positive, got %v", cfg.Collector.Interval)
 	}
 
 	if cfg.Reconciler.Enabled && cfg.Reconciler.Interval <= 0 {
 		return nil, fmt.Errorf("reconciler.interval must be positive when enabled, got %v", cfg.Reconciler.Interval)
+	}
+
+	if err := validateMetricsAddr(cfg.MetricsAddr); err != nil {
+		return nil, fmt.Errorf("metrics_addr: %w", err)
 	}
 
 	switch cfg.DBClientCfg.Type {
@@ -113,4 +133,22 @@ func Load(path string) (*Config, error) {
 	}
 
 	return cfg, nil
+}
+
+// validateMetricsAddr ensures addr is in ":PORT" format (e.g. ":9091").
+// The Helm chart derives the containerPort by trimming the leading colon,
+// so host:port forms like "0.0.0.0:9091" are intentionally rejected.
+func validateMetricsAddr(addr string) error {
+	host, portStr, err := net.SplitHostPort(addr)
+	if err != nil {
+		return fmt.Errorf("must be :PORT format (e.g. \":9091\"), got %q", addr)
+	}
+	if host != "" {
+		return fmt.Errorf("must be :PORT format (e.g. \":9091\"), got %q; host part is not supported", addr)
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil || port < 1 || port > 65535 {
+		return fmt.Errorf("port must be 1-65535, got %q", portStr)
+	}
+	return nil
 }
