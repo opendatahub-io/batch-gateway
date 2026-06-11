@@ -17,17 +17,17 @@ import (
 
 	"github.com/go-logr/logr"
 	"github.com/go-logr/logr/testr"
-	db "github.com/llm-d-incubation/batch-gateway/internal/database/api"
-	mockdb "github.com/llm-d-incubation/batch-gateway/internal/database/mock"
-	filesapi "github.com/llm-d-incubation/batch-gateway/internal/files_store/api"
-	mockfiles "github.com/llm-d-incubation/batch-gateway/internal/files_store/mock"
-	"github.com/llm-d-incubation/batch-gateway/internal/processor/config"
-	"github.com/llm-d-incubation/batch-gateway/internal/shared/openai"
-	batch_types "github.com/llm-d-incubation/batch-gateway/internal/shared/types"
-	"github.com/llm-d-incubation/batch-gateway/internal/util/clientset"
-	ucom "github.com/llm-d-incubation/batch-gateway/internal/util/com"
-	"github.com/llm-d-incubation/batch-gateway/internal/util/semaphore"
-	"github.com/llm-d-incubation/batch-gateway/pkg/clients/inference"
+	db "github.com/llm-d/llm-d-batch-gateway/internal/database/api"
+	mockdb "github.com/llm-d/llm-d-batch-gateway/internal/database/mock"
+	filesapi "github.com/llm-d/llm-d-batch-gateway/internal/files_store/api"
+	mockfiles "github.com/llm-d/llm-d-batch-gateway/internal/files_store/mock"
+	"github.com/llm-d/llm-d-batch-gateway/internal/processor/config"
+	"github.com/llm-d/llm-d-batch-gateway/internal/shared/openai"
+	batch_types "github.com/llm-d/llm-d-batch-gateway/internal/shared/types"
+	"github.com/llm-d/llm-d-batch-gateway/internal/util/clientset"
+	ucom "github.com/llm-d/llm-d-batch-gateway/internal/util/com"
+	"github.com/llm-d/llm-d-batch-gateway/internal/util/semaphore"
+	"github.com/llm-d/llm-d-batch-gateway/pkg/clients/inference"
 )
 
 // ---------------------------------------------------------------------------
@@ -597,6 +597,8 @@ func makeInputLines(models []string) [][]byte {
 	for i, m := range models {
 		req := map[string]any{
 			"custom_id": fmt.Sprintf("req-%d", i),
+			"method":    "POST",
+			"url":       "/v1/chat/completions",
 			"body": map[string]any{
 				"model": m,
 			},
@@ -628,6 +630,8 @@ func makeInputLinesWithSystemPrompts(specs []inputLineSpec) [][]byte {
 		}
 		req := map[string]any{
 			"custom_id": fmt.Sprintf("req-%d", i),
+			"method":    "POST",
+			"url":       "/v1/chat/completions",
 			"body":      body,
 			"meta":      map[string]any{"i": i},
 		}
