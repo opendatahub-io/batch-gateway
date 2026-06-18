@@ -21,6 +21,14 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
+# RHOAI defaults: upstream OCI chart v0.2.0 with RHOAI container images.
+# Set before sourcing common.sh so its validation picks them up.
+BATCH_RELEASE_VERSION="${BATCH_RELEASE_VERSION:-v0.2.0}"
+BATCH_IMAGE_TAG="${BATCH_IMAGE_TAG:-rhoai-3.5-ea.2}"
+BATCH_APISERVER_REPO="${BATCH_APISERVER_REPO:-quay.io/rhoai/odh-llm-d-batch-gateway-apiserver-rhel9}"
+BATCH_PROCESSOR_REPO="${BATCH_PROCESSOR_REPO:-quay.io/rhoai/odh-llm-d-batch-gateway-processor-rhel9}"
+BATCH_GC_REPO="${BATCH_GC_REPO:-quay.io/rhoai/odh-llm-d-batch-gateway-gc-rhel9}"
+
 source "${SCRIPT_DIR}/common.sh"
 
 # ── Configuration ────────────────────────────────────────────────────────────
@@ -1576,12 +1584,12 @@ usage() {
     echo "  MODEL_NAME       Model name for simulator (default: facebook/opt-125m)"
     echo "  MODEL_REPLICAS   Number of replicas (default: 1)"
     echo "  SIM_IMAGE        Simulator image (default: ghcr.io/llm-d/llm-d-inference-sim:v0.7.1)"
-    echo "  BATCH_IMAGE_TAG        Batch gateway image tag (default: from values.yaml)"
-    echo "  BATCH_APISERVER_REPO   Apiserver image repo (default: from values.yaml)"
-    echo "  BATCH_PROCESSOR_REPO   Processor image repo (default: from values.yaml)"
-    echo "  BATCH_GC_REPO          GC image repo (default: from values.yaml)"
-    echo "  BATCH_DEV_VERSION      Batch gateway commit SHA for dev chart (default: local)"
-    echo "  BATCH_RELEASE_VERSION  Install released OCI chart (e.g. v1.0.0)"
+    echo "  BATCH_RELEASE_VERSION  OCI chart version (default: v0.2.0)"
+    echo "  BATCH_IMAGE_TAG        Batch gateway image tag (default: rhoai-3.5-ea.2)"
+    echo "  BATCH_APISERVER_REPO   Apiserver image repo (default: quay.io/rhoai/odh-llm-d-batch-gateway-apiserver-rhel9)"
+    echo "  BATCH_PROCESSOR_REPO   Processor image repo (default: quay.io/rhoai/odh-llm-d-batch-gateway-processor-rhel9)"
+    echo "  BATCH_GC_REPO          GC image repo (default: quay.io/rhoai/odh-llm-d-batch-gateway-gc-rhel9)"
+    echo "  BATCH_DEV_VERSION      Batch gateway commit SHA for dev chart (overrides BATCH_RELEASE_VERSION)"
     echo "  BATCH_DB_TYPE          Database: postgresql or redis (default: postgresql)"
     echo "  BATCH_STORAGE_TYPE     File storage: fs or s3 (default: s3)"
     echo "  ENABLE_FLOW_CONTROL   Enable GIE flow control (default: true)"

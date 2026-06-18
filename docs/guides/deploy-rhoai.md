@@ -987,10 +987,11 @@ oc create secret generic batch-gateway-secrets \
 <summary>Install batch-gateway</summary>
 
 ```bash
-IMAGE_TAG=odh-stable
-APISERVER_REPO=quay.io/opendatahub/odh-llm-d-batch-gateway-apiserver
-PROCESSOR_REPO=quay.io/opendatahub/odh-llm-d-batch-gateway-processor
-GC_REPO=quay.io/opendatahub/odh-llm-d-batch-gateway-gc
+CHART_VERSION=0.2.0
+IMAGE_TAG=rhoai-3.5-ea.2
+APISERVER_REPO=quay.io/rhoai/odh-llm-d-batch-gateway-apiserver-rhel9
+PROCESSOR_REPO=quay.io/rhoai/odh-llm-d-batch-gateway-processor-rhel9
+GC_REPO=quay.io/rhoai/odh-llm-d-batch-gateway-gc-rhel9
 ```
 
 ```bash
@@ -1000,8 +1001,10 @@ INTERNAL_GW_SVC=$(oc get svc -n openshift-ingress \
     -o jsonpath='{.items[0].metadata.name}')
 MODEL_URL="http://${INTERNAL_GW_SVC}.openshift-ingress.svc.cluster.local/${LLM_NS}/${ISVC_NAME}"
 
-# Install batch-gateway
-helm upgrade --install batch-gateway ./charts/batch-gateway \
+# Install batch-gateway from OCI chart
+helm upgrade --install batch-gateway \
+    oci://ghcr.io/llm-d-incubation/charts/batch-gateway \
+    --version ${CHART_VERSION} \
     --namespace ${BATCH_NS} \
     --set "apiserver.image.repository=${APISERVER_REPO}" \
     --set "apiserver.image.tag=${IMAGE_TAG}" \

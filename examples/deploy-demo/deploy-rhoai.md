@@ -57,10 +57,11 @@ Batch-route has no authorization — model-level authz is enforced downstream wh
 
 | Mode | Command |
 |------|---------|
-| Local chart (default) | `bash examples/deploy-demo/deploy-rhoai.sh install` |
-| Specific commit | `BATCH_DEV_VERSION=1f925ff bash examples/deploy-demo/deploy-rhoai.sh install` |
-| Released OCI chart | `BATCH_RELEASE_VERSION=v0.1.0 bash examples/deploy-demo/deploy-rhoai.sh install` |
-| Specific batch-gateway images | `BATCH_IMAGE_TAG=rhoai-3.5-ea.2` <br> `BATCH_APISERVER_REPO=quay.io/rhoai/odh-llm-d-batch-gateway-apiserver-rhel9` <br> `BATCH_PROCESSOR_REPO=quay.io/rhoai/odh-llm-d-batch-gateway-processor-rhel9` <br> `BATCH_GC_REPO=quay.io/rhoai/odh-llm-d-batch-gateway-gc-rhel9` <br> `bash examples/deploy-demo/deploy-rhoai.sh install` |
+| OCI chart v0.2.0 + RHOAI images (default) | `bash examples/deploy-demo/deploy-rhoai.sh install` |
+| Different OCI chart version | `BATCH_RELEASE_VERSION=v0.3.0 bash examples/deploy-demo/deploy-rhoai.sh install` |
+| Specific commit (dev chart) | `BATCH_DEV_VERSION=1f925ff bash examples/deploy-demo/deploy-rhoai.sh install` |
+| Local chart | `BATCH_DEV_VERSION=local bash examples/deploy-demo/deploy-rhoai.sh install` |
+| Custom batch-gateway images | `BATCH_IMAGE_TAG=my-tag` <br> `BATCH_APISERVER_REPO=my-registry/apiserver` <br> `BATCH_PROCESSOR_REPO=my-registry/processor` <br> `BATCH_GC_REPO=my-registry/gc` <br> `bash examples/deploy-demo/deploy-rhoai.sh install` |
 
 > `BATCH_RELEASE_VERSION` and `BATCH_DEV_VERSION` cannot be used together.
 
@@ -132,12 +133,12 @@ Use that only on **ephemeral or dedicated** demo clusters. See [issue #309](http
 | Variable | Default | Scope | Description |
 |----------|---------|-------|-------------|
 | `BATCH_HELM_RELEASE` | `batch-gateway` | all | Helm release name |
-| `BATCH_RELEASE_VERSION` | — | all | Install from released OCI chart (e.g. `v1.0.0`). Cannot be used with `BATCH_DEV_VERSION` |
-| `BATCH_DEV_VERSION` | `local` | all | Image tag / commit SHA. `local` uses local chart + `latest` image. Cannot be used with `BATCH_RELEASE_VERSION` |
-| `BATCH_IMAGE_TAG` | — | all | Override image tag for all components. Takes precedence over `BATCH_RELEASE_VERSION` / `BATCH_DEV_VERSION` derived tags |
-| `BATCH_APISERVER_REPO` | — | all | Override apiserver image repository |
-| `BATCH_PROCESSOR_REPO` | — | all | Override processor image repository |
-| `BATCH_GC_REPO` | — | all | Override gc image repository |
+| `BATCH_RELEASE_VERSION` | `v0.2.0` | all | OCI chart version. Cannot be used with `BATCH_DEV_VERSION` |
+| `BATCH_DEV_VERSION` | — | all | Commit SHA for dev chart. Overrides `BATCH_RELEASE_VERSION`. `local` uses local chart |
+| `BATCH_IMAGE_TAG` | `rhoai-3.5-ea.2` | all | Image tag for all components. Takes precedence over version-derived tags |
+| `BATCH_APISERVER_REPO` | `quay.io/rhoai/odh-llm-d-batch-gateway-apiserver-rhel9` | all | Apiserver image repository |
+| `BATCH_PROCESSOR_REPO` | `quay.io/rhoai/odh-llm-d-batch-gateway-processor-rhel9` | all | Processor image repository |
+| `BATCH_GC_REPO` | `quay.io/rhoai/odh-llm-d-batch-gateway-gc-rhel9` | all | GC image repository |
 | `BATCH_DB_TYPE` | `postgresql` | all | Database backend: `postgresql` or `redis` |
 | `BATCH_STORAGE_TYPE` | `s3` | all | File storage: `fs` or `s3` |
 | `DEMO_TLS_INSECURE_SKIP_VERIFY` | `1` | all | Disables TLS certificate verification for processor → model gateway and Istio Gateway → batch apiserver (**demo/lab only**, [CWE-295](https://cwe.mitre.org/data/definitions/295.html)). Default `1` since demo scripts use self-signed certs. Set to `0` if you have trusted CA certs. |
