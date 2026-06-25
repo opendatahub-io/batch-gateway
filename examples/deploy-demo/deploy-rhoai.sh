@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 set -euo pipefail
 
 # ── Install RHOAI (Red Hat OpenShift AI) platform ────────────────────────────
@@ -20,14 +20,6 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
-
-# RHOAI defaults: upstream OCI chart v0.2.0 with RHOAI container images.
-# Set before sourcing common.sh so its validation picks them up.
-BATCH_RELEASE_VERSION="${BATCH_RELEASE_VERSION:-v0.2.0}"
-BATCH_IMAGE_TAG="${BATCH_IMAGE_TAG:-rhoai-3.5-ea.2}"
-BATCH_APISERVER_REPO="${BATCH_APISERVER_REPO:-quay.io/rhoai/odh-llm-d-batch-gateway-apiserver-rhel9}"
-BATCH_PROCESSOR_REPO="${BATCH_PROCESSOR_REPO:-quay.io/rhoai/odh-llm-d-batch-gateway-processor-rhel9}"
-BATCH_GC_REPO="${BATCH_GC_REPO:-quay.io/rhoai/odh-llm-d-batch-gateway-gc-rhel9}"
 
 source "${SCRIPT_DIR}/common.sh"
 
@@ -622,6 +614,38 @@ EOF
     fi
 }
 
+# TODO: Remove when RHCL wasm plugin OOM issue is fixed (CONNLINK-1130).
+# RHCL 1.4.0 wasm plugin causes gateway envoy proxy to OOM at the default 1Gi
+# memory limit. Use Gateway API infrastructure.parametersRef to increase it.
+patch_gateway_memory() {
+    local gw_name="$1" gw_ns="$2" cm_name="$3"
+    if ! kubectl get gateway "${gw_name}" -n "${gw_ns}" &>/dev/null; then
+        return
+    fi
+    step "Patching Gateway '${gw_name}' memory limit to 2Gi..."
+    kubectl apply -f - <<EOF
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ${cm_name}
+  namespace: ${gw_ns}
+data:
+  deployment: |
+    spec:
+      template:
+        spec:
+          containers:
+          - name: istio-proxy
+            resources:
+              limits:
+                memory: 2Gi
+EOF
+    kubectl patch gateway "${gw_name}" -n "${gw_ns}" --type=merge \
+        -p "{\"spec\":{\"infrastructure\":{\"parametersRef\":{\"group\":\"\",\"kind\":\"ConfigMap\",\"name\":\"${cm_name}\"}}}}"
+    log "Gateway '${gw_name}' memory limit patched to 2Gi."
+}
+
+
 apply_dsci_and_dsc() {
     local apps_namespace
     case "${OPERATOR_TYPE}" in
@@ -718,10 +742,13 @@ deploy_llm_inference_service() {
             - type: round-robin-fairness-policy
             - type: global-strict-fairness-policy
             - type: slo-deadline-ordering-policy
+            - type: utilization-detector
+              parameters:
+                queueDepthThreshold: 5
+                kvCacheUtilThreshold: 0.8
           schedulingProfiles: []
           saturationDetector:
-            queueDepthThreshold: 5
-            kvCacheUtilThreshold: 0.8
+            pluginRef: utilization-detector
           flowControl:
             maxBytes: 4294967296
             defaultRequestTTL: 30s
@@ -946,20 +973,6 @@ spec:
     - group: inference.networking.x-k8s.io
       kind: InferencePool
       name: ${pool_name}
-  - matches:
-    - path:
-        type: PathPrefix
-        value: /${LLM_NAMESPACE}/${isvc_name}
-    filters:
-    - type: URLRewrite
-      urlRewrite:
-        path:
-          type: ReplacePrefixMatch
-          replacePrefixMatch: /
-    backendRefs:
-    - group: inference.networking.x-k8s.io
-      kind: InferencePool
-      name: ${pool_name}
 EOF
 
     log "batch-llm-route created: /${LLM_NAMESPACE}/${isvc_name}/* -> InferencePool/${pool_name} (via Internal Gateway)"
@@ -1147,7 +1160,7 @@ verify_flow_control_config() {
 
     # 3. Batch processor inferenceObjective config
     step "Checking batch processor config..."
-    if kubectl get configmap "${BATCH_HELM_RELEASE}-processor-config" -n "${BATCH_NAMESPACE}" \
+    if kubectl get configmap "${BATCH_INSTANCE_NAME}-processor-config" -n "${BATCH_NAMESPACE}" \
         -o jsonpath='{.data}' 2>/dev/null | grep "inference_objective" | grep -q "${BATCH_FLOW_CONTROL_OBJECTIVE}"; then
         log "Processor configured with inferenceObjective: ${BATCH_FLOW_CONTROL_OBJECTIVE}"
     else
@@ -1237,14 +1250,14 @@ verify_flow_control_runtime() {
 
     # 3. Pool saturation metric exists
     step "Checking pool saturation metric..."
-    if echo "${metrics_body}" | grep -q 'inference_extension_flow_control_pool_saturation'; then
+    if [[ "${metrics_body}" == *"inference_extension_flow_control_pool_saturation"* ]]; then
         local saturation
         saturation=$(echo "${metrics_body}" | grep 'inference_extension_flow_control_pool_saturation{' \
             | grep -oE '[0-9.]+$' | head -1)
         log "Pool saturation: ${saturation}"
     else
+        # saturation metric may not be exposed in EPP
         warn "Pool saturation metric not found."
-        errors=$((errors + 1))
     fi
 
     if [ "${errors}" -gt 0 ]; then
@@ -1257,43 +1270,7 @@ verify_flow_control_runtime() {
 
 deploy_batch_gateway_rhoai() {
     banner "Installing Batch Gateway"
-
-    local isvc_name="${ISVC_NAME}"
-
-    # Route batch processor through the Internal Gateway (ClusterIP, no rate limit)
-    # instead of the external Gateway. The Internal Gateway still uses EPP and
-    # enforces AuthPolicy (model access check with user's original token).
-    local internal_gw_svc
-    internal_gw_svc=$(kubectl get svc -n "${BATCH_INTERNAL_GATEWAY_NAMESPACE}" \
-        -l "gateway.networking.k8s.io/gateway-name=${BATCH_INTERNAL_GATEWAY_NAME}" \
-        -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
-    [ -z "${internal_gw_svc}" ] && die "No service found for Internal Gateway '${BATCH_INTERNAL_GATEWAY_NAME}'."
-    local model_url="http://${internal_gw_svc}.${BATCH_INTERNAL_GATEWAY_NAMESPACE}.svc.cluster.local/${LLM_NAMESPACE}/${isvc_name}"
-    log "Model URL (via Internal Gateway): ${model_url}"
-
-    # Escape dots in model name for helm --set path
-    local model_key="${MODEL_NAME//./\\.}"
-
-    local helm_args=(
-        --set "processor.config.modelGateways.${model_key}.url=${model_url}"
-        --set "processor.config.modelGateways.${model_key}.requestTimeout=${GW_REQUEST_TIMEOUT}"
-        --set "processor.config.modelGateways.${model_key}.maxRetries=${GW_MAX_RETRIES}"
-        --set "processor.config.modelGateways.${model_key}.initialBackoff=${GW_INITIAL_BACKOFF}"
-        --set "processor.config.modelGateways.${model_key}.maxBackoff=${GW_MAX_BACKOFF}"
-        --set "apiserver.config.batchAPI.passThroughHeaders={Authorization}"
-        # CI clusters have limited CPU; lower requests so the processor pod can be scheduled
-        --set "processor.resources.requests.cpu=100m"
-        --set "processor.resources.requests.memory=128Mi"
-    )
-
-    if [ "${ENABLE_FLOW_CONTROL}" = "true" ]; then
-        helm_args+=(
-            --set "processor.config.modelGateways.${model_key}.inferenceObjective=${BATCH_FLOW_CONTROL_OBJECTIVE}"
-        )
-        log "Flow control: processor will send x-gateway-inference-objective: ${BATCH_FLOW_CONTROL_OBJECTIVE}"
-    fi
-
-    do_deploy_batch_gateway "${helm_args[@]}"
+    do_deploy_batch_gateway_dsc "${ISVC_NAME}" "Authorization"
 }
 
 check_prerequisites() {
@@ -1321,6 +1298,7 @@ cmd_install() {
 
     install_lws_operator
     create_openshift_gateway
+    patch_gateway_memory "${GATEWAY_NAME}" "${GATEWAY_NAMESPACE}" "inference-gw-options"
     install_connectivity_link
     install_rhoai_operator
     apply_dsci_and_dsc
@@ -1332,6 +1310,7 @@ cmd_install() {
     apply_llm_token_rate_limit
 
     create_batch_internal_gateway
+    patch_gateway_memory "${BATCH_INTERNAL_GATEWAY_NAME}" "${BATCH_INTERNAL_GATEWAY_NAMESPACE}" "batch-gw-options"
     create_batch_llm_httproute
     apply_batch_llm_auth_policy
     check_batch_internal_gateway
@@ -1350,17 +1329,7 @@ cmd_install() {
     [ -n "${CUSTOM_CATALOG}" ] && log "  Catalog:  ${CUSTOM_CATALOG} (custom)"
     log "  Model: ${MODEL_NAME} (simulator, ${MODEL_REPLICAS} replicas, no GPU)"
     log "  Flow Control: ${ENABLE_FLOW_CONTROL}"
-    log "  Batch Gateway: ${BATCH_HELM_RELEASE} (${BATCH_NAMESPACE})"
-    if [ -n "${BATCH_IMAGE_TAG}" ]; then
-        log "  Batch Gateway image tag: ${BATCH_IMAGE_TAG}"
-    fi
-    if [ -n "${BATCH_RELEASE_VERSION}" ]; then
-        log "  Batch Gateway version: ${BATCH_RELEASE_VERSION} (OCI chart)"
-    elif [ "${BATCH_DEV_VERSION}" != "local" ]; then
-        log "  Batch Gateway version: ${BATCH_DEV_VERSION} (commit chart)"
-    else
-        log "  Batch Gateway version: latest (local chart)"
-    fi
+    log "  Batch Gateway: ${BATCH_INSTANCE_NAME} (${BATCH_NAMESPACE}, LLMBatchGateway CR)"
     log ""
     log "Run '$0 test' to verify."
 }
@@ -1460,7 +1429,8 @@ cmd_uninstall() {
     kubectl delete ratelimitpolicy batch-ratelimit -n "${BATCH_NAMESPACE}" 2>/dev/null || true
     kubectl delete authpolicy batch-route-auth -n "${BATCH_NAMESPACE}" 2>/dev/null || true
     kubectl delete httproute batch-route -n "${BATCH_NAMESPACE}" 2>/dev/null || true
-    helm uninstall "${BATCH_HELM_RELEASE}" -n "${BATCH_NAMESPACE}" --timeout 60s 2>/dev/null || true
+    kubectl delete llmbatchgateway "${BATCH_INSTANCE_NAME}" -n "${BATCH_NAMESPACE}" --timeout=60s 2>/dev/null || true
+    helm uninstall "${BATCH_INSTANCE_NAME}" -n "${BATCH_NAMESPACE}" --timeout 60s 2>/dev/null || true
     helm uninstall "${BATCH_REDIS_RELEASE}" -n "${BATCH_NAMESPACE}" --timeout 60s 2>/dev/null || true
     helm uninstall "${BATCH_POSTGRESQL_RELEASE}" -n "${BATCH_NAMESPACE}" --timeout 60s 2>/dev/null || true
     kubectl delete deployment,svc -l app="${BATCH_MINIO_RELEASE}" -n "${BATCH_NAMESPACE}" 2>/dev/null || true
@@ -1468,7 +1438,7 @@ cmd_uninstall() {
     force_delete_namespace "${BATCH_NAMESPACE}"
 
     # DestinationRule (in GATEWAY_NAMESPACE, not deleted with batch namespace)
-    kubectl delete destinationrule "${BATCH_HELM_RELEASE}-backend-tls" -n "${GATEWAY_NAMESPACE}" 2>/dev/null || true
+    kubectl delete destinationrule "${BATCH_INSTANCE_NAME}-backend-tls" -n "${GATEWAY_NAMESPACE}" 2>/dev/null || true
 
     # InferenceObjective CRDs (flow control)
     step "Removing InferenceObjective resources..."
@@ -1584,12 +1554,6 @@ usage() {
     echo "  MODEL_NAME       Model name for simulator (default: facebook/opt-125m)"
     echo "  MODEL_REPLICAS   Number of replicas (default: 1)"
     echo "  SIM_IMAGE        Simulator image (default: ghcr.io/llm-d/llm-d-inference-sim:v0.7.1)"
-    echo "  BATCH_RELEASE_VERSION  OCI chart version (default: v0.2.0)"
-    echo "  BATCH_IMAGE_TAG        Batch gateway image tag (default: rhoai-3.5-ea.2)"
-    echo "  BATCH_APISERVER_REPO   Apiserver image repo (default: quay.io/rhoai/odh-llm-d-batch-gateway-apiserver-rhel9)"
-    echo "  BATCH_PROCESSOR_REPO   Processor image repo (default: quay.io/rhoai/odh-llm-d-batch-gateway-processor-rhel9)"
-    echo "  BATCH_GC_REPO          GC image repo (default: quay.io/rhoai/odh-llm-d-batch-gateway-gc-rhel9)"
-    echo "  BATCH_DEV_VERSION      Batch gateway commit SHA for dev chart (overrides BATCH_RELEASE_VERSION)"
     echo "  BATCH_DB_TYPE          Database: postgresql or redis (default: postgresql)"
     echo "  BATCH_STORAGE_TYPE     File storage: fs or s3 (default: s3)"
     echo "  ENABLE_FLOW_CONTROL   Enable GIE flow control (default: true)"

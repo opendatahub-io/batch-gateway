@@ -32,7 +32,7 @@ bash examples/deploy-demo/deploy-rhoai.sh install
 | MinIO | S3-compatible file storage (when `BATCH_STORAGE_TYPE=s3`) |
 | Internal Gateway | ClusterIP gateway for batch processor → LLM inference (bypasses rate limits, preserves AuthPolicy) |
 | InferenceObjective | GIE flow control CRDs — priority-based dispatch (interactive=100, batch=-1). Enabled by default (`ENABLE_FLOW_CONTROL=true`) |
-| batch-gateway | apiserver + processor + gc (Helm chart) |
+| batch-gateway | apiserver + processor + gc (LLMBatchGateway CR, operator-managed) |
 
 #### Routing & Policies
 
@@ -53,19 +53,7 @@ Batch-route has no authorization — model-level authz is enforced downstream wh
 
 #### Install Examples
 
-**Batch-gateway chart source** — controls where the batch-gateway Helm chart and images come from:
-
-| Mode | Command |
-|------|---------|
-| OCI chart v0.2.0 + RHOAI images (default) | `bash examples/deploy-demo/deploy-rhoai.sh install` |
-| Different OCI chart version | `BATCH_RELEASE_VERSION=v0.3.0 bash examples/deploy-demo/deploy-rhoai.sh install` |
-| Specific commit (dev chart) | `BATCH_DEV_VERSION=1f925ff bash examples/deploy-demo/deploy-rhoai.sh install` |
-| Local chart | `BATCH_DEV_VERSION=local bash examples/deploy-demo/deploy-rhoai.sh install` |
-| Custom batch-gateway images | `BATCH_IMAGE_TAG=my-tag` <br> `BATCH_APISERVER_REPO=my-registry/apiserver` <br> `BATCH_PROCESSOR_REPO=my-registry/processor` <br> `BATCH_GC_REPO=my-registry/gc` <br> `bash examples/deploy-demo/deploy-rhoai.sh install` |
-
-> `BATCH_RELEASE_VERSION` and `BATCH_DEV_VERSION` cannot be used together.
-
-**RHOAI / ODH platform** — controls which AI platform operator is installed (orthogonal to batch-gateway chart source, can be combined):
+**RHOAI / ODH platform** — controls which AI platform operator is installed:
 
 | Mode | Command |
 |------|---------|
@@ -105,9 +93,9 @@ bash examples/deploy-demo/deploy-rhoai.sh uninstall
 
 Default `uninstall` removes the batch-gateway footprint and associated gateway/policy resources:
 
-- Helm releases and CRs in `BATCH_NAMESPACE` (including all HTTPRoutes)
+- LLMBatchGateway CR and dependencies in `BATCH_NAMESPACE` (`batch-route` HTTPRoute, Redis, PostgreSQL, MinIO)
 - Both Gateways: `GATEWAY_NAME` and `BATCH_INTERNAL_GATEWAY_NAME`
-- DestinationRule `${BATCH_HELM_RELEASE}-backend-tls`
+- DestinationRule `${BATCH_INSTANCE_NAME}-backend-tls`
 - InferenceObjective resources in `LLM_NAMESPACE`
 - Internal Gateway resources (`batch-llm-route`, `batch-llm-route-auth`) in `LLM_NAMESPACE`
 - Kuadrant policies (`batch-route-auth`, `batch-ratelimit`, `inference-token-limit`)
@@ -130,41 +118,35 @@ Use that only on **ephemeral or dedicated** demo clusters. See [issue #309](http
 
 ## Environment Variables
 
-| Variable | Default | Scope | Description |
-|----------|---------|-------|-------------|
-| `BATCH_HELM_RELEASE` | `batch-gateway` | all | Helm release name |
-| `BATCH_RELEASE_VERSION` | `v0.2.0` | all | OCI chart version. Cannot be used with `BATCH_DEV_VERSION` |
-| `BATCH_DEV_VERSION` | — | all | Commit SHA for dev chart. Overrides `BATCH_RELEASE_VERSION`. `local` uses local chart |
-| `BATCH_IMAGE_TAG` | `rhoai-3.5-ea.2` | all | Image tag for all components. Takes precedence over version-derived tags |
-| `BATCH_APISERVER_REPO` | `quay.io/rhoai/odh-llm-d-batch-gateway-apiserver-rhel9` | all | Apiserver image repository |
-| `BATCH_PROCESSOR_REPO` | `quay.io/rhoai/odh-llm-d-batch-gateway-processor-rhel9` | all | Processor image repository |
-| `BATCH_GC_REPO` | `quay.io/rhoai/odh-llm-d-batch-gateway-gc-rhel9` | all | GC image repository |
-| `BATCH_DB_TYPE` | `postgresql` | all | Database backend: `postgresql` or `redis` |
-| `BATCH_STORAGE_TYPE` | `s3` | all | File storage: `fs` or `s3` |
-| `DEMO_TLS_INSECURE_SKIP_VERIFY` | `1` | all | Disables TLS certificate verification for processor → model gateway and Istio Gateway → batch apiserver (**demo/lab only**, [CWE-295](https://cwe.mitre.org/data/definitions/295.html)). Default `1` since demo scripts use self-signed certs. Set to `0` if you have trusted CA certs. |
-| `BATCH_NAMESPACE` | `batch-api` | all | Namespace for batch-gateway |
-| `LLM_NAMESPACE` | `llm` | all | Namespace for model serving |
-| `BATCH_EXCHANGE_CLIENT_TYPE` | `redis` | all | Exchange backend type (`redis` or `valkey`) |
-| `GW_REQUEST_TIMEOUT` | `5m` | all | Model gateway HTTP request timeout |
-| `GW_MAX_RETRIES` | `3` | all | Model gateway max retries |
-| `GW_INITIAL_BACKOFF` | `1s` | all | Model gateway initial retry backoff |
-| `GW_MAX_BACKOFF` | `60s` | all | Model gateway max retry backoff |
-| `OPERATOR_TYPE` | `rhoai` | rhoai | Operator type: `rhoai` or `odh` |
-| `CUSTOM_CATALOG` | — | rhoai | Custom catalog image for operator (creates CatalogSource) |
-| `RHOAI_VERSION` | (auto-detected) | rhoai | RHOAI version (e.g. `3.4`). Auto-detected from PackageManifest if not set |
-| `RHOAI_CHANNEL` | (auto-detected) | rhoai | RHOAI OLM channel (e.g. `stable-3.4`). Auto-detected if not set |
-| `ODH_CHANNEL` | `fast-3` | rhoai | ODH OLM channel (used when `OPERATOR_TYPE=odh`) |
-| `KUADRANT_NAMESPACE` | `kuadrant-system` | rhoai | Namespace for Connectivity Link (Kuadrant) |
-| `GATEWAY_CLASS_NAME` | `openshift-default` | rhoai | GatewayClass name |
-| `GATEWAY_NAME` | `openshift-ai-inference` | rhoai | Gateway resource name |
-| `GATEWAY_NAMESPACE` | `openshift-ingress` | rhoai | Gateway namespace |
-| `BATCH_INTERNAL_GATEWAY_NAME` | `batch-internal-gateway` | rhoai | Internal Gateway resource name |
-| `BATCH_INTERNAL_GATEWAY_NAMESPACE` | `${GATEWAY_NAMESPACE}` | rhoai | Internal Gateway namespace |
-| `MODEL_NAME` | `facebook/opt-125m` | rhoai | Model name for routing |
-| `MODEL_URI` | `hf://sshleifer/tiny-gpt2` | rhoai | Model URI for LLMInferenceService |
-| `MODEL_REPLICAS` | `1` | rhoai | Number of model replicas |
-| `SIM_IMAGE` | `ghcr.io/llm-d/llm-d-inference-sim:v0.7.1` | rhoai | Simulator container image |
-| `ENABLE_FLOW_CONTROL` | `true` | rhoai | Enable GIE priority-based flow control |
-| `INTERACTIVE_FLOW_CONTROL_OBJECTIVE` | `interactive-default` | rhoai | InferenceObjective name for interactive requests (priority 100) |
-| `BATCH_FLOW_CONTROL_OBJECTIVE` | `batch-sheddable` | rhoai | InferenceObjective name for batch requests (priority -1) |
-| `UNINSTALL_ALL` | `0` | all | Set to `1` to remove RHOAI operators, Kuadrant, cert-manager, etc. (ephemeral clusters only) |
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `BATCH_INSTANCE_NAME` | `batch-gateway` | Instance name |
+| `BATCH_DB_TYPE` | `postgresql` | Database backend: `postgresql` or `redis` |
+| `BATCH_STORAGE_TYPE` | `s3` | File storage: `fs` or `s3` |
+| `DEMO_TLS_INSECURE_SKIP_VERIFY` | `1` | Disables TLS certificate verification for processor → model gateway and Istio Gateway → batch apiserver (**demo/lab only**, [CWE-295](https://cwe.mitre.org/data/definitions/295.html)). Default `1` since demo scripts use self-signed certs. Set to `0` if you have trusted CA certs. |
+| `BATCH_NAMESPACE` | `batch-api` | Namespace for batch-gateway |
+| `LLM_NAMESPACE` | `llm` | Namespace for model serving |
+| `BATCH_EXCHANGE_CLIENT_TYPE` | `redis` | Exchange backend type (`redis` or `valkey`) |
+| `GW_REQUEST_TIMEOUT` | `5m` | Model gateway HTTP request timeout |
+| `GW_MAX_RETRIES` | `3` | Model gateway max retries |
+| `GW_INITIAL_BACKOFF` | `1s` | Model gateway initial retry backoff |
+| `GW_MAX_BACKOFF` | `60s` | Model gateway max retry backoff |
+| `OPERATOR_TYPE` | `rhoai` | Operator type: `rhoai` or `odh` |
+| `CUSTOM_CATALOG` | — | Custom catalog image for operator (creates CatalogSource) |
+| `RHOAI_VERSION` | (auto-detected) | RHOAI version (e.g. `3.4`). Auto-detected from PackageManifest if not set |
+| `RHOAI_CHANNEL` | (auto-detected) | RHOAI OLM channel (e.g. `stable-3.4`). Auto-detected if not set |
+| `ODH_CHANNEL` | `fast-3` | ODH OLM channel (used when `OPERATOR_TYPE=odh`) |
+| `KUADRANT_NAMESPACE` | `kuadrant-system` | Namespace for Connectivity Link (Kuadrant) |
+| `GATEWAY_CLASS_NAME` | `openshift-default` | GatewayClass name |
+| `GATEWAY_NAME` | `openshift-ai-inference` | Gateway resource name |
+| `GATEWAY_NAMESPACE` | `openshift-ingress` | Gateway namespace |
+| `BATCH_INTERNAL_GATEWAY_NAME` | `batch-internal-gateway` | Internal Gateway resource name |
+| `BATCH_INTERNAL_GATEWAY_NAMESPACE` | `${GATEWAY_NAMESPACE}` | Internal Gateway namespace |
+| `MODEL_NAME` | `facebook/opt-125m` | Model name for routing |
+| `MODEL_URI` | `hf://sshleifer/tiny-gpt2` | Model URI for LLMInferenceService |
+| `MODEL_REPLICAS` | `1` | Number of model replicas |
+| `SIM_IMAGE` | `ghcr.io/llm-d/llm-d-inference-sim:v0.7.1` | Simulator container image |
+| `ENABLE_FLOW_CONTROL` | `true` | Enable GIE priority-based flow control |
+| `INTERACTIVE_FLOW_CONTROL_OBJECTIVE` | `interactive-default` | InferenceObjective name for interactive requests (priority 100) |
+| `BATCH_FLOW_CONTROL_OBJECTIVE` | `batch-sheddable` | InferenceObjective name for batch requests (priority -1) |
+| `UNINSTALL_ALL` | `0` | Set to `1` to remove RHOAI operators, Kuadrant, cert-manager, etc. (ephemeral clusters only) |
