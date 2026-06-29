@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 set -euo pipefail
 
 # ── Deploy batch-gateway on MaaS platform ────────────────────────────────────
@@ -27,6 +27,8 @@ LLM_NAMESPACE="${LLM_NAMESPACE:-llm}"
 GATEWAY_CLASS_NAME="${GATEWAY_CLASS_NAME:-openshift-default}"
 BATCH_INTERNAL_GATEWAY_NAME="${BATCH_INTERNAL_GATEWAY_NAME:-batch-internal-gateway}"
 BATCH_INTERNAL_GATEWAY_NAMESPACE="${BATCH_INTERNAL_GATEWAY_NAMESPACE:-${GATEWAY_NAMESPACE}}"
+
+OPERATOR_TYPE="${OPERATOR_TYPE:-odh}"
 
 # ── MaaS-specific Configuration ─────────────────────────────────────────────
 MAAS_REPO="${MAAS_REPO:-https://github.com/opendatahub-io/models-as-a-service.git}"
@@ -214,20 +216,6 @@ spec:
     - group: inference.networking.x-k8s.io
       kind: InferencePool
       name: ${pool_name}
-  - matches:
-    - path:
-        type: PathPrefix
-        value: /${LLM_NAMESPACE}/${isvc_name}
-    filters:
-    - type: URLRewrite
-      urlRewrite:
-        path:
-          type: ReplacePrefixMatch
-          replacePrefixMatch: /
-    backendRefs:
-    - group: inference.networking.x-k8s.io
-      kind: InferencePool
-      name: ${pool_name}
 EOF
 
     log "batch-llm-route created: /${LLM_NAMESPACE}/${isvc_name}/* -> InferencePool/${pool_name} (via Internal Gateway)"
@@ -275,32 +263,7 @@ apply_batch_llm_auth_policy() {
 
 deploy_batch_gateway_maas() {
     banner "Installing Batch Gateway"
-
-    local isvc_name="${MAAS_ISVC_NAME}"
-
-    # Route batch processor through the Internal Gateway (ClusterIP, no token rate limit)
-    # instead of the external MaaS Gateway. The Internal Gateway still uses EPP and
-    # enforces AuthPolicy (API key validation).
-    local internal_gw_svc
-    internal_gw_svc=$(kubectl get svc -n "${BATCH_INTERNAL_GATEWAY_NAMESPACE}" \
-        -l "gateway.networking.k8s.io/gateway-name=${BATCH_INTERNAL_GATEWAY_NAME}" \
-        -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
-    [ -z "${internal_gw_svc}" ] && die "No service found for Internal Gateway '${BATCH_INTERNAL_GATEWAY_NAME}'."
-    local model_url="http://${internal_gw_svc}.${BATCH_INTERNAL_GATEWAY_NAMESPACE}.svc.cluster.local/${LLM_NAMESPACE}/${isvc_name}"
-    log "Model URL (via Internal Gateway): ${model_url}"
-
-    local model_key="${MAAS_MODEL_NAME}"
-
-    local helm_args=(
-        --set "processor.config.modelGateways.${model_key}.url=${model_url}"
-        --set "processor.config.modelGateways.${model_key}.requestTimeout=${GW_REQUEST_TIMEOUT}"
-        --set "processor.config.modelGateways.${model_key}.maxRetries=${GW_MAX_RETRIES}"
-        --set "processor.config.modelGateways.${model_key}.initialBackoff=${GW_INITIAL_BACKOFF}"
-        --set "processor.config.modelGateways.${model_key}.maxBackoff=${GW_MAX_BACKOFF}"
-        --set "apiserver.config.batchAPI.passThroughHeaders={Authorization,X-MaaS-Subscription}"
-    )
-
-    do_deploy_batch_gateway "${helm_args[@]}"
+    do_deploy_batch_gateway_dsc "${MAAS_ISVC_NAME}" "Authorization,X-MaaS-Subscription"
 }
 
 # ── MaaS Model Policies (MaaSModelRef + MaaSAuthPolicy + MaaSSubscription) ───
@@ -757,8 +720,8 @@ cmd_uninstall() {
     kubectl delete ratelimitpolicy batch-ratelimit -n "${BATCH_NAMESPACE}" 2>/dev/null || true
     kubectl delete authpolicy batch-auth -n "${BATCH_NAMESPACE}" 2>/dev/null || true
     kubectl delete httproute batch-route -n "${BATCH_NAMESPACE}" 2>/dev/null || true
-    kubectl delete destinationrule "${BATCH_HELM_RELEASE}-backend-tls" -n "${GATEWAY_NAMESPACE}" 2>/dev/null || true
-    helm uninstall "${BATCH_HELM_RELEASE}" -n "${BATCH_NAMESPACE}" --timeout 60s 2>/dev/null || true
+    kubectl delete destinationrule "${BATCH_INSTANCE_NAME}-backend-tls" -n "${GATEWAY_NAMESPACE}" 2>/dev/null || true
+    helm uninstall "${BATCH_INSTANCE_NAME}" -n "${BATCH_NAMESPACE}" --timeout 60s 2>/dev/null || true
     helm uninstall "${BATCH_REDIS_RELEASE}" -n "${BATCH_NAMESPACE}" --timeout 60s 2>/dev/null || true
     helm uninstall "${BATCH_POSTGRESQL_RELEASE}" -n "${BATCH_NAMESPACE}" --timeout 60s 2>/dev/null || true
     kubectl delete pvc "${BATCH_FILES_PVC_NAME}" -n "${BATCH_NAMESPACE}" 2>/dev/null || true
