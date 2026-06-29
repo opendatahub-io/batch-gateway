@@ -439,20 +439,6 @@ spec:
     - group: inference.networking.x-k8s.io
       kind: InferencePool
       name: ${POOL_NAME}
-  - matches:
-    - path:
-        type: PathPrefix
-        value: /${LLM_NS}/${ISVC_NAME}
-    filters:
-    - type: URLRewrite
-      urlRewrite:
-        path:
-          type: ReplacePrefixMatch
-          replacePrefixMatch: /
-    backendRefs:
-    - group: inference.networking.x-k8s.io
-      kind: InferencePool
-      name: ${POOL_NAME}
 EOF
 ```
 

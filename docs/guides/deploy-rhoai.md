@@ -46,7 +46,7 @@ Both the LLM route and the batch route use **kubernetesTokenReview** for authent
 
 ### 1.4 Authorization Model
 
-Model access is controlled through Kubernetes RBAC. Users need `get` permission on the specific `LLMInferenceService` resource to access a model. This is granted by creating a Role and RoleBinding in the model's namespace (see [Enabling authentication and authorization for LLM inference service](https://docs.redhat.com/en/documentation/red_hat_openshift_ai_self-managed/3.4/html/deploy_models_using_distributed_inference_with_llm-d/enabling-authentication-and-authorization-for-llm-inference-service_distributed-inference) for details).
+Model access is controlled through Kubernetes RBAC. Users need `get` permission on the specific `LLMInferenceService` resource to access a model. This is granted by creating a Role and RoleBinding in the model's namespace (see [Enabling authentication and authorization for LLM inference service](https://docs.redhat.com/en/documentation/red_hat_openshift_ai_self-managed/3.5/html/deploy_models_using_distributed_inference_with_llm-d/enabling-authentication-and-authorization-for-llm-inference-service_distributed-inference) for details).
 
 - **LLM route**: SubjectAccessReview checks if user can `get llminferenceservices/<name>` — unauthorized requests are rejected with **403**
 - **Batch route**: No authorization check — authorization is enforced by the batch-llm-route on the Internal Gateway when the processor forwards inference requests with the user's original token
@@ -287,7 +287,7 @@ oc rollout status deployment/openshift-ai-inference-openshift-default -n openshi
 
 ### 3.4 Install RHCL
 
-Follow [Red Hat Connectivity Link docs](https://docs.redhat.com/en/documentation/red_hat_connectivity_link/1.3) to install RHCL
+Follow [Red Hat Connectivity Link docs](https://docs.redhat.com/en/documentation/red_hat_connectivity_link) to install RHCL
 
 Set the variable used throughout this section:
 ```bash
@@ -476,9 +476,9 @@ oc wait datasciencecluster/default-dsc --for=jsonpath='{.status.phase}'=Ready --
 
 ### 3.6 Deploy model with llm-d
 
-Follow [deploy model doc](https://docs.redhat.com/en/documentation/red_hat_openshift_ai_self-managed/3.4/html/deploy_models_using_distributed_inference_with_llm-d/index) to deploy model with LLM-D
+Follow [deploy model doc](https://docs.redhat.com/en/documentation/red_hat_openshift_ai_self-managed/3.5/html/deploy_models_using_distributed_inference_with_llm-d/index) to deploy model with LLM-D
 
-For more examples: [kserve samples repo](https://github.com/red-hat-data-services/kserve/tree/main/docs/samples/llmisvc) (switch to the `rhoai-<version>` branch matching your RHOAI version for version-specific samples)
+For more examples: [kserve samples repo](https://github.com/red-hat-data-services/kserve/tree/rhoai-3.5/docs/samples/llmisvc) (switch to the `rhoai-<version>` branch matching your RHOAI version for version-specific samples)
 
 The following example deploys a simulated model with `LLMInferenceService`.
 
@@ -521,10 +521,13 @@ spec:
             - type: round-robin-fairness-policy
             - type: global-strict-fairness-policy
             - type: slo-deadline-ordering-policy
+            - type: utilization-detector
+              parameters:
+                queueDepthThreshold: 5
+                kvCacheUtilThreshold: 0.8
           schedulingProfiles: []
           saturationDetector:
-            queueDepthThreshold: 5
-            kvCacheUtilThreshold: 0.8
+            pluginRef: utilization-detector
           flowControl:
             maxBytes: 4294967296
             defaultRequestTTL: 30s
@@ -664,7 +667,7 @@ EOF
 
 ### 3.8 Configure TokenRateLimitPolicy for LLMInferenceService
 
-Configure per-user token rate limiting for inference requests. See [Red Hat Connectivity Link docs](https://docs.redhat.com/en/documentation/red_hat_connectivity_link/1.3) for details. The following is an example configuration.
+Configure per-user token rate limiting for inference requests. See [Red Hat Connectivity Link docs](https://docs.redhat.com/en/documentation/red_hat_connectivity_link) for details. The following is an example configuration.
 
 > **Note**: The TokenRateLimitPolicy targets the Gateway (not HTTPRoute) because LLMInferenceService dynamically generates the inference HTTPRoute name.
 
@@ -697,7 +700,7 @@ EOF
 # wait for policy to be enforced
 oc wait tokenratelimitpolicy/inference-token-limit \
     --for="condition=Enforced=true" \
-    -n openshift-ingress --timeout=120s
+    -n openshift-ingress --timeout=180s
 ```
 </details>
 
@@ -803,20 +806,6 @@ spec:
     - group: inference.networking.x-k8s.io
       kind: InferencePool
       name: ${POOL_NAME}
-  - matches:
-    - path:
-        type: PathPrefix
-        value: /${LLM_NS}/${ISVC_NAME}
-    filters:
-    - type: URLRewrite
-      urlRewrite:
-        path:
-          type: ReplacePrefixMatch
-          replacePrefixMatch: /
-    backendRefs:
-    - group: inference.networking.x-k8s.io
-      kind: InferencePool
-      name: ${POOL_NAME}
 EOF
 ```
 
@@ -874,18 +863,10 @@ EOF
 
 </details>
 
-There are two ways to deploy the batch-gateway components. Choose **one** of the following sub-sections:
-
-| | 3.9.1 LLMBatchGateway CR | 3.9.2 Helm chart |
-|---|---|---|
-| **Requires** | RHOAI with `aigateway` enabled ([3.5](#35-install-rhoai)) | `helm` CLI only |
-| **Image management** | Operator-pinned (from RHOAI release) | Manual (set per image) |
-| **Lifecycle** | Declarative CR, operator reconciles | Helm release |
-
-Both options require the same dependencies (Redis, PostgreSQL, MinIO) and produce the same result.
+The batch-gateway is deployed via the `LLMBatchGateway` CR, which is managed by the batch-gateway-operator (deployed automatically when `aigateway.batchGateway.managementState: Managed` is set in the DataScienceCluster).
 
 <details>
-<summary>Create namespace and install dependencies (required for both options)</summary>
+<summary>Create namespace and install dependencies</summary>
 
 ```bash
 oc create namespace "${BATCH_NS}" 2>/dev/null || true
@@ -995,10 +976,6 @@ oc create secret generic batch-gateway-secrets \
 
 </details>
 
-#### 3.9.1 Option A: Deploy via LLMBatchGateway CR
-
-> **Prerequisite**: The DataScienceCluster must have `aigateway.managementState: Managed` with `aigateway.batchGateway.managementState: Managed` (see [3.5](#35-install-rhoai)). This deploys the ai-gateway-operator, which in turn deploys the batch-gateway-operator.
-
 <details>
 <summary>Create LLMBatchGateway CR</summary>
 
@@ -1066,80 +1043,11 @@ oc wait llmbatchgateway/batch-gateway -n ${BATCH_NS} \
 >   fileStorage:
 >     fs:
 >       basePath: /tmp/batch-gateway
->       claimName: batch-gateway-files
+>       claimName: <your-pvc-name>
 >   ```
 >   The PVC must have `ReadWriteMany` access mode (requires NFS, CephFS, or similar).
 
 </details>
-
-#### 3.9.2 Option B: Deploy via Helm chart
-
-<details>
-<summary>Install batch-gateway with Helm</summary>
-
-```bash
-CHART_VERSION=0.2.0
-IMAGE_TAG=rhoai-3.5-ea.2
-APISERVER_REPO=quay.io/rhoai/odh-llm-d-batch-gateway-apiserver-rhel9
-PROCESSOR_REPO=quay.io/rhoai/odh-llm-d-batch-gateway-processor-rhel9
-GC_REPO=quay.io/rhoai/odh-llm-d-batch-gateway-gc-rhel9
-```
-
-```bash
-# Get model URL from the Internal Gateway service
-INTERNAL_GW_SVC=$(oc get svc -n openshift-ingress \
-    -l "gateway.networking.k8s.io/gateway-name=batch-internal-gateway" \
-    -o jsonpath='{.items[0].metadata.name}')
-MODEL_URL="http://${INTERNAL_GW_SVC}.openshift-ingress.svc.cluster.local/${LLM_NS}/${ISVC_NAME}"
-
-# Install batch-gateway from OCI chart
-helm upgrade --install batch-gateway \
-    oci://ghcr.io/llm-d-incubation/charts/batch-gateway \
-    --version ${CHART_VERSION} \
-    --namespace ${BATCH_NS} \
-    --set "apiserver.image.repository=${APISERVER_REPO}" \
-    --set "apiserver.image.tag=${IMAGE_TAG}" \
-    --set "processor.image.repository=${PROCESSOR_REPO}" \
-    --set "processor.image.tag=${IMAGE_TAG}" \
-    --set "gc.image.repository=${GC_REPO}" \
-    --set "gc.image.tag=${IMAGE_TAG}" \
-    --set "global.secretName=batch-gateway-secrets" \
-    --set "global.dbClient.type=postgresql" \
-    --set "global.fileClient.type=s3" \
-    --set "global.fileClient.s3.endpoint=http://minio.${BATCH_NS}.svc.cluster.local:9000" \
-    --set "global.fileClient.s3.region=us-east-1" \
-    --set "global.fileClient.s3.accessKeyId=${MINIO_USER}" \
-    --set "global.fileClient.s3.prefix=${MINIO_BUCKET}" \
-    --set "global.fileClient.s3.usePathStyle=true" \
-    --set "global.fileClient.s3.autoCreateBucket=true" \
-    --set "processor.config.modelGateways.${MODEL_NAME}.url=${MODEL_URL}" \
-    --set "processor.config.modelGateways.${MODEL_NAME}.requestTimeout=5m" \
-    --set "processor.config.modelGateways.${MODEL_NAME}.maxRetries=3" \
-    --set "processor.config.modelGateways.${MODEL_NAME}.initialBackoff=1s" \
-    --set "processor.config.modelGateways.${MODEL_NAME}.maxBackoff=60s" \
-    --set "processor.config.modelGateways.${MODEL_NAME}.inferenceObjective=batch-sheddable" \
-    --set apiserver.tls.enabled=true \
-    --set apiserver.tls.certManager.enabled=true \
-    --set apiserver.tls.certManager.issuerName=selfsigned-issuer \
-    --set apiserver.tls.certManager.issuerKind=ClusterIssuer \
-    --set "apiserver.tls.certManager.dnsNames={batch-gateway-apiserver,batch-gateway-apiserver.${BATCH_NS}.svc.cluster.local,localhost}"
-```
-
-> - **`modelGateways.<model>.inferenceObjective`**: The `InferenceObjective` CRD name sent as the `x-gateway-inference-objective` header. EPP uses this to assign the request to the batch priority band (priority -1, sheddable). Without this, batch requests default to priority 0 and compete equally with interactive traffic.
-> - **`modelGateways.<model>.url`**: The processor uses this URL to send inference requests. It points to the Internal Gateway's model endpoint (discovered from the Internal Gateway Service), not the external Gateway or the model server directly. The Internal Gateway enforces AuthPolicy (model access check) but not TokenRateLimitPolicy.
-> - **`passThroughHeaders`**: Defaults to `[Authorization]`, so the processor forwards the end user's bearer token on inference calls without extra configuration. Override this only if you need a different set of headers.
->
-> - **`apiserver.tls.certManager.*`**: Enables TLS for the batch API server using cert-manager. The `issuerName` must match a ClusterIssuer (e.g. `selfsigned-issuer`). The `dnsNames` should include the Service name and FQDN for TLS certificate generation. In this demo the DestinationRule (see 3.10) uses `insecureSkipVerify: true` because we use a self-signed certificate; in production, configure a trusted CA and set `insecureSkipVerify: false`.
-> - **File storage**: This example uses S3-compatible storage (MinIO). To use a PVC instead, replace the `s3` options with:
->   ```
->   --set "global.fileClient.type=fs"
->   --set "global.fileClient.fs.basePath=/tmp/batch-gateway"
->   --set "global.fileClient.fs.pvcName=batch-gateway-files"
->   ```
->   and create a PVC with `ReadWriteMany` access mode. Note that `ReadWriteMany` requires a storage class that supports RWX (e.g. NFS, CephFS, EFS). Block storage (e.g. gp2, gp3) does not support RWX.
-
-</details>
-
 
 ### 3.10 Configure HTTPRoute and Policies for Batch Gateway
 

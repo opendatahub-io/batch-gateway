@@ -303,20 +303,6 @@ spec:
     - group: inference.networking.k8s.io
       kind: InferencePool
       name: free-model
-  - matches:
-    - path:
-        type: PathPrefix
-        value: /llm/free-model
-    filters:
-    - type: URLRewrite
-      urlRewrite:
-        path:
-          type: ReplacePrefixMatch
-          replacePrefixMatch: /
-    backendRefs:
-    - group: inference.networking.k8s.io
-      kind: InferencePool
-      name: free-model
   # gold-model
   - matches:
     - path:
@@ -342,20 +328,6 @@ spec:
         path:
           type: ReplacePrefixMatch
           replacePrefixMatch: /v1/chat/completions
-    backendRefs:
-    - group: inference.networking.k8s.io
-      kind: InferencePool
-      name: gold-model
-  - matches:
-    - path:
-        type: PathPrefix
-        value: /llm/gold-model
-    filters:
-    - type: URLRewrite
-      urlRewrite:
-        path:
-          type: ReplacePrefixMatch
-          replacePrefixMatch: /
     backendRefs:
     - group: inference.networking.k8s.io
       kind: InferencePool
