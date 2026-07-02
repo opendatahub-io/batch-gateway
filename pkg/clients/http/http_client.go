@@ -29,7 +29,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	cbackoff "github.com/cenkalti/backoff/v5"
+	cbackoff "github.com/cenkalti/backoff/v6"
 	"github.com/go-logr/logr"
 	"github.com/go-resty/resty/v2"
 	"github.com/llm-d/llm-d-batch-gateway/internal/util/logging"

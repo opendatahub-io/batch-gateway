@@ -29,7 +29,7 @@ import (
 	"fmt"
 	"time"
 
-	cbackoff "github.com/cenkalti/backoff/v5"
+	cbackoff "github.com/cenkalti/backoff/v6"
 )
 
 // permanentError marks an error as non-retryable.
