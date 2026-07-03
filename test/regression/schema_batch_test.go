@@ -14,21 +14,24 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// this file contains the utility functions for the batch object
-package batch_utils
+package regression
 
 import (
-	"encoding/json"
-	"fmt"
+	"testing"
 
-	db "github.com/llm-d/llm-d-batch-gateway/internal/database/api"
-	batch_types "github.com/llm-d/llm-d-batch-gateway/internal/shared/types"
+	"github.com/llm-d/llm-d-batch-gateway/internal/shared/openai"
 )
 
-func GetJobPriorityDataFromQueueItem(item *db.BatchJobPriority) (*batch_types.BatchJobPriorityData, error) {
-	data := &batch_types.BatchJobPriorityData{}
-	if err := json.Unmarshal(item.Data, data); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal job priority data: %w", err)
-	}
-	return data, nil
+func TestSchemaCompat_Batch(t *testing.T) {
+	t.Run("Batch", func(t *testing.T) {
+		assertRoundTrip[openai.Batch](t, "batch_full.golden.json")
+	})
+
+	t.Run("ListBatchResponse", func(t *testing.T) {
+		assertRoundTrip[openai.ListBatchResponse](t, "batch_list.golden.json")
+	})
+
+	t.Run("CreateBatchRequest", func(t *testing.T) {
+		assertRoundTrip[openai.CreateBatchRequest](t, "create_batch_request.golden.json")
+	})
 }

@@ -1,4 +1,4 @@
-.PHONY: help build build-apiserver build-processor build-gc run-apiserver run-processor run-gc run-apiserver-dev run-processor-dev run-gc-dev build-release package-release publish-helm-chart generate-release test test-coverage test-coverage-func clean lint fmt vet tidy install-tools deps-get deps-verify bench check check-container-tool ci image-build image-build-apiserver image-build-processor image-build-gc test-integration test-all test-e2e test-helm dev-deploy dev-clean dev-rm-cluster pre-commit
+.PHONY: help build build-apiserver build-processor build-gc run-apiserver run-processor run-gc run-apiserver-dev run-processor-dev run-gc-dev build-release package-release publish-helm-chart generate-release test test-coverage test-coverage-func clean lint fmt vet tidy install-tools deps-get deps-verify bench check check-container-tool ci image-build image-build-apiserver image-build-processor image-build-gc test-regression test-integration test-all test-e2e test-helm dev-deploy dev-clean dev-rm-cluster pre-commit benchmark-local benchmark-local-teardown
 
 SHELL := /usr/bin/env bash
 
@@ -218,6 +218,12 @@ tidy:
 	@echo "Tidying go modules..."
 	$(GO) mod tidy
 
+## update-deps: Upgrade all dependencies to latest and tidy
+update-deps:
+	@echo "Upgrading all dependencies..."
+	$(GO) get -u ./...
+	$(GO) mod tidy
+
 ## clean: Remove build artifacts and coverage files
 clean:
 	@echo "Cleaning..."
@@ -310,15 +316,22 @@ deps-verify:
 	@echo "Verifying dependencies..."
 	$(GO) mod verify
 
-## test-integration: Run integration tests (each test spawns its own mock server)
+## test-regression: Run regression tests (API schema compat, past-bug guards)
+test-regression:
+	@echo "Running regression tests..."
+	@$(GO) test $(TEST_FLAGS) -v -count=1 ./test/regression/... || \
+		(echo "\n❌ Regression tests failed" && exit 1)
+	@echo "\n✅ Regression tests passed!"
+
+## test-integration: Run integration tests (in-process server with mock backends and external service integration, no cluster needed)
 test-integration:
 	@echo "Running integration tests..."
 	@$(GO) test -v -tags=integration ./... || \
 		(echo "\n❌ Integration tests failed" && exit 1)
 	@echo "\n✅ Integration tests passed!"
 
-## test-all: Run all tests (unit + integration)
-test-all: test test-integration
+## test-all: Run all tests (unit + regression + integration)
+test-all: test test-regression test-integration
 
 KIND_CLUSTER_NAME ?= batch-gateway-dev
 
@@ -340,12 +353,45 @@ dev-rm-cluster:
 	@kind delete cluster --name batch-gateway-dev || echo "Cluster not found or already deleted"
 	@echo "✅ Kind cluster deleted"
 
+BENCHMARK_CONTEXT ?= kind-$(KIND_CLUSTER_NAME)
+BENCHMARK_SCENARIO ?= 3
+BENCHMARK_RESULTS_DIR ?= benchmarks/results/local-run
+
+## benchmark-local: Run benchmark e2e on local Kind cluster with inference-sim (no GPU required)
+##                   Set BENCHMARK_KEEP_CLUSTER=1 to skip teardown for inspection.
+benchmark-local:
+	@kind get clusters 2>/dev/null | grep -q $(KIND_CLUSTER_NAME) || \
+		{ echo "ERROR: Kind cluster '$(KIND_CLUSTER_NAME)' not found. Run 'make dev-deploy' first."; exit 1; }
+	@$(CONTAINER_TOOL) exec $(KIND_CLUSTER_NAME)-control-plane crictl images 2>/dev/null | grep -q batch-gateway-apiserver || \
+		{ echo "ERROR: batch-gateway images not loaded in Kind. Run 'make dev-deploy' first."; exit 1; }
+	@echo "=== Benchmark local e2e (MODE=sim, scenario $(BENCHMARK_SCENARIO)) ==="
+	@echo "Step 1/4: Setting up infrastructure..."
+	@MODE=sim KUBE_CONTEXT=$(BENCHMARK_CONTEXT) SCENARIO=$(BENCHMARK_SCENARIO) BG_IMAGE_TAG=0.0.1 BG_PULL_POLICY=IfNotPresent bash benchmarks/setup.sh
+	@echo "Step 2/4: Generating prompts..."
+	@python3 benchmarks/generate_prompts.py --num-requests 50 --isl-distribution fixed --isl-mean 256 --model sim-model --multi-job --output-dir $(BENCHMARK_RESULTS_DIR)
+	@echo "Step 3/4: Running benchmark..."
+	@python3 benchmarks/benchmark.py --context $(BENCHMARK_CONTEXT) --scenarios $(BENCHMARK_SCENARIO) --model sim-model --batch-size 50 --num-jobs 1 --results-dir $(BENCHMARK_RESULTS_DIR)
+	@echo "Step 4/4: Done!"
+	@echo "Report: $(BENCHMARK_RESULTS_DIR)/report.html"
+	@echo "Metadata: $(BENCHMARK_RESULTS_DIR)/run-metadata.json"
+	@if [ -z "$(BENCHMARK_KEEP_CLUSTER)" ]; then \
+		echo "Tearing down benchmark namespace..."; \
+		KUBE_CONTEXT=$(BENCHMARK_CONTEXT) SCENARIO=$(BENCHMARK_SCENARIO) bash benchmarks/teardown.sh; \
+	else \
+		echo "Keeping cluster (BENCHMARK_KEEP_CLUSTER set). Teardown with: make benchmark-local-teardown"; \
+	fi
+
+## benchmark-local-teardown: Teardown local benchmark environment
+benchmark-local-teardown:
+	@KUBE_CONTEXT=$(BENCHMARK_CONTEXT) SCENARIO=$(BENCHMARK_SCENARIO) bash benchmarks/teardown.sh
+
 ## test-e2e: Run E2E tests against a live API server (requires TEST_BASE_URL or dev-deploy NodePort services)
 ##           Use TEST_RUN to filter tests, e.g.: make test-e2e TEST_RUN=TestE2E/Batches/Cancel/InProgress
 test-e2e:
 	@echo "Running E2E tests..."
 	@OUT=$$(mktemp); \
-	cd test/e2e && $(GO) test -v -count=1 $(if $(TEST_RUN),-run $(TEST_RUN)) ./... 2>&1 | tee $$OUT; \
+	echo "Processor observability endpoint: auto-resolved by the e2e test helpers"; \
+	cd test/e2e && $(GO) test -v -count=1 -timeout=20m $(if $(TEST_RUN),-run $(TEST_RUN)) ./... 2>&1 | tee $$OUT; \
 	TEST_EXIT=$${PIPESTATUS[0]}; \
 	PASS_COUNT=$$(grep -- '--- PASS:' $$OUT 2>/dev/null | wc -l | tr -d ' '); \
 	FAIL_COUNT=$$(grep -- '--- FAIL:' $$OUT 2>/dev/null | wc -l | tr -d ' '); \

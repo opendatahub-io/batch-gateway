@@ -20,7 +20,7 @@ jobs:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Set up Go
         uses: actions/setup-go@v6
@@ -42,5 +42,12 @@ jobs:
       - name: Run pre-commit hooks
         uses: pre-commit/action@v3.0.1
 
+      - name: Run integration tests
+        run: make test-integration
+
       - name: Lint Helm chart
-        run: helm lint charts/batch-gateway
+        run: |
+          helm lint charts/batch-gateway
+          for f in charts/batch-gateway/ci/values-*.yaml; do
+            helm lint charts/batch-gateway -f "$f"
+          done
