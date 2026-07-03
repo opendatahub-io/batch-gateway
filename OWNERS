@@ -2,18 +2,14 @@
 
 # List of usernames who may use /lgtm
 reviewers:
-  - wseaton
   - lioraron
   - yizhaodev
   - j-mok-dev
-  - RishabhSaini
   - llm-d-team
 
 # List of usernames who may use /approve
 approvers:
-  - wseaton
   - lioraron
   - yizhaodev
   - j-mok-dev
-  - RishabhSaini
   - llm-d-team

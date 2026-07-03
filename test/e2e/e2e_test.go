@@ -29,7 +29,7 @@ import (
 var (
 	testApiserverURL      = getEnvOrDefault("TEST_APISERVER_URL", "https://localhost:8000")
 	testApiserverObsURL   = getEnvOrDefault("TEST_APISERVER_OBS_URL", "http://localhost:8081")
-	testProcessorObsURL   = getEnvOrDefault("TEST_PROCESSOR_OBS_URL", "http://localhost:9090")
+	testProcessorObsURL   = getEnvOrDefault("TEST_PROCESSOR_OBS_URL", "")
 	testJaegerURL         = getEnvOrDefault("TEST_JAEGER_URL", "http://localhost:16686")
 	testTenantHeader      = getEnvOrDefault("TEST_TENANT_HEADER", "X-MaaS-Username")
 	testTenantID          = getEnvOrDefault("TEST_TENANT_ID", "default")
@@ -51,6 +51,12 @@ var (
 	testModel429        = getEnvOrDefault("TEST_MODEL_429", "sim-model-429")
 	testModelAlwaysFail = getEnvOrDefault("TEST_MODEL_ALWAYS_FAIL", "sim-model-always-fail")
 	testModelAIMD       = getEnvOrDefault("TEST_MODEL_AIMD", "sim-model-aimd")
+
+	// testSimService* hold the Kubernetes service names for the simulators.
+	// Must match VLLM_SIM_*_NAME in dev-common.sh (overridable via env).
+	testSimService     = getEnvOrDefault("TEST_SIM_SERVICE", "vllm-sim")
+	testSimService429  = getEnvOrDefault("TEST_SIM_SERVICE_429", "vllm-sim-429")
+	testSimServiceAIMD = getEnvOrDefault("TEST_SIM_SERVICE_AIMD", "vllm-sim-aimd")
 
 	// testJSONL is a valid batch input file with two requests.
 	// max_tokens is kept small so batches finish quickly. Default TEST_MODEL (sim-model)
@@ -108,6 +114,7 @@ func TestE2E(t *testing.T) {
 	t.Run("GarbageCollection", testGarbageCollection)
 	t.Run("Observability", testObservability)
 	t.Run("ProcessorGracefulShutdown", testProcessorGracefulShutdown)
+	t.Run("OrphanRecovery", testOrphanRecovery)
 	t.Run("FlowControl", testFlowControl)
 	t.Run("AIMD", testAIMD)
 	t.Run("HelmUpgrade", testHelmUpgrade)

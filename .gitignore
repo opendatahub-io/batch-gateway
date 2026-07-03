@@ -1,5 +1,13 @@
 bin/
+.build/
 .vscode/
 .claude/
 .cursor/
 .codegraph/
+.venv/
+__pycache__/
+*.pyc
+benchmarks/results/*
+!benchmarks/results/.gitkeep
+.dispatcher-port-forward.pid
+.dispatcher-sim-port-forward.pid
