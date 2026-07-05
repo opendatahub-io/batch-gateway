@@ -29,8 +29,7 @@ KUADRANT_NAMESPACE="${KUADRANT_NAMESPACE:-kuadrant-system}"
 
 OPERATOR_TYPE="${OPERATOR_TYPE:-rhoai}"    # rhoai or odh
 CUSTOM_CATALOG="${CUSTOM_CATALOG:-}"       # custom catalog image (e.g. quay.io/rhoai/rhoai-fbc-fragment:...)
-RHOAI_VERSION="${RHOAI_VERSION:-}"
-RHOAI_CHANNEL="${RHOAI_CHANNEL:-}"
+RHOAI_CHANNEL="${RHOAI_CHANNEL:-stable-3.x}"
 ODH_CHANNEL="${ODH_CHANNEL:-fast-3}"
 GATEWAY_CLASS_NAME="${GATEWAY_CLASS_NAME:-openshift-default}"
 GATEWAY_NAME="${GATEWAY_NAME:-openshift-ai-inference}"
@@ -53,11 +52,6 @@ ENABLE_FLOW_CONTROL="${ENABLE_FLOW_CONTROL:-true}"
 INTERACTIVE_FLOW_CONTROL_OBJECTIVE="${INTERACTIVE_FLOW_CONTROL_OBJECTIVE:-interactive-default}"
 BATCH_FLOW_CONTROL_OBJECTIVE="${BATCH_FLOW_CONTROL_OBJECTIVE:-batch-sheddable}"
 
-if [ -n "${RHOAI_VERSION}" ]; then
-    if ! [[ "${RHOAI_VERSION}" =~ ^[0-9]+\.[0-9]+ ]]; then
-        die "RHOAI_VERSION must be at least major.minor (e.g. 3.4 or 3.4.0), got '${RHOAI_VERSION}'."
-    fi
-fi
 # ── 1. cert-manager ─────────────────────────────────────────────────────────
 
 install_cert_manager_operator() {
@@ -348,131 +342,156 @@ EOF
     log "Red Hat Connectivity Link installed with Authorino SSL."
 }
 
-# ── 5. RHOAI / ODH operator ─────────────────────────────────────────────────
+install_connectivity_link_v1_3() {
+    local ns="${KUADRANT_NAMESPACE}"
+    local rhcl_csv="rhcl-operator.v1.3.5"
 
-# Resolve RHOAI version and channel (only called when installation is needed).
-# Queries PackageManifest (with retry), then:
-# - Version: user-provided RHOAI_VERSION, or highest from stable-X.Y / beta channels
-# - Channel: user-provided RHOAI_CHANNEL, or stable-${RHOAI_VERSION} preferred, then beta
-resolve_rhoai_info() {
-    # Fetch PackageManifest (with retry — CatalogSource READY does not guarantee
-    # PackageManifest is synced yet, especially for custom catalogs)
-    local manifest_json=""
-    local retries=0
-    local max_retries=12  # 12 × 5s = 60s
-    while [ -z "${manifest_json}" ]; do
-        if [ -n "${CUSTOM_CATALOG}" ]; then
-            local catalog_name="${OPERATOR_TYPE}-custom-catalog"
-            manifest_json=$(kubectl get packagemanifest rhods-operator \
-                -n openshift-marketplace -o json 2>/dev/null \
-                | jq --arg cs "${catalog_name}" 'select(.status.catalogSource == $cs)') || true
-        else
-            manifest_json=$(kubectl get packagemanifest rhods-operator \
-                -n openshift-marketplace -o json 2>/dev/null) || true
-        fi
-        if [ -n "${manifest_json}" ]; then
-            break
-        fi
-        retries=$((retries + 1))
-        if [ "${retries}" -ge "${max_retries}" ]; then
-            die "PackageManifest 'rhods-operator' not found after ${max_retries} attempts. Is the catalog source available?"
-        fi
-        log "PackageManifest not yet available, retrying (${retries}/${max_retries})..."
-        sleep 5
-    done
+    step "Installing Red Hat Connectivity Link 1.3.5 (pinned) in namespace '${ns}'..."
 
-    # Resolve version
-    if [ -n "${RHOAI_VERSION}" ]; then
-        log "Using user-specified RHOAI version: ${RHOAI_VERSION}"
+    if kubectl get subscription.operators.coreos.com rhcl-operator \
+        -n "${ns}" &>/dev/null 2>&1; then
+        log "Connectivity Link operator already installed. Skipping."
     else
-        local selected_csv
-        if [ -n "${RHOAI_CHANNEL}" ]; then
-            step "Deriving RHOAI version from channel ${RHOAI_CHANNEL}..."
-            selected_csv=$(echo "${manifest_json}" | jq -r --arg ch "${RHOAI_CHANNEL}" '
-                .status.channels[] | select(.name == $ch) | .currentCSV // empty') || true
-        else
-            step "Auto-detecting latest RHOAI version..."
-            # Collect CSVs from all stable-X.Y and beta channels, pick highest version.
-            # Sort: higher major.minor.patch wins; within same base version:
-            # patch (3.4.0.1) > GA (3.4.0) > pre-release (3.4.0-ea.2).
-            selected_csv=$(echo "${manifest_json}" | jq -r '
-                .status.channels[] |
-                select((.name | test("^stable-[0-9]+\\.[0-9]+$")) or .name == "beta") |
-                .currentCSV // empty' \
-                | sort -u \
-                | sed -n 's/^rhods-operator\.//p' \
-                | awk '{
-                    ver = $0
-                    split(ver, p, /[.-]/)
-                    base = sprintf("%04d%04d%04d", p[1], p[2], p[3])
-                    if (index(ver, "-") > 0) type = 0
-                    else if (split(ver, d, ".") > 3) type = 2
-                    else type = 1
-                    printf "%s.%d\t%s\n", base, type, ver
-                }' | sort | tail -1 | cut -f2) || true
-            [ -n "${selected_csv}" ] && selected_csv="rhods-operator.${selected_csv}"
-        fi
+        kubectl create namespace "${ns}" 2>/dev/null || true
 
-        RHOAI_VERSION=$(echo "${selected_csv}" | sed -n 's/^rhods-operator\.//p') || true
+        kubectl apply -f - <<EOF
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: rhcl-operator
+  namespace: ${ns}
+spec:
+  channel: stable
+  installPlanApproval: Manual
+  name: rhcl-operator
+  source: redhat-operators
+  sourceNamespace: openshift-marketplace
+  startingCSV: ${rhcl_csv}
+---
+apiVersion: operators.coreos.com/v1
+kind: OperatorGroup
+metadata:
+  name: kuadrant
+  namespace: ${ns}
+spec:
+  upgradeStrategy: Default
+EOF
 
-        if [ -n "${RHOAI_VERSION}" ]; then
-            log "Latest RHOAI version: ${RHOAI_VERSION}"
-        else
-            die "No RHOAI version found for rhods-operator."
-        fi
-    fi
-
-    # Resolve channel — prefer stable-X.Y > stable-X.x > beta
-    if [ -n "${RHOAI_CHANNEL}" ]; then
-        log "Using user-specified RHOAI channel: ${RHOAI_CHANNEL}"
-        # Validate channel exists in catalog (catches typos in user-specified values)
-        local validate_csv
-        validate_csv=$(echo "${manifest_json}" | jq -r --arg ch "${RHOAI_CHANNEL}" '
-            .status.channels[] | select(.name == $ch) | .currentCSV // empty') || true
-        if [ -z "${validate_csv}" ]; then
-            die "Channel '${RHOAI_CHANNEL}' not found in PackageManifest."
-        fi
-    else
-        step "Auto-detecting RHOAI channel for version ${RHOAI_VERSION}..."
-        local minor_ver
-        minor_ver=$(echo "${RHOAI_VERSION}" | grep -oE '^[0-9]+\.[0-9]+')
-        local major="${minor_ver%%.*}"
-        local candidates=("stable-${minor_ver}" "stable-${major}.x" "beta")
-        for candidate in "${candidates[@]}"; do
-            local csv
-            csv=$(echo "${manifest_json}" | jq -r --arg ch "${candidate}" '
-                .status.channels[] | select(.name == $ch) | .currentCSV // empty') || true
-            if [ -z "${csv}" ]; then
-                continue
+        # Approve install plans as they appear (RHCL + sub-operators)
+        step "Approving install plans for RHCL 1.3.x..."
+        local approved=0
+        for i in $(seq 1 30); do
+            local plans
+            plans=$(kubectl get installplan -n "${ns}" -o jsonpath='{range .items[?(@.spec.approved==false)]}{.metadata.name}{"\n"}{end}' 2>/dev/null)
+            if [ -n "${plans}" ]; then
+                for plan in ${plans}; do
+                    local csv_list
+                    csv_list=$(kubectl get installplan "${plan}" -n "${ns}" -o jsonpath='{.spec.clusterServiceVersionNames[*]}' 2>/dev/null)
+                    # Only approve 1.3.x plans
+                    if ! echo "${csv_list}" | grep -qE 'rhcl-operator\.v1\.3'; then
+                        log "Skipping install plan ${plan} (not RHCL 1.3.x: ${csv_list})"
+                        continue
+                    fi
+                    log "Approving install plan ${plan} (${csv_list})"
+                    kubectl patch installplan "${plan}" -n "${ns}" --type=merge -p '{"spec":{"approved":true}}'
+                    approved=$((approved + 1))
+                done
             fi
-            local csv_ver
-            csv_ver=$(echo "${csv}" | sed -n 's/^rhods-operator\.//p')
-            if [[ "${csv_ver}" == ${RHOAI_VERSION} || "${csv_ver}" == ${RHOAI_VERSION}.* || "${csv_ver}" == ${RHOAI_VERSION}-* ]]; then
-                RHOAI_CHANNEL="${candidate}"
-                log "Channel '${candidate}' provides CSV: ${csv}"
+            # Check if RHCL CSV is installed
+            local phase
+            phase=$(kubectl get csv "${rhcl_csv}" -n "${ns}" -o jsonpath='{.status.phase}' 2>/dev/null || echo "")
+            if [ "${phase}" = "Succeeded" ]; then
+                log "RHCL ${rhcl_csv} installed (approved ${approved} install plans)."
                 break
             fi
-            log "Channel '${candidate}' provides ${csv}, skipping (does not match ${RHOAI_VERSION})."
+            sleep 10
         done
-        if [ -z "${RHOAI_CHANNEL}" ]; then
-            die "No channel provides RHOAI ${RHOAI_VERSION}. Checked: ${candidates[*]}"
+
+        local phase
+        phase=$(kubectl get csv "${rhcl_csv}" -n "${ns}" -o jsonpath='{.status.phase}' 2>/dev/null || echo "")
+        if [ "${phase}" != "Succeeded" ]; then
+            die "RHCL ${rhcl_csv} not installed after 300s. Phase: ${phase}"
         fi
+
+        step "Waiting for Connectivity Link sub-operators..."
+        for deploy in authorino-operator \
+                      limitador-operator-controller-manager \
+                      dns-operator-controller-manager; do
+            wait_for_deployment "$deploy" "${ns}" 180s
+        done
     fi
 
-    # Final validation: verify the channel's CSV matches RHOAI_VERSION
-    local channel_csv
-    channel_csv=$(echo "${manifest_json}" | jq -r --arg ch "${RHOAI_CHANNEL}" '
-        .status.channels[] | select(.name == $ch) | .currentCSV // empty') || true
-    if [ -z "${channel_csv}" ]; then
-        die "Channel '${RHOAI_CHANNEL}' not found in PackageManifest."
+    # Create Kuadrant CR with retry (same logic as install_connectivity_link)
+    local kuadrant_ready=false
+    for attempt in 1 2 3; do
+        log "Waiting 30s for Kuadrant operator to register sub-operators..."
+        sleep 30
+
+        step "Creating Kuadrant CR (attempt ${attempt}/3)..."
+        kubectl apply -f - <<EOF
+apiVersion: kuadrant.io/v1beta1
+kind: Kuadrant
+metadata:
+  name: kuadrant
+  namespace: ${ns}
+spec: {}
+EOF
+
+        if kubectl wait kuadrant/kuadrant --for="condition=Ready=true" \
+            -n "${ns}" --timeout=180s 2>/dev/null; then
+            kuadrant_ready=true
+            break
+        fi
+
+        warn "Kuadrant CR not ready, force-restarting operator pod..."
+        kubectl delete kuadrant/kuadrant -n "${ns}" --ignore-not-found 2>/dev/null || true
+        kubectl delete pod -n "${ns}" -l control-plane=controller-manager,app=kuadrant --force 2>/dev/null || true
+        wait_for_deployment "kuadrant-operator-controller-manager" "${ns}" 120s
+    done
+
+    if [ "${kuadrant_ready}" != "true" ]; then
+        die "Kuadrant CR did not become ready after 3 attempts"
     fi
-    local channel_ver
-    channel_ver=$(echo "${channel_csv}" | sed -n 's/^rhods-operator\.//p')
-    if [[ "${channel_ver}" != ${RHOAI_VERSION} && "${channel_ver}" != ${RHOAI_VERSION}.* && "${channel_ver}" != ${RHOAI_VERSION}-* ]]; then
-        die "Channel '${RHOAI_CHANNEL}' provides ${channel_csv}, but RHOAI_VERSION is '${RHOAI_VERSION}'."
+
+    # Configure Authorino for authentication (SSL with OpenShift serving certs)
+    step "Configuring Authorino SSL..."
+    oc annotate svc/authorino-authorino-authorization \
+        service.beta.openshift.io/serving-cert-secret-name=authorino-server-cert \
+        -n "${ns}" --overwrite
+    sleep 2
+
+    kubectl apply -f - <<EOF
+apiVersion: operator.authorino.kuadrant.io/v1beta1
+kind: Authorino
+metadata:
+  name: authorino
+  namespace: ${ns}
+spec:
+  replicas: 1
+  clusterWide: true
+  listener:
+    tls:
+      enabled: true
+      certSecretRef:
+        name: authorino-server-cert
+  oidcServer:
+    tls:
+      enabled: false
+EOF
+
+    step "Waiting for Authorino deployment to be ready..."
+    wait_for_deployment "authorino" "${ns}" 180s
+
+    if kubectl get deployment odh-model-controller -n redhat-ods-applications &>/dev/null; then
+        step "Restarting RHOAI controllers to pick up Connectivity Link..."
+        kubectl delete pod -n redhat-ods-applications -l app=odh-model-controller 2>/dev/null || true
+        kubectl delete pod -n redhat-ods-applications -l control-plane=kserve-controller-manager 2>/dev/null || true
     fi
-    log "Validated: channel '${RHOAI_CHANNEL}' provides ${channel_csv}"
+
+    log "Red Hat Connectivity Link 1.3.5 installed (pinned) with Authorino SSL."
 }
+
+# ── 5. RHOAI / ODH operator ─────────────────────────────────────────────────
 
 create_custom_catalogsource() {
     local name="$1"
@@ -525,11 +544,13 @@ install_rhoai_operator() {
             operator_name="rhods-operator"
             namespace="redhat-ods-operator"
             catalog="redhat-operators"
+            channel="${RHOAI_CHANNEL}"
             ;;
         odh)
             operator_name="opendatahub-operator"
             namespace="opendatahub"
             catalog="community-operators"
+            channel="${ODH_CHANNEL}"
             ;;
         *)
             die "Unknown OPERATOR_TYPE: ${OPERATOR_TYPE}. Use rhoai or odh."
@@ -548,29 +569,6 @@ install_rhoai_operator() {
             log "Using custom catalog: ${CUSTOM_CATALOG}"
             create_custom_catalogsource "${custom_catalog_name}" "openshift-marketplace" "${CUSTOM_CATALOG}"
             catalog="${custom_catalog_name}"
-        fi
-
-        # Resolve version and channel
-        if [ "${OPERATOR_TYPE}" = "rhoai" ]; then
-            resolve_rhoai_info
-            channel="${RHOAI_CHANNEL}"
-        else
-            channel="${ODH_CHANNEL}"
-            # Validate ODH channel exists before creating Subscription
-            local pm_json
-            pm_json=$(kubectl get packagemanifest "${operator_name}" \
-                -n openshift-marketplace -o json 2>/dev/null) || true
-            if [ -n "${CUSTOM_CATALOG}" ] && [ -n "${pm_json}" ]; then
-                pm_json=$(echo "${pm_json}" | jq --arg cs "${custom_catalog_name}" \
-                    'select(.status.catalogSource == $cs)') || true
-            fi
-            if [ -n "${pm_json}" ]; then
-                local available_channels
-                available_channels=$(echo "${pm_json}" | jq -r '.status.channels[].name' | tr '\n' ' ') || true
-                if [ -n "${available_channels}" ] && ! echo " ${available_channels} " | grep -q " ${channel} "; then
-                    die "Channel '${channel}' not found for '${operator_name}'. Available: ${available_channels}"
-                fi
-            fi
         fi
 
         kubectl create namespace "${namespace}" 2>/dev/null || true
@@ -599,52 +597,7 @@ EOF
         wait_for_subscription "${namespace}" "${operator_name}"
     fi
 
-    # Verify installed version matches expected version (skipped when already installed and no version provided)
-    if [ "${OPERATOR_TYPE}" = "rhoai" ] && [ -n "${RHOAI_VERSION}" ]; then
-        local installed_csv
-        installed_csv=$(kubectl get subscription.operators.coreos.com "${operator_name}" \
-            -n "${namespace}" -o jsonpath='{.status.installedCSV}' 2>/dev/null || echo "")
-        if [ -z "${installed_csv}" ]; then
-            die "No installedCSV found for subscription '${operator_name}'."
-        fi
-        if [[ "${installed_csv}" != rhods-operator.${RHOAI_VERSION} && "${installed_csv}" != rhods-operator.${RHOAI_VERSION}.* && "${installed_csv}" != rhods-operator.${RHOAI_VERSION}-* ]]; then
-            die "Expected RHOAI ${RHOAI_VERSION} but installedCSV is '${installed_csv}'."
-        fi
-        log "RHOAI installedCSV: ${installed_csv}"
-    fi
 }
-
-# TODO: Remove when RHCL wasm plugin OOM issue is fixed (CONNLINK-1130).
-# RHCL 1.4.0 wasm plugin causes gateway envoy proxy to OOM at the default 1Gi
-# memory limit. Use Gateway API infrastructure.parametersRef to increase it.
-patch_gateway_memory() {
-    local gw_name="$1" gw_ns="$2" cm_name="$3"
-    if ! kubectl get gateway "${gw_name}" -n "${gw_ns}" &>/dev/null; then
-        return
-    fi
-    step "Patching Gateway '${gw_name}' memory limit to 2Gi..."
-    kubectl apply -f - <<EOF
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: ${cm_name}
-  namespace: ${gw_ns}
-data:
-  deployment: |
-    spec:
-      template:
-        spec:
-          containers:
-          - name: istio-proxy
-            resources:
-              limits:
-                memory: 2Gi
-EOF
-    kubectl patch gateway "${gw_name}" -n "${gw_ns}" --type=merge \
-        -p "{\"spec\":{\"infrastructure\":{\"parametersRef\":{\"group\":\"\",\"kind\":\"ConfigMap\",\"name\":\"${cm_name}\"}}}}"
-    log "Gateway '${gw_name}' memory limit patched to 2Gi."
-}
-
 
 apply_dsci_and_dsc() {
     local apps_namespace
@@ -869,6 +822,7 @@ EOF
         sleep 10
     done
     die "LLMInferenceService '${isvc_name}' not ready after 600s. Check operator logs."
+
 }
 
 # ── 6b. InferencePool discovery helper ──────────────────────────────────────
@@ -1298,8 +1252,15 @@ cmd_install() {
 
     install_lws_operator
     create_openshift_gateway
-    patch_gateway_memory "${GATEWAY_NAME}" "${GATEWAY_NAMESPACE}" "inference-gw-options"
-    install_connectivity_link
+
+    # TODO
+    # Pin RHCL to 1.3.x to work around wasm plugin incompatibility with Service Mesh 3.x.
+    # RHCL 1.4.x wasm plugin fails with 'allow_on_headers_stop_iteration' unknown field
+    # and causes OOM in gateway pods. Uses Manual approval to prevent auto-upgrade.
+    # Tracked by: CONNLINK-1130, https://access.redhat.com/solutions/7144055
+    # install_connectivity_link
+    install_connectivity_link_v1_3
+
     install_rhoai_operator
     apply_dsci_and_dsc
 
@@ -1310,10 +1271,8 @@ cmd_install() {
     apply_llm_token_rate_limit
 
     create_batch_internal_gateway
-    patch_gateway_memory "${BATCH_INTERNAL_GATEWAY_NAME}" "${BATCH_INTERNAL_GATEWAY_NAMESPACE}" "batch-gw-options"
     create_batch_llm_httproute
     apply_batch_llm_auth_policy
-    check_batch_internal_gateway
 
     deploy_batch_gateway_rhoai
     apply_batch_auth_policy
@@ -1333,6 +1292,7 @@ cmd_install() {
     log ""
     log "Run '$0 test' to verify."
 }
+
 
 # ── Test ──────────────────────────────────────────────────────────────────────
 
@@ -1399,16 +1359,18 @@ EOF
     local llm_url="${GATEWAY_URL}/${LLM_NAMESPACE}/${isvc_name}/v1/chat/completions"
     local inference_payload="{\"model\":\"${MODEL_NAME}\",\"messages\":[{\"role\":\"user\",\"content\":\"Hello\"}],\"max_tokens\":10}"
 
-    check_batch_internal_gateway
-
+    local test_failures=0
     run_tests "${llm_url}" "${GATEWAY_URL}" "${MODEL_NAME}" \
         "Authorization: Bearer ${token}" \
         "Authorization: Bearer ${unauth_token}" \
-        "${inference_payload}"
+        "${inference_payload}" \
+        || test_failures=$?
 
     if [ "${ENABLE_FLOW_CONTROL}" = "true" ]; then
         verify_flow_control_runtime
     fi
+
+    return "${test_failures}"
 }
 
 # ── Uninstall ────────────────────────────────────────────────────────────────
@@ -1549,7 +1511,6 @@ usage() {
     echo "Environment Variables:"
     echo "  OPERATOR_TYPE    rhoai or odh (default: rhoai)"
     echo "  CUSTOM_CATALOG    Custom catalog image for operator (creates CatalogSource)"
-    echo "  RHOAI_VERSION    RHOAI version"
     echo "  RHOAI_CHANNEL    RHOAI OLM channel"
     echo "  MODEL_NAME       Model name for simulator (default: facebook/opt-125m)"
     echo "  MODEL_REPLICAS   Number of replicas (default: 1)"

@@ -644,7 +644,6 @@ cmd_install() {
     create_batch_internal_gateway
     create_batch_llm_httproute
     apply_batch_llm_auth_policy
-    check_batch_internal_gateway
 
     deploy_batch_gateway_maas
     apply_batch_auth_policy
@@ -696,13 +695,15 @@ cmd_test() {
     local llm_url="${gw_url}/${LLM_NAMESPACE}/${MAAS_ISVC_NAME}/v1/chat/completions"
     local inference_payload="{\"model\":\"${MAAS_MODEL_NAME}\",\"messages\":[{\"role\":\"user\",\"content\":\"Hello\"}],\"max_tokens\":10}"
 
-    check_batch_internal_gateway
-
+    local test_failures=0
     run_tests "${llm_url}" "${gw_url}" "${MAAS_MODEL_NAME}" \
         "Authorization: Bearer ${api_key}" \
         "Authorization: Bearer ${unauth_api_key}" \
         "${inference_payload}" \
-        "X-MaaS-Subscription: batch-test-subscription"
+        "X-MaaS-Subscription: batch-test-subscription" \
+        || test_failures=$?
+
+    return "${test_failures}"
 }
 
 # ── Uninstall ────────────────────────────────────────────────────────────────
