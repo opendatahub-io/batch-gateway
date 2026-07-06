@@ -574,7 +574,8 @@ func ResolveModelGateways(cfg *ProcessorConfig) (*ResolvedGateways, error) {
 			models[model] = gw.InferencePoolName
 		}
 		result.Async = &inference.AsyncClientConfig{
-			Models: models,
+			Models:            models,
+			ResultPollTimeout: cfg.AsyncDispatchConfig.ResultPollTimeout,
 		}
 		return result, nil
 	}

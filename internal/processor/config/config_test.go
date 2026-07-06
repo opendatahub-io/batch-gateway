@@ -946,6 +946,9 @@ func TestResolveModelGateways_Async(t *testing.T) {
 		if resolved.Async.Models["model-b"] != "pool-b" {
 			t.Errorf("Models[model-b] = %q, want %q", resolved.Async.Models["model-b"], "pool-b")
 		}
+		if resolved.Async.ResultPollTimeout != 10*time.Second {
+			t.Errorf("ResultPollTimeout = %v, want %v", resolved.Async.ResultPollTimeout, 10*time.Second)
+		}
 	})
 
 	t.Run("sync mode does not populate Async", func(t *testing.T) {
