@@ -57,9 +57,9 @@ Batch-route has no authorization — model-level authz is enforced downstream wh
 
 | Mode | Command |
 |------|---------|
-| Auto-detect latest RHOAI (default) | `bash examples/deploy-demo/deploy-rhoai.sh install` |
-| Specific RHOAI version | `RHOAI_VERSION=3.4 bash examples/deploy-demo/deploy-rhoai.sh install` |
-| Custom RHOAI catalog | `CUSTOM_CATALOG=quay.io/rhoai/rhoai-fbc-fragment:...` <br> `bash examples/deploy-demo/deploy-rhoai.sh install` |
+| Latest stable RHOAI (default) | `bash examples/deploy-demo/deploy-rhoai.sh install` |
+| Specific RHOAI channel | `RHOAI_CHANNEL=stable-3.4 bash examples/deploy-demo/deploy-rhoai.sh install` |
+| Custom RHOAI catalog | `CUSTOM_CATALOG=quay.io/rhoai/rhoai-fbc-fragment:...` <br> `RHOAI_CHANNEL=beta bash examples/deploy-demo/deploy-rhoai.sh install` |
 | ODH instead of RHOAI | `OPERATOR_TYPE=odh bash examples/deploy-demo/deploy-rhoai.sh install` |
 
 > See [Environment Variables](#environment-variables) for common parameters.
@@ -133,8 +133,7 @@ Use that only on **ephemeral or dedicated** demo clusters. See [issue #309](http
 | `GW_MAX_BACKOFF` | `60s` | Model gateway max retry backoff |
 | `OPERATOR_TYPE` | `rhoai` | Operator type: `rhoai` or `odh` |
 | `CUSTOM_CATALOG` | — | Custom catalog image for operator (creates CatalogSource) |
-| `RHOAI_VERSION` | (auto-detected) | RHOAI version (e.g. `3.4`). Auto-detected from PackageManifest if not set |
-| `RHOAI_CHANNEL` | (auto-detected) | RHOAI OLM channel (e.g. `stable-3.4`). Auto-detected if not set |
+| `RHOAI_CHANNEL` | `stable-3.x` | RHOAI OLM channel |
 | `ODH_CHANNEL` | `fast-3` | ODH OLM channel (used when `OPERATOR_TYPE=odh`) |
 | `KUADRANT_NAMESPACE` | `kuadrant-system` | Namespace for Connectivity Link (Kuadrant) |
 | `GATEWAY_CLASS_NAME` | `openshift-default` | GatewayClass name |
