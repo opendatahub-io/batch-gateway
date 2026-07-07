@@ -133,18 +133,32 @@ ${K} -n "${NAMESPACE}" create secret generic batch-gateway-secrets \
 
 # --- PVCs ---
 log "Creating PVCs"
+if [ "${MODE}" = "sim" ]; then
+    PVC_ACCESS_MODE="ReadWriteOnce"
+else
+    PVC_ACCESS_MODE="ReadWriteMany"
+fi
 ${K} -n "${NAMESPACE}" apply -f - <<EOF
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
   name: batch-gateway-files
 spec:
-  accessModes: [ReadWriteMany]
+  accessModes: [${PVC_ACCESS_MODE}]
+  resources:
+    requests:
+      storage: 10Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: benchmark-results
+spec:
+  accessModes: [${PVC_ACCESS_MODE}]
   resources:
     requests:
       storage: 10Gi
 EOF
-${K} -n "${NAMESPACE}" apply -f "${SCRIPT_DIR}/manifests/results-pvc.yaml"
 
 # GIE (flow control) settings for sim mode scenario 4
 GIE_VERSION="${GIE_VERSION:-v1.5.0}"
@@ -274,7 +288,7 @@ VALUESEOF
         # Install EPP standalone chart
         epp_release="epp-bench"
         log "  Installing EPP (release: ${epp_release})"
-        ${H} install "${epp_release}" "${chart_dir}" \
+        ${H} upgrade --install "${epp_release}" "${chart_dir}" \
             -n "${NAMESPACE}" \
             --set "inferenceExtension.image.tag=${GIE_VERSION}" \
             --set inferenceExtension.monitoring.prometheus.auth.enabled=false \
