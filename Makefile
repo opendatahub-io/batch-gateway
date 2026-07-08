@@ -1,4 +1,4 @@
-.PHONY: help build build-apiserver build-processor build-gc run-apiserver run-processor run-gc run-apiserver-dev run-processor-dev run-gc-dev build-release package-release publish-helm-chart generate-release test test-coverage test-coverage-func clean lint fmt vet tidy install-tools deps-get deps-verify bench check check-container-tool ci image-build image-build-apiserver image-build-processor image-build-gc test-regression test-integration test-all test-e2e test-helm dev-deploy dev-clean dev-rm-cluster pre-commit benchmark-local benchmark-local-teardown
+.PHONY: help build build-apiserver build-processor build-gc run-apiserver run-processor run-gc run-apiserver-dev run-processor-dev run-gc-dev build-release package-release publish-helm-chart generate-release test test-coverage test-coverage-func clean lint fmt vet tidy install-tools deps-get deps-verify bench check check-container-tool ci image-build image-build-apiserver image-build-processor image-build-gc test-regression test-integration test-all test-e2e test-helm dev-deploy dev-clean dev-rm-cluster pre-commit benchmark-local benchmark-local-teardown benchmark-gpu benchmark-gpu-teardown
 
 SHELL := /usr/bin/env bash
 
@@ -384,6 +384,72 @@ benchmark-local:
 ## benchmark-local-teardown: Teardown local benchmark environment
 benchmark-local-teardown:
 	@KUBE_CONTEXT=$(BENCHMARK_CONTEXT) SCENARIO=$(BENCHMARK_SCENARIO) bash benchmarks/teardown.sh
+
+# GPU benchmark variables
+BENCHMARK_GPU_CONTEXT ?= $(BENCHMARK_CONTEXT)
+BENCHMARK_GPU_NAMESPACE ?= batch-bench-gpu
+BENCHMARK_GPU_SCENARIOS ?= 0 1 2 3 4
+BENCHMARK_GPU_RESULTS_DIR ?= benchmarks/results/gpu-run
+BENCHMARK_GPU_MODEL ?= Qwen/Qwen3-8B
+BENCHMARK_GPU_BATCH_SIZE ?= 3000
+BENCHMARK_GPU_NUM_JOBS ?= 3
+BENCHMARK_GPU_BURST_RATE ?= 35
+BENCHMARK_GPU_PROMPT_TOKENS ?= 256
+BENCHMARK_GPU_CYCLES ?= 4
+BENCHMARK_GPU_WARMUP ?= 2
+
+## benchmark-gpu: Run benchmark e2e on a GPU cluster (single command, unified report)
+##                Uses --managed mode: setup → benchmark → teardown per scenario in one process.
+##                Required: BENCHMARK_GPU_CONTEXT (or BENCHMARK_CONTEXT)
+##                Optional: ROUTER_REPO, PROMETHEUS_URL, BENCHMARK_GPU_SCENARIOS, BENCHMARK_GPU_NAMESPACE
+##
+##                Example:
+##                  make benchmark-gpu BENCHMARK_GPU_CONTEXT=coreweave-waldorf BENCHMARK_GPU_NAMESPACE=my-ns
+##                  # With Prometheus already port-forwarded:
+##                  make benchmark-gpu BENCHMARK_GPU_CONTEXT=coreweave-waldorf PROMETHEUS_URL=http://localhost:9090
+benchmark-gpu:
+	@if [ -z "$(BENCHMARK_GPU_CONTEXT)" ]; then \
+		echo "ERROR: BENCHMARK_GPU_CONTEXT must be set (or set BENCHMARK_CONTEXT)"; exit 1; \
+	fi
+	@echo "=== Benchmark GPU e2e (scenarios: $(BENCHMARK_GPU_SCENARIOS)) ==="
+	@echo "Context: $(BENCHMARK_GPU_CONTEXT)"
+	@echo "Namespace: $(BENCHMARK_GPU_NAMESPACE)"
+	@echo "Model: $(BENCHMARK_GPU_MODEL)"
+	@echo "Burst rate: $(BENCHMARK_GPU_BURST_RATE) req/s"
+	@echo "Batch: $(BENCHMARK_GPU_NUM_JOBS) jobs x $(BENCHMARK_GPU_BATCH_SIZE) requests"
+	@echo "Results: $(BENCHMARK_GPU_RESULTS_DIR)"
+	@rm -rf $(BENCHMARK_GPU_RESULTS_DIR)
+	python3 benchmarks/benchmark.py \
+		--managed \
+		--context $(BENCHMARK_GPU_CONTEXT) \
+		--namespace $(BENCHMARK_GPU_NAMESPACE) \
+		--scenarios $(BENCHMARK_GPU_SCENARIOS) \
+		--model $(BENCHMARK_GPU_MODEL) \
+		--batch-size $(BENCHMARK_GPU_BATCH_SIZE) \
+		--num-jobs $(BENCHMARK_GPU_NUM_JOBS) \
+		--burst-rate $(BENCHMARK_GPU_BURST_RATE) \
+		--prompt-tokens $(BENCHMARK_GPU_PROMPT_TOKENS) \
+		--cycles $(BENCHMARK_GPU_CYCLES) \
+		--warmup $(BENCHMARK_GPU_WARMUP) \
+		--results-dir $(BENCHMARK_GPU_RESULTS_DIR)
+	@echo ""
+	@echo "=== GPU Benchmark complete ==="
+	@echo "Report:  $(BENCHMARK_GPU_RESULTS_DIR)/report.html"
+	@echo "Results: $(BENCHMARK_GPU_RESULTS_DIR)/results.json"
+	@echo "Run 'make benchmark-gpu-teardown' to delete the namespace."
+
+## benchmark-gpu-teardown: Teardown GPU benchmark resources (keeps namespace for RBAC preservation)
+benchmark-gpu-teardown:
+	@KEEP_NAMESPACE=1 KUBE_CONTEXT=$(BENCHMARK_GPU_CONTEXT) SCENARIO=$(BENCHMARK_SCENARIO) NAMESPACE=$(BENCHMARK_GPU_NAMESPACE) bash benchmarks/teardown.sh
+
+## benchmark-gpu-teardown-full: Full teardown including namespace deletion (RBAC will need ArgoCD re-sync)
+benchmark-gpu-teardown-full:
+	@KUBE_CONTEXT=$(BENCHMARK_GPU_CONTEXT) SCENARIO=$(BENCHMARK_SCENARIO) NAMESPACE=$(BENCHMARK_GPU_NAMESPACE) bash benchmarks/teardown.sh
+
+# Prometheus defaults for GPU benchmarks
+PROMETHEUS_NAMESPACE ?= llm-d-monitoring
+PROMETHEUS_SERVICE ?= llmd-kube-prometheus-stack-prometheus
+PROMETHEUS_RELEASE ?= llmd-kube-prometheus-stack
 
 ## test-e2e: Run E2E tests against a live API server (requires TEST_BASE_URL or dev-deploy NodePort services)
 ##           Use TEST_RUN to filter tests, e.g.: make test-e2e TEST_RUN=TestE2E/Batches/Cancel/InProgress

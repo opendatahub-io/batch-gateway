@@ -25,6 +25,7 @@ Usage:
 
 import argparse
 import ast
+import atexit
 import csv
 import datetime
 import json
@@ -77,7 +78,7 @@ class BenchmarkConfig:
     target: str
     gpu_count: int = 1
     max_model_len: int = 4096
-    warmup_cycles: int = 1
+    warmup_cycles: int = 2
 
 
 @dataclass
@@ -109,9 +110,21 @@ class ScenarioResult:
     name: str
     phases: list = field(default_factory=list)
     batch_timeline: list = field(default_factory=list)
+    job_completion_times: dict = field(default_factory=dict)
     aimd_metrics: dict = field(default_factory=dict)
     flow_control_metrics: dict = field(default_factory=dict)
+    gpu_metrics: dict = field(default_factory=dict)
 
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+JOB_SLO_WINDOWS = {
+    "job-a": {"label": "A", "display": "30m", "seconds": 1800},
+    "job-b": {"label": "B", "display": "2h", "seconds": 7200},
+    "job-c": {"label": "C", "display": "24h", "seconds": 86400},
+}
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -165,12 +178,24 @@ def cleanup_namespace(context, namespace):
              "--replicas=0"], context, namespace, check=False)
     time.sleep(8)
 
-    # Truncate PostgreSQL
-    kubectl(["run", "--rm", "-i", "pg-nuke", "--image=postgres:16",
-             "--restart=Never", "--env=PGPASSWORD=benchmarkpw", "--",
-             "psql", "-h", "postgresql", "-U", "postgres", "-d", "batchgateway",
-             "-c", "TRUNCATE batch_items, file_items CASCADE;"],
-            context, namespace, check=False)
+    # Truncate PostgreSQL (extract password from the deployed secret)
+    try:
+        pg_url = kubectl(
+            ["get", "secret", "batch-gateway-secrets",
+             "-o", "jsonpath={.data.postgresql-url}"],
+            context, namespace, check=True)
+        import base64
+        pg_conn = base64.b64decode(pg_url).decode()
+        # Extract password from postgresql://user:pass@host/db format
+        pg_pass = pg_conn.split("://")[1].split(":")[1].split("@")[0]
+    except Exception:
+        pg_pass = ""
+    if pg_pass:
+        kubectl(["run", "--rm", "-i", "pg-nuke", "--image=postgres:16",
+                 "--restart=Never", f"--env=PGPASSWORD={pg_pass}", "--",
+                 "psql", "-h", "postgresql", "-U", "postgres", "-d", "batchgateway",
+                 "-c", "TRUNCATE batch_items, file_items CASCADE;"],
+                context, namespace, check=False)
 
     # Flush Redis
     kubectl(["run", "--rm", "-i", "redis-del", "--image=redis",
@@ -272,17 +297,71 @@ def _batch_submit_script():
     """)
 
 
+def _upload_jsonl_to_pvc(cfg, namespace, job_names):
+    """Upload JSONL files to the benchmark-results PVC via a helper pod."""
+    helper_name = "data-loader"
+    helper_yaml = textwrap.dedent(f"""\
+    apiVersion: v1
+    kind: Pod
+    metadata:
+      name: {helper_name}
+      labels:
+        batch-benchmark: "true"
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+      restartPolicy: Never
+      containers:
+        - name: loader
+          image: busybox
+          securityContext:
+            allowPrivilegeEscalation: false
+          command: ["sleep", "300"]
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: benchmark-results
+    """)
+    kubectl(["delete", "pod", helper_name, "--ignore-not-found", "--wait"],
+            cfg.context, namespace, check=False)
+    kubectl_apply(helper_yaml, cfg.context, namespace)
+    try:
+        kubectl(["wait", "pod", helper_name, "--for=condition=Ready",
+                 "--timeout=60s"], cfg.context, namespace)
+        time.sleep(2)
+
+        for name in job_names:
+            jsonl_path = cfg.results_dir / f"{name}.jsonl"
+            for attempt in range(3):
+                try:
+                    kubectl(["cp", str(jsonl_path),
+                             f"{namespace}/{helper_name}:/data/{name}.jsonl"],
+                            cfg.context, namespace=None, check=True)
+                    break
+                except subprocess.CalledProcessError:
+                    if attempt == 2:
+                        raise
+                    time.sleep(5)
+    finally:
+        kubectl(["delete", "pod", helper_name, "--ignore-not-found"],
+                cfg.context, namespace, check=False)
+
+
 def submit_batches(cfg, namespace):
-    """Submit batch jobs using pre-generated JSONL files."""
+    """Submit batch jobs using pre-generated JSONL files stored on PVC."""
     if cfg.num_jobs == 0:
         return
 
-    completion_windows = ["30m", "2h", "24h"]
-    job_names = ["job-a", "job-b", "job-c"]
+    job_names = list(JOB_SLO_WINDOWS.keys())
+    active_jobs = []
 
     for i in range(min(cfg.num_jobs, 3)):
         name = job_names[i]
-        window = completion_windows[i]
         jsonl_path = cfg.results_dir / f"{name}.jsonl"
 
         if not jsonl_path.exists():
@@ -296,7 +375,13 @@ def submit_batches(cfg, namespace):
                 "--seed", str(42 + i),
                 "--output", str(jsonl_path),
             ], check=True)
+        active_jobs.append(name)
 
+    log("  Uploading JSONL files to PVC...")
+    _upload_jsonl_to_pvc(cfg, namespace, active_jobs)
+
+    for i, name in enumerate(active_jobs):
+        window = JOB_SLO_WINDOWS[name]["display"]
         log(f"  Submitting {name} (window={window}, size={cfg.batch_size})")
         script = _batch_submit_script()
         indented = "\n".join("          " + line for line in script.splitlines())
@@ -322,11 +407,21 @@ def submit_batches(cfg, namespace):
         spec:
           backoffLimit: 0
           template:
+            metadata:
+              labels:
+                batch-benchmark: "true"
+                app.kubernetes.io/part-of: batch-gateway
             spec:
+              securityContext:
+                runAsNonRoot: true
+                runAsUser: 1000
+                fsGroup: 1000
               restartPolicy: Never
               containers:
                 - name: batch-submit
                   image: python:3.12-slim
+                  securityContext:
+                    allowPrivilegeEscalation: false
                   env:
                     - name: BATCH_GATEWAY_URL
                       value: "http://batch-gateway-apiserver:8000"
@@ -345,17 +440,10 @@ def submit_batches(cfg, namespace):
                   configMap:
                     name: {name}-script
                 - name: data
-                  configMap:
-                    name: {name}-data
+                  persistentVolumeClaim:
+                    claimName: benchmark-results
         """)
 
-        # Upload the JSONL as a ConfigMap
-        kubectl(["create", "configmap", f"{name}-data",
-                 f"--from-file={name}.jsonl={jsonl_path}"],
-                cfg.context, namespace, check=True)
-        kubectl(["label", "configmap", f"{name}-data",
-                 "batch-benchmark=true"],
-                cfg.context, namespace, check=True)
         kubectl_apply(cm_yaml, cfg.context, namespace)
         kubectl_apply(job_yaml, cfg.context, namespace)
 
@@ -371,6 +459,14 @@ def start_interactive_traffic(cfg, namespace):
         f"({cfg.warmup_cycles} warmup), "
         f"burst@{cfg.burst_rate}/s for {cfg.burst_seconds}s, "
         f"idle@{cfg.idle_rate}/s for {cfg.idle_seconds}s")
+
+    backend_kwargs = json.dumps({
+        "extras": {
+            "headers": {
+                "x-gateway-inference-objective": "interactive-default",
+            },
+        },
+    })
 
     cycle_lines = []
     for c in range(1, cfg.cycles + 1):
@@ -395,6 +491,7 @@ def start_interactive_traffic(cfg, namespace):
         f'M="{cfg.model}"',
         f'COMMON="--request-format text_completions --model $M '
         f'--data prompt_tokens={cfg.prompt_tokens},output_tokens=512 '
+        f"--backend-kwargs '{backend_kwargs}' "
         f'--processor $M --disable-console-interactive"',
         'mkdir -p /results',
     ] + cycle_lines + ['echo "=== Done ==="']
@@ -451,12 +548,21 @@ def start_batch_as_interactive_traffic(cfg, namespace):
     log(f"  Starting batch-as-interactive traffic: {total_requests} requests "
         f"at ~{rate} req/s over {total_duration}s")
 
+    backend_kwargs = json.dumps({
+        "extras": {
+            "headers": {
+                "x-gateway-inference-objective": "interactive-default",
+            },
+        },
+    })
+
     indent = " " * 14
     script_lines = [
         f'T="{cfg.target}"',
         f'M="{cfg.model}"',
         f'COMMON="--request-format text_completions --model $M '
         f'--data prompt_tokens={cfg.prompt_tokens},output_tokens=512 '
+        f"--backend-kwargs '{backend_kwargs}' "
         f'--processor $M --disable-console-interactive"',
         'mkdir -p /results',
         f'echo "=== Batch-as-interactive: {total_requests} requests at {rate} req/s ==="',
@@ -526,6 +632,30 @@ def get_batch_progress(context, namespace):
     return completed, total
 
 
+def get_per_job_progress(context, namespace):
+    """Get per-job batch progress: {job_name: {completed, total, status}}."""
+    jobs = {}
+    for name in list(JOB_SLO_WINDOWS.keys()):
+        try:
+            out = kubectl(["logs", f"job/{name}", "--tail=10"],
+                         context, namespace, check=False)
+            job_completed, job_total = 0, 0
+            status = "in_progress"
+            for line in reversed(out.split("\n")):
+                if "Terminal:" in line:
+                    status = line.split("Terminal:")[1].strip()
+                    break
+                if "completed=" in line and "/" in line.split("completed=")[1]:
+                    parts = line.split("completed=")[1].split()[0].split("/")
+                    job_completed = int(parts[0])
+                    job_total = int(parts[1])
+                    break
+            jobs[name] = {"completed": job_completed, "total": job_total, "status": status}
+        except Exception as e:
+            log(f"  DEBUG: Failed to parse progress for {name}: {e}")
+    return jobs
+
+
 def get_current_phase(context, namespace):
     """Get current guidellm phase from job logs."""
     try:
@@ -543,6 +673,7 @@ def get_current_phase(context, namespace):
 def monitor_scenario(cfg, scenario, namespace):
     """Monitor batch progress during interactive traffic, return timeline."""
     timeline = []
+    job_completion_times = {}
     start = time.time()
     total_duration = cfg.cycles * (cfg.burst_seconds + cfg.idle_seconds) + 300
 
@@ -551,6 +682,11 @@ def monitor_scenario(cfg, scenario, namespace):
 
         completed, total = get_batch_progress(cfg.context, namespace)
         phase = get_current_phase(cfg.context, namespace)
+
+        per_job = get_per_job_progress(cfg.context, namespace)
+        for jname, jinfo in per_job.items():
+            if jname not in job_completion_times and jinfo["status"] == "completed":
+                job_completion_times[jname] = round(elapsed)
 
         timeline.append({
             "elapsed": round(elapsed),
@@ -578,7 +714,7 @@ def monitor_scenario(cfg, scenario, namespace):
 
         time.sleep(10)
 
-    return timeline
+    return timeline, job_completion_times
 
 
 # ---------------------------------------------------------------------------
@@ -779,12 +915,88 @@ def parse_scenario_results(results_dir):
 # ---------------------------------------------------------------------------
 
 
+class PrometheusPortForward:
+    """Manages a kubectl port-forward to Prometheus."""
+
+    def __init__(self, context, namespace, service, local_port=9090):
+        self.context = context
+        self.namespace = namespace
+        self.service = service
+        self.local_port = local_port
+        self._process = None
+
+    def start(self):
+        cmd = [
+            "kubectl", f"--context={self.context}",
+            "-n", self.namespace,
+            "port-forward", f"svc/{self.service}",
+            f"{self.local_port}:9090",
+        ]
+        self._process = subprocess.Popen(
+            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        time.sleep(2)
+        if self._process.poll() is not None:
+            log(f"  WARNING: Prometheus port-forward failed to start (exit={self._process.returncode})")
+            self._process = None
+            return False
+        log(f"  Prometheus port-forward started (localhost:{self.local_port} → {self.service})")
+        return True
+
+    def stop(self):
+        if self._process:
+            self._process.terminate()
+            try:
+                self._process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self._process.kill()
+                self._process.wait()
+            self._process = None
+
+    @property
+    def url(self):
+        return f"http://localhost:{self.local_port}"
+
+
+_prom_port_forward = None
+
+
+def get_prometheus_url():
+    """Return the Prometheus URL, starting a port-forward if configured."""
+    global _prom_port_forward
+    if _prom_port_forward and _prom_port_forward._process:
+        return _prom_port_forward.url
+    return os.environ.get("PROMETHEUS_URL", "")
+
+
+def start_prometheus_port_forward(context, namespace, service):
+    """Start a background port-forward to Prometheus if PROMETHEUS_URL is not set."""
+    global _prom_port_forward
+    if os.environ.get("PROMETHEUS_URL"):
+        return
+    pf = PrometheusPortForward(context, namespace, service)
+    if pf.start():
+        _prom_port_forward = pf
+        os.environ["PROMETHEUS_URL"] = pf.url
+        atexit.register(stop_prometheus_port_forward)
+
+
+def stop_prometheus_port_forward():
+    """Stop the background port-forward."""
+    global _prom_port_forward
+    if _prom_port_forward:
+        _prom_port_forward.stop()
+        _prom_port_forward = None
+
+
 def query_prometheus(context, namespace, query, start_time, end_time, step="15s"):
     """Query Prometheus for time-series metrics via port-forward."""
     import urllib.request
     import urllib.parse
 
-    prom_url = os.environ.get("PROMETHEUS_URL", "http://localhost:9091")
+    prom_url = get_prometheus_url()
+    if not prom_url:
+        return []
     params = urllib.parse.urlencode({
         "query": query,
         "start": start_time.isoformat() + "Z",
@@ -804,16 +1016,17 @@ def query_prometheus(context, namespace, query, start_time, end_time, step="15s"
 
 
 def collect_gpu_metrics(context, namespace, start_time, end_time):
-    """Collect GPU utilization metrics from Prometheus (DCGM exporter)."""
+    """Collect GPU utilization metrics from Prometheus (DCGM exporter + vLLM)."""
     metrics = {}
 
-    gpu_util_query = 'avg(DCGM_FI_DEV_GPU_UTIL)'
-    results = query_prometheus(context, namespace, gpu_util_query, start_time, end_time)
+    gpu_cache_query = 'avg(vllm:gpu_cache_usage_perc)'
+    results = query_prometheus(context, namespace, gpu_cache_query, start_time, end_time)
     if results:
         values = [float(v[1]) for v in results[0].get("values", []) if v[1] != "NaN"]
         if values:
-            metrics["gpu_utilization_avg"] = sum(values) / len(values)
-            metrics["gpu_utilization_max"] = max(values)
+            metrics["gpu_cache_usage_avg"] = sum(values) / len(values)
+            metrics["gpu_cache_usage_max"] = max(values)
+            metrics["gpu_cache_usage_series"] = values
 
     running_query = 'sum(vllm:num_requests_running)'
     results = query_prometheus(context, namespace, running_query, start_time, end_time)
@@ -821,6 +1034,8 @@ def collect_gpu_metrics(context, namespace, start_time, end_time):
         values = [float(v[1]) for v in results[0].get("values", []) if v[1] != "NaN"]
         if values:
             metrics["requests_running_avg"] = sum(values) / len(values)
+            metrics["requests_running_max"] = max(values)
+            metrics["requests_running_series"] = values
 
     waiting_query = 'sum(vllm:num_requests_waiting)'
     results = query_prometheus(context, namespace, waiting_query, start_time, end_time)
@@ -828,6 +1043,7 @@ def collect_gpu_metrics(context, namespace, start_time, end_time):
         values = [float(v[1]) for v in results[0].get("values", []) if v[1] != "NaN"]
         if values:
             metrics["requests_waiting_avg"] = sum(values) / len(values)
+            metrics["requests_waiting_series"] = values
 
     return metrics
 
@@ -889,6 +1105,17 @@ def collect_flow_control_metrics(context, namespace, start_time, end_time):
             values = [float(v[1]) for v in series.get("values", []) if v[1] != "NaN"]
             if values:
                 metrics[f"queue_size_priority_{priority}_avg"] = sum(values) / len(values)
+                metrics[f"queue_size_priority_{priority}_series"] = values
+
+    # Total queue size (all priorities combined) for the chart
+    total_queue_query = 'sum(inference_extension_flow_control_queue_size)'
+    results = query_prometheus(context, namespace, total_queue_query, start_time, end_time)
+    if results:
+        values = [float(v[1]) for v in results[0].get("values", []) if v[1] != "NaN"]
+        if values:
+            metrics["flow_control_queue_size_series"] = values
+            metrics["flow_control_queue_size_avg"] = sum(values) / len(values)
+            metrics["flow_control_queue_size_max"] = max(values)
 
     return metrics
 
@@ -913,6 +1140,108 @@ def _aggregate_phases(phases, phase_filter=None):
         "errors": sum(p.errors for p in filtered),
         "error_rate": sum(p.error_rate for p in filtered) / n,
     }
+
+
+def _format_slo_completion(result):
+    """Format batch SLO as per-job actual/target with pass/fail indicators.
+
+    Returns e.g. 'A: ✓ 8m/30m<br>B: ✓ 15m/2h<br>C: ✓ 25m/24h'
+    """
+    parts = []
+    for job_name, info in JOB_SLO_WINDOWS.items():
+        label = info["label"]
+        target = info["display"]
+        if job_name in result.job_completion_times:
+            elapsed_s = result.job_completion_times[job_name]
+            passed = elapsed_s <= info["seconds"]
+            indicator = "✓" if passed else "✗"
+            actual = _format_duration(elapsed_s)
+            parts.append(f"{label}: {indicator} {actual}/{target}")
+        else:
+            parts.append(f"{label}: — /{target}")
+
+    return "<br>".join(parts)
+
+
+def _format_duration(seconds):
+    """Format seconds into human-readable duration (e.g. '8m', '1h 15m')."""
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes = seconds // 60
+    if minutes < 60:
+        return f"{minutes}m"
+    hours = minutes // 60
+    remaining_min = minutes % 60
+    if remaining_min == 0:
+        return f"{hours}h"
+    return f"{hours}h {remaining_min}m"
+
+
+def _generate_narrative(results, cfg):
+    """Auto-generate a narrative conclusion based on metric comparisons."""
+    baseline = next((r for r in results if r.scenario == 0), None)
+    ungated = next((r for r in results if r.scenario == 2), None)
+    aimd = next((r for r in results if r.scenario == 3), None)
+    fc = next((r for r in results if r.scenario == 4), None)
+
+    lines = []
+    baseline_burst = _aggregate_phases(baseline.phases, "burst") if baseline else None
+    baseline_ttft = baseline_burst["ttft_p99"] if baseline_burst else None
+
+    if baseline_ttft:
+        lines.append(f"The interactive-only baseline (S0) achieved a TTFT p99 of "
+                     f"{baseline_ttft:.0f} ms during burst phases.")
+
+    if ungated:
+        ungated_burst = _aggregate_phases(ungated.phases, "burst")
+        if ungated_burst and baseline_ttft:
+            degradation = ((ungated_burst["ttft_p99"] - baseline_ttft) / baseline_ttft) * 100
+            lines.append(f"Ungated batch (S2) degraded interactive TTFT p99 by "
+                         f"{degradation:.0f}% ({ungated_burst['ttft_p99']:.0f} ms) "
+                         f"due to uncontrolled batch competition.")
+
+    if aimd:
+        aimd_burst = _aggregate_phases(aimd.phases, "burst")
+        if aimd_burst and baseline_ttft:
+            overhead = ((aimd_burst["ttft_p99"] - baseline_ttft) / baseline_ttft) * 100
+            lines.append(f"AIMD-gated batch (S3) protected interactive TTFT p99 within "
+                         f"{overhead:.0f}% of baseline ({aimd_burst['ttft_p99']:.0f} ms) "
+                         f"using lower static concurrency (perEndpoint: 30).")
+
+    if fc:
+        fc_burst = _aggregate_phases(fc.phases, "burst")
+        if fc_burst and baseline_ttft:
+            overhead = ((fc_burst["ttft_p99"] - baseline_ttft) / baseline_ttft) * 100
+            lines.append(f"AIMD + flow control (S4) achieved the best protection at "
+                         f"{overhead:.0f}% above baseline ({fc_burst['ttft_p99']:.0f} ms) "
+                         f"with proactive Router-side batch shedding.")
+
+    # Batch completion summary with per-job SLO status
+    for r in results:
+        if r.scenario >= 2 and r.batch_timeline:
+            final = r.batch_timeline[-1]
+            completed = final.get("completed", 0)
+            total = final.get("total", 0)
+            elapsed = final.get("elapsed", 0)
+            if total > 0:
+                pct = completed / total * 100
+                if r.job_completion_times:
+                    slo_met = sum(
+                        1 for jn, jt in r.job_completion_times.items()
+                        if jt <= JOB_SLO_WINDOWS.get(jn, {}).get("seconds", float("inf"))
+                    )
+                    lines.append(
+                        f"S{r.scenario} ({r.name}) completed {pct:.0f}% of batch in "
+                        f"{_format_duration(elapsed)}, {slo_met}/{len(r.job_completion_times)} "
+                        f"jobs met their SLO windows.")
+                else:
+                    lines.append(f"S{r.scenario} ({r.name}) completed {pct:.0f}% of batch "
+                                 f"({completed}/{total}) in {_format_duration(elapsed)}.")
+
+    if not lines:
+        return "Insufficient data for narrative conclusion. Run on GPU cluster to generate."
+
+    return " ".join(lines)
 
 
 def generate_html_report(cfg, results):
@@ -950,7 +1279,7 @@ def generate_html_report(cfg, results):
                 f"<td>{idle_agg['error_rate']*100:.1f}%</td></tr>"
             )
 
-    # Build chart data for TTFT p99 comparison
+    # Build chart data for latency comparison (TTFT, TPOT, ITL)
     chart_data = []
     for result in results:
         burst_agg = _aggregate_phases(result.phases, "burst")
@@ -958,9 +1287,31 @@ def generate_html_report(cfg, results):
             chart_data.append({
                 "scenario": f"S{result.scenario}",
                 "name": result.name,
+                "ttft_p50": burst_agg["ttft_p50"],
+                "ttft_p95": burst_agg["ttft_p95"],
                 "ttft_p99": burst_agg["ttft_p99"],
+                "tpot_p50": burst_agg["tpot_p50"],
+                "tpot_p95": burst_agg["tpot_p95"],
                 "tpot_p99": burst_agg["tpot_p99"],
+                "itl_p50": burst_agg["itl_p50"],
+                "itl_p95": burst_agg["itl_p95"],
+                "itl_p99": burst_agg["itl_p99"],
+                "error_rate": burst_agg["error_rate"],
             })
+
+    # Error rate data per scenario (both burst and idle)
+    error_chart_data = []
+    for result in results:
+        burst_agg = _aggregate_phases(result.phases, "burst")
+        idle_agg = _aggregate_phases(result.phases, "idle")
+        error_chart_data.append({
+            "scenario": f"S{result.scenario}",
+            "name": result.name,
+            "burst_error_rate": burst_agg["error_rate"] * 100 if burst_agg else 0,
+            "idle_error_rate": idle_agg["error_rate"] * 100 if idle_agg else 0,
+            "burst_errors": burst_agg["errors"] if burst_agg else 0,
+            "idle_errors": idle_agg["errors"] if idle_agg else 0,
+        })
 
     timelines_json = {}
     for result in results:
@@ -992,6 +1343,99 @@ def generate_html_report(cfg, results):
                 "max": result.flow_control_metrics.get("flow_control_saturation_max", 0),
             })
 
+    # Flow control queue size data (scenario 4)
+    fc_queue_chart_data = []
+    for result in results:
+        if result.flow_control_metrics and "flow_control_queue_size_series" in result.flow_control_metrics:
+            fc_queue_chart_data.append({
+                "scenario": f"S{result.scenario}",
+                "name": result.name,
+                "series": result.flow_control_metrics["flow_control_queue_size_series"],
+                "avg": result.flow_control_metrics.get("flow_control_queue_size_avg", 0),
+                "max": result.flow_control_metrics.get("flow_control_queue_size_max", 0),
+            })
+
+    # GPU / infrastructure metrics data
+    gpu_chart_data = []
+    for result in results:
+        if result.gpu_metrics:
+            gpu_chart_data.append({
+                "scenario": f"S{result.scenario}",
+                "name": result.name,
+                "cache_series": result.gpu_metrics.get("gpu_cache_usage_series", []),
+                "running_series": result.gpu_metrics.get("requests_running_series", []),
+                "waiting_series": result.gpu_metrics.get("requests_waiting_series", []),
+                "cache_avg": result.gpu_metrics.get("gpu_cache_usage_avg", 0),
+                "running_avg": result.gpu_metrics.get("requests_running_avg", 0),
+                "waiting_avg": result.gpu_metrics.get("requests_waiting_avg", 0),
+            })
+
+    # Build summary comparison table (one row per scenario)
+    summary_rows = []
+    for result in results:
+        burst_agg = _aggregate_phases(result.phases, "burst")
+        idle_agg = _aggregate_phases(result.phases, "idle")
+
+        ttft_p99_burst = f"{burst_agg['ttft_p99']:.1f}" if burst_agg else "N/A"
+        itl_p99_burst = f"{burst_agg['itl_p99']:.1f}" if burst_agg else "N/A"
+        idle_rps = f"{idle_agg['completed'] / max(1, cfg.idle_seconds * (cfg.cycles - cfg.warmup_cycles)):.2f}" if idle_agg else "N/A"
+
+        if result.scenario <= 1:
+            batch_slo = "N/A"
+        elif result.job_completion_times:
+            batch_slo = _format_slo_completion(result)
+        elif result.batch_timeline:
+            final = result.batch_timeline[-1]
+            completed = final.get("completed", 0)
+            total = final.get("total", 0)
+            batch_slo = f"{completed}/{total}" if total > 0 else "N/A"
+        else:
+            batch_slo = "N/A"
+
+        batch_ttft_p50 = "N/A"
+        batch_phases = [p for p in result.phases if "batch" in p.phase.lower()]
+        if batch_phases:
+            batch_ttft_p50 = f"{sum(p.ttft_p50 for p in batch_phases) / len(batch_phases):.1f}"
+
+        summary_rows.append(
+            f"<tr><td>S{result.scenario} ({result.name})</td>"
+            f"<td>{ttft_p99_burst}</td>"
+            f"<td>{itl_p99_burst}</td>"
+            f"<td>{idle_rps}</td>"
+            f"<td>{batch_slo}</td>"
+            f"<td>{batch_ttft_p50}</td></tr>"
+        )
+
+    # Generate narrative conclusion
+    narrative = _generate_narrative(results, cfg)
+
+    # Compute phase bands from the first timeline that has phase data
+    phase_bands = []
+    for tl_data in timelines_json.values():
+        if tl_data and any(d.get("phase") for d in tl_data):
+            current_phase = None
+            band_start = 0
+            for point in tl_data:
+                phase = point.get("phase", "unknown")
+                phase_normalized = "burst" if "burst" in phase.lower() else (
+                    "idle" if "idle" in phase.lower() else None)
+                if phase_normalized and phase_normalized != current_phase:
+                    if current_phase:
+                        phase_bands.append({
+                            "phase": current_phase,
+                            "start": band_start,
+                            "end": point["elapsed"]
+                        })
+                    current_phase = phase_normalized
+                    band_start = point["elapsed"]
+            if current_phase:
+                phase_bands.append({
+                    "phase": current_phase,
+                    "start": band_start,
+                    "end": tl_data[-1]["elapsed"]
+                })
+            break
+
     html = textwrap.dedent(f"""\
     <!DOCTYPE html>
     <html>
@@ -1001,24 +1445,34 @@ def generate_html_report(cfg, results):
         <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-annotation@3"></script>
         <style>
             body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-                   margin: 40px; max-width: 1400px; background: #fafafa; color: #333; }}
+                   margin: 40px; max-width: 1400px; margin-left: auto; margin-right: auto;
+                   background: #fafafa; color: #333; }}
             h1 {{ color: #1a1a1a; border-bottom: 2px solid #e5e5e5; padding-bottom: 12px; }}
             h2 {{ color: #444; margin-top: 40px; }}
             .card {{ background: white; border-radius: 8px; padding: 24px; margin: 20px 0;
                     box-shadow: 0 1px 3px rgba(0,0,0,0.1); }}
+            .narrative {{ background: #f0f9ff; border-left: 4px solid #3b82f6;
+                         padding: 16px 20px; border-radius: 0 8px 8px 0; margin: 20px 0;
+                         line-height: 1.6; }}
             table {{ border-collapse: collapse; width: 100%; margin: 20px 0; }}
             th, td {{ padding: 10px 14px; text-align: left; border-bottom: 1px solid #eee; }}
             th {{ background: #f5f5f5; font-weight: 600; }}
             .chart-container {{ background: white; border-radius: 8px; padding: 20px;
                               margin: 20px 0; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }}
             .charts-grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }}
+            .charts-grid-3 {{ display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 20px; }}
             canvas {{ max-height: 350px; }}
             .metric-good {{ color: #16a34a; font-weight: 600; }}
             .metric-bad {{ color: #dc2626; font-weight: 600; }}
+            .legend-note {{ font-size: 0.85em; color: #666; margin-top: 8px; }}
         </style>
     </head>
     <body>
         <h1>Batch Gateway Benchmark Report</h1>
+
+        <div class="narrative">
+            <strong>Conclusion:</strong> {narrative}
+        </div>
 
         <div class="card">
             <h2 style="margin-top:0">Configuration</h2>
@@ -1041,6 +1495,22 @@ def generate_html_report(cfg, results):
             </table>
         </div>
 
+        <h2>Summary Comparison</h2>
+        <div class="card">
+            <p><em>Key metrics at a glance (one row per scenario). Latencies in ms.</em></p>
+            <table>
+                <tr>
+                    <th>Scenario</th>
+                    <th>Interactive TTFT p99 (burst)</th>
+                    <th>Interactive ITL p99 (burst)</th>
+                    <th>Batch idle throughput (req/s)</th>
+                    <th>Batch SLO completion</th>
+                    <th>Batch TTFT p50</th>
+                </tr>
+                {''.join(summary_rows) if summary_rows else '<tr><td colspan="6">No data collected yet</td></tr>'}
+            </table>
+        </div>
+
         <h2>Interactive Latency Comparison</h2>
         <div class="card">
             <p><em>All values in milliseconds. Lower is better.
@@ -1056,18 +1526,41 @@ def generate_html_report(cfg, results):
             </table>
         </div>
 
-        <div class="charts-grid">
+        <div class="charts-grid-3">
             <div class="chart-container">
                 <canvas id="ttftChart"></canvas>
+            </div>
+            <div class="chart-container">
+                <canvas id="itlChart"></canvas>
             </div>
             <div class="chart-container">
                 <canvas id="tpotChart"></canvas>
             </div>
         </div>
 
+        <h2>Error Rate Comparison</h2>
+        <div class="chart-container">
+            <canvas id="errorChart"></canvas>
+        </div>
+
         <h2>Batch Completion Timeline</h2>
         <div class="chart-container">
             <canvas id="timelineChart"></canvas>
+            <p class="legend-note">Shaded bands: <span style="color:#ef4444">&#9632;</span> burst phases,
+               <span style="color:#22c55e">&#9632;</span> idle phases</p>
+        </div>
+
+        <h2>Infrastructure Metrics</h2>
+        <div class="charts-grid">
+            <div class="chart-container">
+                <canvas id="gpuCacheChart"></canvas>
+            </div>
+            <div class="chart-container">
+                <canvas id="requestsRunningChart"></canvas>
+            </div>
+            <div class="chart-container">
+                <canvas id="requestsWaitingChart"></canvas>
+            </div>
         </div>
 
         <h2>AIMD Concurrency Dynamics (Scenarios 3-4)</h2>
@@ -1075,9 +1568,14 @@ def generate_html_report(cfg, results):
             <canvas id="aimdChart"></canvas>
         </div>
 
-        <h2>Flow Control Pool Saturation (Scenario 4)</h2>
-        <div class="chart-container">
-            <canvas id="flowControlChart"></canvas>
+        <h2>Flow Control (Scenario 4)</h2>
+        <div class="charts-grid">
+            <div class="chart-container">
+                <canvas id="flowControlChart"></canvas>
+            </div>
+            <div class="chart-container">
+                <canvas id="fcQueueChart"></canvas>
+            </div>
         </div>
 
         <script>
@@ -1085,49 +1583,94 @@ def generate_html_report(cfg, results):
         const timelines = {json.dumps(timelines_json)};
         const aimdData = {json.dumps(aimd_chart_data)};
         const flowControlData = {json.dumps(flow_control_chart_data)};
+        const fcQueueData = {json.dumps(fc_queue_chart_data)};
+        const gpuData = {json.dumps(gpu_chart_data)};
+        const errorData = {json.dumps(error_chart_data)};
+        const phaseBands = {json.dumps(phase_bands)};
         const colors = ['#6b7280', '#ef4444', '#f59e0b', '#3b82f6', '#22c55e', '#8b5cf6'];
 
-        // TTFT p99 bar chart
+        // TTFT bar chart (p50/p95/p99)
         if (chartData.length > 0) {{
             new Chart(document.getElementById('ttftChart'), {{
                 type: 'bar',
                 data: {{
-                    labels: chartData.map(d => d.scenario + ' (' + d.name + ')'),
-                    datasets: [{{
-                        label: 'TTFT p99 (ms) during Burst',
-                        data: chartData.map(d => d.ttft_p99),
-                        backgroundColor: colors.slice(0, chartData.length),
-                    }}]
+                    labels: chartData.map(d => d.scenario),
+                    datasets: [
+                        {{ label: 'p50', data: chartData.map(d => d.ttft_p50), backgroundColor: '#93c5fd' }},
+                        {{ label: 'p95', data: chartData.map(d => d.ttft_p95), backgroundColor: '#3b82f6' }},
+                        {{ label: 'p99', data: chartData.map(d => d.ttft_p99), backgroundColor: '#1d4ed8' }},
+                    ]
                 }},
                 options: {{
                     responsive: true,
-                    plugins: {{ title: {{ display: true, text: 'TTFT p99 During Burst (lower is better)' }} }},
+                    plugins: {{ title: {{ display: true, text: 'TTFT During Burst (ms, lower is better)' }} }},
                     scales: {{ y: {{ beginAtZero: true, title: {{ display: true, text: 'ms' }} }} }}
                 }}
             }});
         }}
 
-        // TPOT p99 bar chart
+        // ITL bar chart (p50/p95/p99)
+        if (chartData.length > 0) {{
+            new Chart(document.getElementById('itlChart'), {{
+                type: 'bar',
+                data: {{
+                    labels: chartData.map(d => d.scenario),
+                    datasets: [
+                        {{ label: 'p50', data: chartData.map(d => d.itl_p50), backgroundColor: '#86efac' }},
+                        {{ label: 'p95', data: chartData.map(d => d.itl_p95), backgroundColor: '#22c55e' }},
+                        {{ label: 'p99', data: chartData.map(d => d.itl_p99), backgroundColor: '#15803d' }},
+                    ]
+                }},
+                options: {{
+                    responsive: true,
+                    plugins: {{ title: {{ display: true, text: 'ITL During Burst (ms, lower is better)' }} }},
+                    scales: {{ y: {{ beginAtZero: true, title: {{ display: true, text: 'ms' }} }} }}
+                }}
+            }});
+        }}
+
+        // TPOT bar chart (p50/p95/p99)
         if (chartData.length > 0) {{
             new Chart(document.getElementById('tpotChart'), {{
                 type: 'bar',
                 data: {{
-                    labels: chartData.map(d => d.scenario + ' (' + d.name + ')'),
-                    datasets: [{{
-                        label: 'TPOT p99 (ms) during Burst',
-                        data: chartData.map(d => d.tpot_p99),
-                        backgroundColor: colors.slice(0, chartData.length),
-                    }}]
+                    labels: chartData.map(d => d.scenario),
+                    datasets: [
+                        {{ label: 'p50', data: chartData.map(d => d.tpot_p50), backgroundColor: '#fde68a' }},
+                        {{ label: 'p95', data: chartData.map(d => d.tpot_p95), backgroundColor: '#f59e0b' }},
+                        {{ label: 'p99', data: chartData.map(d => d.tpot_p99), backgroundColor: '#b45309' }},
+                    ]
                 }},
                 options: {{
                     responsive: true,
-                    plugins: {{ title: {{ display: true, text: 'TPOT p99 During Burst (lower is better)' }} }},
+                    plugins: {{ title: {{ display: true, text: 'TPOT During Burst (ms, lower is better)' }} }},
                     scales: {{ y: {{ beginAtZero: true, title: {{ display: true, text: 'ms' }} }} }}
                 }}
             }});
         }}
 
-        // Timeline chart
+        // Error rate comparison chart
+        if (errorData.length > 0) {{
+            new Chart(document.getElementById('errorChart'), {{
+                type: 'bar',
+                data: {{
+                    labels: errorData.map(d => d.scenario + ' (' + d.name + ')'),
+                    datasets: [
+                        {{ label: 'Burst Error Rate (%)', data: errorData.map(d => d.burst_error_rate),
+                           backgroundColor: '#fca5a5' }},
+                        {{ label: 'Idle Error Rate (%)', data: errorData.map(d => d.idle_error_rate),
+                           backgroundColor: '#fed7aa' }},
+                    ]
+                }},
+                options: {{
+                    responsive: true,
+                    plugins: {{ title: {{ display: true, text: 'Error Rate by Scenario and Phase (%)' }} }},
+                    scales: {{ y: {{ beginAtZero: true, title: {{ display: true, text: '%' }} }} }}
+                }}
+            }});
+        }}
+
+        // Timeline chart with phase bands
         const tlDatasets = [];
         let idx = 0;
         for (const [name, data] of Object.entries(timelines)) {{
@@ -1140,12 +1683,27 @@ def generate_html_report(cfg, results):
             idx++;
         }}
         if (tlDatasets.length > 0) {{
+            const annotations = {{}};
+            phaseBands.forEach((band, i) => {{
+                annotations['band' + i] = {{
+                    type: 'box',
+                    xMin: band.start,
+                    xMax: band.end,
+                    backgroundColor: band.phase === 'burst'
+                        ? 'rgba(239, 68, 68, 0.08)'
+                        : 'rgba(34, 197, 94, 0.08)',
+                    borderWidth: 0,
+                }};
+            }});
             new Chart(document.getElementById('timelineChart'), {{
                 type: 'line',
                 data: {{ datasets: tlDatasets }},
                 options: {{
                     responsive: true,
-                    plugins: {{ title: {{ display: true, text: 'Batch Requests Completed Over Time' }} }},
+                    plugins: {{
+                        title: {{ display: true, text: 'Batch Requests Completed Over Time' }},
+                        annotation: {{ annotations: annotations }}
+                    }},
                     scales: {{
                         x: {{ type: 'linear', title: {{ display: true, text: 'Time (s)' }} }},
                         y: {{ title: {{ display: true, text: 'Completed' }}, beginAtZero: true }}
@@ -1154,10 +1712,77 @@ def generate_html_report(cfg, results):
             }});
         }}
 
+        // GPU cache usage chart
+        if (gpuData.length > 0 && gpuData.some(d => d.cache_series.length > 0)) {{
+            const cacheDatasets = gpuData.filter(d => d.cache_series.length > 0).map((d, i) => ({{
+                label: d.scenario + ' (' + d.name + ') avg=' + (d.cache_avg * 100).toFixed(1) + '%',
+                data: d.cache_series.map((v, j) => ({{x: j * 15, y: v * 100}})),
+                borderColor: colors[i % colors.length],
+                fill: false, tension: 0.3, pointRadius: 0, borderWidth: 2,
+            }}));
+            new Chart(document.getElementById('gpuCacheChart'), {{
+                type: 'line',
+                data: {{ datasets: cacheDatasets }},
+                options: {{
+                    responsive: true,
+                    plugins: {{ title: {{ display: true, text: 'GPU KV Cache Usage (%)' }} }},
+                    scales: {{
+                        x: {{ type: 'linear', title: {{ display: true, text: 'Time (s)' }} }},
+                        y: {{ title: {{ display: true, text: 'Cache Usage (%)' }}, min: 0, max: 100 }}
+                    }}
+                }}
+            }});
+        }}
+
+        // Requests running chart
+        if (gpuData.length > 0 && gpuData.some(d => d.running_series.length > 0)) {{
+            const runningDatasets = gpuData.filter(d => d.running_series.length > 0).map((d, i) => ({{
+                label: d.scenario + ' (' + d.name + ') avg=' + d.running_avg.toFixed(1),
+                data: d.running_series.map((v, j) => ({{x: j * 15, y: v}})),
+                borderColor: colors[i % colors.length],
+                fill: false, tension: 0.3, pointRadius: 0, borderWidth: 2,
+            }}));
+            new Chart(document.getElementById('requestsRunningChart'), {{
+                type: 'line',
+                data: {{ datasets: runningDatasets }},
+                options: {{
+                    responsive: true,
+                    plugins: {{ title: {{ display: true, text: 'vLLM Requests Running' }} }},
+                    scales: {{
+                        x: {{ type: 'linear', title: {{ display: true, text: 'Time (s)' }} }},
+                        y: {{ title: {{ display: true, text: 'Requests' }}, beginAtZero: true }}
+                    }}
+                }}
+            }});
+        }}
+
+        // Requests waiting chart
+        if (gpuData.length > 0 && gpuData.some(d => (d.waiting_series || []).length > 0)) {{
+            const waitingDatasets = gpuData.filter(d => (d.waiting_series || []).length > 0).map((d, i) => ({{
+                label: d.scenario + ' (' + d.name + ') avg=' + (d.waiting_avg || 0).toFixed(1),
+                data: d.waiting_series.map((v, j) => ({{x: j * 15, y: v}})),
+                borderColor: colors[i % colors.length],
+                fill: false, tension: 0.3, pointRadius: 0, borderWidth: 2,
+            }}));
+            new Chart(document.getElementById('requestsWaitingChart'), {{
+                type: 'line',
+                data: {{ datasets: waitingDatasets }},
+                options: {{
+                    responsive: true,
+                    plugins: {{ title: {{ display: true, text: 'vLLM Requests Waiting (Queue Pressure)' }} }},
+                    scales: {{
+                        x: {{ type: 'linear', title: {{ display: true, text: 'Time (s)' }} }},
+                        y: {{ title: {{ display: true, text: 'Requests' }}, beginAtZero: true }}
+                    }}
+                }}
+            }});
+        }}
+
         // AIMD concurrency limit time-series chart
         if (aimdData.length > 0) {{
             const aimdDatasets = aimdData.map((d, i) => ({{
-                label: d.scenario + ' (' + d.name + ') avg=' + d.avg.toFixed(1),
+                label: d.scenario + ' (' + d.name + ') avg=' + d.avg.toFixed(1)
+                    + ' min=' + d.min.toFixed(0) + ' max=' + d.max.toFixed(0),
                 data: d.series.map((v, j) => ({{x: j * 15, y: v}})),
                 borderColor: colors[(i + 3) % colors.length],
                 fill: false, tension: 0.3, pointRadius: 0, borderWidth: 2,
@@ -1199,6 +1824,30 @@ def generate_html_report(cfg, results):
                 }}
             }});
         }}
+
+        // Flow control queue size chart
+        if (fcQueueData.length > 0) {{
+            const queueDatasets = fcQueueData.map((d, i) => ({{
+                label: d.scenario + ' (' + d.name + ') avg=' + d.avg.toFixed(1),
+                data: d.series.map((v, j) => ({{x: j * 15, y: v}})),
+                borderColor: '#7c3aed',
+                fill: true,
+                backgroundColor: 'rgba(124, 58, 237, 0.1)',
+                tension: 0.3, pointRadius: 0, borderWidth: 2,
+            }}));
+            new Chart(document.getElementById('fcQueueChart'), {{
+                type: 'line',
+                data: {{ datasets: queueDatasets }},
+                options: {{
+                    responsive: true,
+                    plugins: {{ title: {{ display: true, text: 'Flow Control Queue Size' }} }},
+                    scales: {{
+                        x: {{ type: 'linear', title: {{ display: true, text: 'Time (s)' }} }},
+                        y: {{ title: {{ display: true, text: 'Queue Depth' }}, beginAtZero: true }}
+                    }}
+                }}
+            }});
+        }}
         </script>
     </body>
     </html>
@@ -1207,6 +1856,70 @@ def generate_html_report(cfg, results):
     report_path.write_text(html)
     log(f"Report written to {report_path}")
     return report_path
+
+
+# ---------------------------------------------------------------------------
+# Managed setup/teardown (--managed mode)
+# ---------------------------------------------------------------------------
+
+
+def _managed_setup(args, scenario):
+    """Run benchmarks/setup.sh with env vars for the given scenario."""
+    namespace = _NAMESPACE_OVERRIDE or f"batch-bench-s{scenario}"
+    ghcr_user = getattr(args, "ghcr_user", None) or os.environ.get("GHCR_USER", "")
+    ghcr_token = getattr(args, "ghcr_token", None) or os.environ.get("GHCR_TOKEN", "")
+    router_repo = getattr(args, "router_repo", None) or os.environ.get("ROUTER_REPO", "")
+    prometheus_release = (
+        getattr(args, "prometheus_release", None)
+        or os.environ.get("PROMETHEUS_RELEASE", "")
+    )
+
+    env = {
+        **os.environ,
+        "SCENARIO": str(scenario),
+        "MODE": "gpu",
+        "NAMESPACE": namespace,
+        "KUBE_CONTEXT": args.context,
+        "GHCR_USER": ghcr_user,
+        "GHCR_TOKEN": ghcr_token,
+        "ROUTER_REPO": router_repo,
+        "PROMETHEUS_RELEASE": prometheus_release,
+        "PROMETHEUS_NAMESPACE": getattr(args, "prometheus_namespace", "") or "",
+    }
+
+    setup_script = str(SCRIPT_DIR / "setup.sh")
+    log(f"  [managed] Running setup.sh for scenario {scenario} in {namespace}")
+    result = subprocess.run(
+        ["bash", setup_script],
+        env=env,
+        check=False,
+    )
+    if result.returncode != 0:
+        log(f"  [managed] WARNING: setup.sh exited with code {result.returncode}")
+
+
+def _managed_teardown(args, scenario):
+    """Tear down all benchmark resources in the namespace."""
+    namespace = _NAMESPACE_OVERRIDE or f"batch-bench-s{scenario}"
+    context = args.context
+
+    log(f"  [managed] Tearing down resources in {namespace}")
+
+    teardown_commands = [
+        ["helm", f"--kube-context={context}", "uninstall", "batch-gateway", "-n", namespace],
+        ["helm", f"--kube-context={context}", "uninstall", "optimized-baseline", "-n", namespace],
+        ["helm", f"--kube-context={context}", "uninstall", "epp-bench", "-n", namespace],
+        ["kubectl", f"--context={context}", "-n", namespace, "delete", "job", "--all", "--ignore-not-found"],
+        ["kubectl", f"--context={context}", "-n", namespace, "delete", "configmap",
+         "-l", "batch-benchmark=true", "--ignore-not-found"],
+        ["kubectl", f"--context={context}", "-n", namespace, "delete", "-k",
+         str(SCRIPT_DIR / "manifests" / "vllm/"), "--ignore-not-found"],
+        ["kubectl", f"--context={context}", "-n", namespace, "delete", "gateway",
+         "llm-d-inference-gateway", "--ignore-not-found"],
+    ]
+
+    for cmd in teardown_commands:
+        subprocess.run(cmd, check=False)
 
 
 # ---------------------------------------------------------------------------
@@ -1238,6 +1951,20 @@ def run_scenario(cfg, scenario):
         kubectl(["delete", "job", "--all", "--ignore-not-found"],
                 cfg.context, namespace, check=False)
 
+    # Clean stale CSV files from results PVC to prevent cross-scenario contamination
+    kubectl(["delete", "pod", "pvc-cleaner", "--ignore-not-found"],
+            cfg.context, namespace, check=False)
+    kubectl(["run", "--rm", "-i", "pvc-cleaner", "--image=busybox",
+             "--restart=Never", "--overrides",
+             '{"spec":{"securityContext":{"runAsNonRoot":true,"runAsUser":1000,"fsGroup":1000},'
+             '"containers":[{"name":"c","image":"busybox",'
+             '"command":["sh","-c","rm -f /results/*.csv"],'
+             '"securityContext":{"allowPrivilegeEscalation":false},'
+             '"volumeMounts":[{"name":"r","mountPath":"/results"}]}],'
+             '"volumes":[{"name":"r","persistentVolumeClaim":'
+             '{"claimName":"benchmark-results"}}]}}', "--"],
+            cfg.context, namespace, check=False)
+
     # Submit batch (scenarios 2-4 only)
     if scenario >= 2:
         submit_batches(cfg, namespace)
@@ -1252,8 +1979,9 @@ def run_scenario(cfg, scenario):
     time.sleep(30)  # Let guidellm validate and start
 
     # Monitor
+    job_completion_times = {}
     if scenario >= 2:
-        timeline = monitor_scenario(cfg, scenario, namespace)
+        timeline, job_completion_times = monitor_scenario(cfg, scenario, namespace)
     else:
         # Scenarios 0-1: wait for guidellm job(s) to finish
         timeline = []
@@ -1312,9 +2040,22 @@ def run_scenario(cfg, scenario):
         if flow_control_metrics:
             log(f"  Flow control: saturation avg={flow_control_metrics.get('flow_control_saturation_avg', 0):.2f}")
 
+    # Collect GPU/infrastructure metrics for all scenarios
+    gpu_metrics = {}
+    if os.environ.get("PROMETHEUS_URL"):
+        end_time = datetime.datetime.utcfromtimestamp(time.time())
+        start_time = end_time - datetime.timedelta(seconds=cfg.cycles * (cfg.burst_seconds + cfg.idle_seconds))
+        gpu_metrics = collect_gpu_metrics(cfg.context, namespace, start_time, end_time)
+        if gpu_metrics:
+            log(f"  GPU: cache_usage avg={gpu_metrics.get('gpu_cache_usage_avg', 0) * 100:.1f}%, "
+                f"running avg={gpu_metrics.get('requests_running_avg', 0):.1f}")
+
     return ScenarioResult(scenario=scenario, name=name, phases=phases,
-                          batch_timeline=timeline, aimd_metrics=aimd_metrics,
-                          flow_control_metrics=flow_control_metrics)
+                          batch_timeline=timeline,
+                          job_completion_times=job_completion_times,
+                          aimd_metrics=aimd_metrics,
+                          flow_control_metrics=flow_control_metrics,
+                          gpu_metrics=gpu_metrics)
 
 
 # ---------------------------------------------------------------------------
@@ -1387,14 +2128,18 @@ def _aggregate_trials(trial_results):
     # Use longest timeline from any trial
     best_timeline = max((r.batch_timeline for r in trial_results), key=len, default=[])
 
-    # Use AIMD/flow-control metrics from first trial that has them
+    # Use AIMD/flow-control/GPU metrics from first trial that has them
     aimd = next((r.aimd_metrics for r in trial_results if r.aimd_metrics), {})
     fc = next((r.flow_control_metrics for r in trial_results if r.flow_control_metrics), {})
+    gpu = next((r.gpu_metrics for r in trial_results if r.gpu_metrics), {})
+    jct = next((r.job_completion_times for r in trial_results if r.job_completion_times), {})
 
     result = ScenarioResult(
         scenario=scenario, name=name,
         phases=aggregated_phases, batch_timeline=best_timeline,
+        job_completion_times=jct,
         aimd_metrics=aimd, flow_control_metrics=fc,
+        gpu_metrics=gpu,
     )
 
     # Attach variance metadata for reporting
@@ -1653,8 +2398,8 @@ def main():
                         default=bench_cfg.get("idle_seconds", 90),
                         help="Duration of idle phase (default: 90)")
     parser.add_argument("--cycles", type=int,
-                        default=bench_cfg.get("cycles", 3),
-                        help="Number of burst/idle cycles (default: 3)")
+                        default=bench_cfg.get("cycles", 4),
+                        help="Number of burst/idle cycles (default: 4)")
     parser.add_argument("--batch-size", type=int,
                         default=bench_cfg.get("batch_size", 1000),
                         help="Requests per batch job (default: 1000)")
@@ -1680,8 +2425,16 @@ def main():
                         default=int(os.environ.get("MAX_MODEL_LEN", "4096")),
                         help="vLLM max-model-len (default: 4096)")
     parser.add_argument("--warmup", type=int,
-                        default=bench_cfg.get("warmup_cycles", 1),
-                        help="Number of warmup cycles to exclude from results (default: 1)")
+                        default=bench_cfg.get("warmup_cycles", 2),
+                        help="Number of warmup cycles to exclude from results (default: 2)")
+
+    # Prometheus port-forward automation
+    parser.add_argument("--prometheus-namespace",
+                        default=os.environ.get("PROMETHEUS_NAMESPACE", "llm-d-monitoring"),
+                        help="Namespace where Prometheus is deployed (default: llm-d-monitoring)")
+    parser.add_argument("--prometheus-service",
+                        default=os.environ.get("PROMETHEUS_SERVICE", "llmd-kube-prometheus-stack-prometheus"),
+                        help="Prometheus service name (default: llmd-kube-prometheus-stack-prometheus)")
 
     # Multiple trials
     parser.add_argument("--trials", type=int, default=1,
@@ -1698,6 +2451,18 @@ def main():
                         help="Rate increment for sweep (default: 5 rps)")
     parser.add_argument("--rate-sweep-duration", type=int, default=30,
                         help="Duration per rate point in sweep mode (default: 30s)")
+
+    # Managed mode: orchestrate setup/teardown per scenario
+    parser.add_argument("--managed", action="store_true",
+                        help="Orchestrate setup/teardown per scenario internally")
+    parser.add_argument("--ghcr-user", default=None,
+                        help="GHCR username (or set GHCR_USER env)")
+    parser.add_argument("--ghcr-token", default=None,
+                        help="GHCR token (or set GHCR_TOKEN env)")
+    parser.add_argument("--router-repo", default=None,
+                        help="Router image repo (or set ROUTER_REPO env)")
+    parser.add_argument("--prometheus-release", default=None,
+                        help="Prometheus Helm release name (or set PROMETHEUS_RELEASE env)")
 
     args = parser.parse_args()
     args.results_dir.mkdir(parents=True, exist_ok=True)
@@ -1731,6 +2496,12 @@ def main():
         f"{cfg.idle_rate} req/s idle ({cfg.idle_seconds}s), {cfg.cycles} cycles")
     log(f"Batch: {cfg.num_jobs} jobs x {cfg.batch_size} requests")
     log(f"Results: {cfg.results_dir}")
+
+    # Start Prometheus port-forward if needed (for scenarios >= 3)
+    if any(s >= 3 for s in cfg.scenarios) and not os.environ.get("PROMETHEUS_URL"):
+        start_prometheus_port_forward(
+            args.context, args.prometheus_namespace, args.prometheus_service,
+        )
 
     # Validate scenarios
     for s in cfg.scenarios:
@@ -1784,9 +2555,17 @@ def main():
                     gpu_count=cfg.gpu_count, max_model_len=cfg.max_model_len,
                     warmup_cycles=cfg.warmup_cycles,
                 )
+                if args.managed:
+                    _managed_setup(args, scenario)
                 result = run_scenario(trial_cfg, scenario)
+                if args.managed:
+                    _managed_teardown(args, scenario)
             else:
+                if args.managed:
+                    _managed_setup(args, scenario)
                 result = run_scenario(cfg, scenario)
+                if args.managed:
+                    _managed_teardown(args, scenario)
             trial_results.append(result)
 
         if trials > 1:
@@ -1850,6 +2629,7 @@ def main():
             "name": result.name,
             "phases": [],
             "batch_timeline": result.batch_timeline,
+            "job_completion_times": result.job_completion_times,
             "summary": {},
         }
 
@@ -1903,7 +2683,12 @@ def main():
         if result.flow_control_metrics:
             scenario_data["flow_control"] = {
                 k: v for k, v in result.flow_control_metrics.items()
-                if k != "flow_control_saturation_series"
+                if not k.endswith("_series")
+            }
+        if result.gpu_metrics:
+            scenario_data["infrastructure"] = {
+                k: v for k, v in result.gpu_metrics.items()
+                if not k.endswith("_series")
             }
 
         structured_results["scenarios"].append(scenario_data)
@@ -1917,6 +2702,8 @@ def main():
     log(f"Report:   {cfg.results_dir / 'report.html'}")
     log(f"Metadata: {metadata_path}")
     log(f"Data:     {results_json_path}")
+
+    stop_prometheus_port_forward()
 
 
 if __name__ == "__main__":

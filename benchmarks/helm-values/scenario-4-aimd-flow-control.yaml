@@ -5,13 +5,18 @@
 # - InferenceObjective CRDs: interactive-default (100), batch-sheddable (-1)
 # - Processor sends x-gateway-inference-objective: "batch-sheddable" header
 #
+# With flow control active, the Router returns 429 for batch requests during
+# saturation. This triggers AIMD multiplicative decrease, producing the
+# expected sawtooth pattern. Lower perEndpoint (30) same as S3 for fair
+# comparison; the differentiator here is the Router's proactive 429 shedding.
+#
 # CRDs and Router overlay are deployed by setup.sh (scenario 4 block).
 processor:
   config:
     dispatchMode: sync
     concurrency:
-      global: 100
-      perEndpoint: 20
+      global: 60
+      perEndpoint: 30
       recovery: 5
       aimd:
         enabled: true
@@ -21,7 +26,7 @@ processor:
     globalInferenceGateway:
       url: "http://llm-d-inference-gateway-istio:80"
       inferenceObjective: "batch-sheddable"
-      requestTimeout: "5m"
+      requestTimeout: "30s"
       maxRetries: 3
-      initialBackoff: "2s"
-      maxBackoff: "30s"
+      initialBackoff: "1s"
+      maxBackoff: "10s"

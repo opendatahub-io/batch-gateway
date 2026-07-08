@@ -27,6 +27,9 @@ set -euo pipefail
 #   SIM_ITL            — simulated inter-token-latency (default: 20ms)
 #   BG_IMAGE_REPO      — batch-gateway image repo override
 #   BG_IMAGE_TAG       — batch-gateway image tag override
+#   BENCH_DB_PASSWORD  — PostgreSQL password (default: random 24-char string)
+#   PROMETHEUS_RELEASE — Prometheus Operator release label for ServiceMonitor discovery (default: llmd-kube-prometheus-stack)
+#   PROMETHEUS_NAMESPACE — Namespace where Prometheus is deployed (default: llm-d-monitoring)
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
@@ -46,6 +49,8 @@ LLM_D_TAG="${LLM_D_TAG:-v0.7.0}"
 SIM_IMAGE="${SIM_IMAGE:-ghcr.io/llm-d/llm-d-inference-sim:latest}"
 SIM_TTFT="${SIM_TTFT:-50ms}"
 SIM_ITL="${SIM_ITL:-20ms}"
+PROMETHEUS_RELEASE="${PROMETHEUS_RELEASE:-llmd-kube-prometheus-stack}"
+PROMETHEUS_NAMESPACE="${PROMETHEUS_NAMESPACE:-llm-d-monitoring}"
 
 # Validate required vars
 for var in KUBE_CONTEXT SCENARIO; do
@@ -81,9 +86,23 @@ log "=== Setting up scenario ${SCENARIO} in namespace ${NAMESPACE} ==="
 # Create namespace
 ${K} create namespace "${NAMESPACE}" 2>/dev/null || true
 
+# Wait for RBAC to be ready (ArgoCD may take time to apply RoleBindings)
+if [ "${MODE}" = "gpu" ]; then
+    for i in $(seq 1 60); do
+        if ${K} auth can-i create serviceaccounts -n "${NAMESPACE}" 2>/dev/null | grep -q "yes"; then
+            break
+        fi
+        if [ "$i" -eq 60 ]; then
+            echo "ERROR: RBAC not ready after 120s — cannot create ServiceAccounts in ${NAMESPACE}" >&2
+            exit 1
+        fi
+        sleep 2
+    done
+fi
+
 # --- Redis ---
 log "Installing Redis"
-${H} install redis oci://registry-1.docker.io/bitnamicharts/redis \
+${H} upgrade --install redis oci://registry-1.docker.io/bitnamicharts/redis \
     -n "${NAMESPACE}" \
     --set auth.enabled=false \
     --set master.persistence.size=1Gi \
@@ -94,10 +113,11 @@ ${H} install redis oci://registry-1.docker.io/bitnamicharts/redis \
 
 # --- PostgreSQL ---
 log "Installing PostgreSQL"
-${H} install postgresql oci://registry-1.docker.io/bitnamicharts/postgresql \
+BENCH_DB_PASSWORD="${BENCH_DB_PASSWORD:-$(head -c 32 /dev/urandom | base64 | tr -dc 'a-zA-Z0-9' | head -c 24)}"
+${H} upgrade --install postgresql oci://registry-1.docker.io/bitnamicharts/postgresql \
     -n "${NAMESPACE}" \
     --set auth.database=batchgateway \
-    --set auth.password=benchmarkpw \
+    --set auth.password="${BENCH_DB_PASSWORD}" \
     --set primary.persistence.size=5Gi \
     --set networkPolicy.enabled=false \
     --wait --timeout 120s >/dev/null
@@ -106,25 +126,39 @@ ${H} install postgresql oci://registry-1.docker.io/bitnamicharts/postgresql \
 log "Creating secrets"
 ${K} -n "${NAMESPACE}" create secret generic batch-gateway-secrets \
     --from-literal=redis-url="redis://redis-master.${NAMESPACE}.svc.cluster.local:6379" \
-    --from-literal=postgresql-url="postgresql://postgres:benchmarkpw@postgresql.${NAMESPACE}.svc.cluster.local:5432/batchgateway?sslmode=disable" \
+    --from-literal=postgresql-url="postgresql://postgres:${BENCH_DB_PASSWORD}@postgresql.${NAMESPACE}.svc.cluster.local:5432/batchgateway?sslmode=disable" \
     --from-literal=inference-api-key="" \
     --from-literal=s3-secret-access-key="" \
     2>/dev/null || true
 
 # --- PVCs ---
 log "Creating PVCs"
+if [ "${MODE}" = "sim" ]; then
+    PVC_ACCESS_MODE="ReadWriteOnce"
+else
+    PVC_ACCESS_MODE="ReadWriteMany"
+fi
 ${K} -n "${NAMESPACE}" apply -f - <<EOF
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
   name: batch-gateway-files
 spec:
-  accessModes: [ReadWriteOnce]
+  accessModes: [${PVC_ACCESS_MODE}]
+  resources:
+    requests:
+      storage: 10Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: benchmark-results
+spec:
+  accessModes: [${PVC_ACCESS_MODE}]
   resources:
     requests:
       storage: 10Gi
 EOF
-${K} -n "${NAMESPACE}" apply -f "${SCRIPT_DIR}/manifests/results-pvc.yaml"
 
 # GIE (flow control) settings for sim mode scenario 4
 GIE_VERSION="${GIE_VERSION:-v1.5.0}"
@@ -229,8 +263,8 @@ inferenceExtension:
         - type: slo-deadline-ordering-policy
         - type: utilization-detector
           parameters:
-            queueDepthThreshold: 5
-            kvCacheUtilThreshold: 0.8
+            queueDepthThreshold: 2
+            kvCacheUtilThreshold: 0.5
       flowControl:
         maxBytes: 4294967296
         defaultRequestTTL: 30s
@@ -254,7 +288,7 @@ VALUESEOF
         # Install EPP standalone chart
         epp_release="epp-bench"
         log "  Installing EPP (release: ${epp_release})"
-        ${H} install "${epp_release}" "${chart_dir}" \
+        ${H} upgrade --install "${epp_release}" "${chart_dir}" \
             -n "${NAMESPACE}" \
             --set "inferenceExtension.image.tag=${GIE_VERSION}" \
             --set inferenceExtension.monitoring.prometheus.auth.enabled=false \
@@ -308,17 +342,19 @@ else
     # Scenario 4: include flow-control overlay for priority-based scheduling
     FLOW_CONTROL_OVERLAY=""
     if [ "${SCENARIO}" = "4" ]; then
-        FLOW_CONTROL_OVERLAY="-f ${SCRIPT_DIR}/helm-values/scenario-4-flow-control-overlay.yaml"
         log "  Flow control: enabling EPP priority bands (interactive=100, batch=-1)"
     fi
 
     if [ -n "${ROUTER_REPO:-}" ]; then
+        if [ "${SCENARIO}" = "4" ]; then
+            FLOW_CONTROL_OVERLAY="-f ${SCRIPT_DIR}/helm-values/scenario-4-flow-control-overlay-router.yaml"
+        fi
         # Local repo mode (development override)
         log "  Using local repo: ROUTER_REPO=${ROUTER_REPO}"
         chart_dir="${ROUTER_REPO}/config/charts/llm-d-router-gateway"
         rm -f "${chart_dir}/Chart.lock"
         (cd "${chart_dir}" && helm dependency build >/dev/null 2>&1)
-        ${H} install "${GUIDE_NAME}" "${chart_dir}" \
+        ${H} upgrade --install "${GUIDE_NAME}" "${chart_dir}" \
             -n "${NAMESPACE}" \
             --set router.epp.replicas=1 \
             --set router.epp.image.registry=ghcr.io \
@@ -336,6 +372,9 @@ else
             --set httpRoute.create=true \
             --set httpRoute.inferenceGatewayName=llm-d-inference-gateway >/dev/null
     else
+        if [ "${SCENARIO}" = "4" ]; then
+            FLOW_CONTROL_OVERLAY="-f ${SCRIPT_DIR}/helm-values/scenario-4-flow-control-overlay.yaml"
+        fi
         # OCI mode (default — reproducible, pinned versions)
         log "  Using OCI chart: ghcr.io/llm-d/llm-d-router-gateway:${ROUTER_CHART_VERSION}"
         log "  Using llm-d guide values from tag: ${LLM_D_TAG}"
@@ -348,7 +387,7 @@ else
         curl -sL "${local_base}/guides/${GUIDE_NAME}/router/${GUIDE_NAME}.values.yaml" -o "${LLM_D_VALUES_DIR}/guide.values.yaml"
         curl -sL "${local_base}/guides/recipes/router/features/monitoring.values.yaml" -o "${LLM_D_VALUES_DIR}/monitoring.values.yaml"
 
-        ${H} install "${GUIDE_NAME}" \
+        ${H} upgrade --install "${GUIDE_NAME}" \
             oci://ghcr.io/llm-d/llm-d-router-gateway \
             --version "${ROUTER_CHART_VERSION}" \
             -n "${NAMESPACE}" \
@@ -401,7 +440,7 @@ if [ "${MODE}" = "sim" ]; then
 else
     log "Waiting for vLLM to be ready..."
     ${K} -n "${NAMESPACE}" wait pod -l llm-d.ai/role=decode \
-        --for=condition=Ready --timeout=300s >/dev/null
+        --for=condition=Ready --timeout=600s >/dev/null
 fi
 
 # --- Batch Gateway (scenarios 2-5 only) ---
@@ -497,6 +536,45 @@ fi
 if [ -n "${VALUES_FILE}" ]; then
     ${K} -n "${NAMESPACE}" rollout status deploy/batch-gateway-apiserver --timeout=60s >/dev/null
     ${K} -n "${NAMESPACE}" rollout status deploy/batch-gateway-processor --timeout=60s >/dev/null
+fi
+
+# --- Prometheus ServiceMonitor (GPU mode, scenarios >= 3) ---
+if [ "${MODE}" = "gpu" ] && [ "${SCENARIO}" -ge 3 ] && [ -n "${VALUES_FILE}" ]; then
+    log "Creating Prometheus ServiceMonitor for batch-gateway-processor"
+    ${K} -n "${NAMESPACE}" apply -f - <<EOF
+apiVersion: v1
+kind: Service
+metadata:
+  name: batch-gateway-processor-metrics
+  labels:
+    app: batch-gateway-processor
+spec:
+  selector:
+    app.kubernetes.io/component: processor
+    app.kubernetes.io/instance: batch-gateway
+  ports:
+    - name: metrics
+      port: 9090
+      targetPort: 9090
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: batch-gateway-processor
+  labels:
+    release: ${PROMETHEUS_RELEASE}
+spec:
+  namespaceSelector:
+    matchNames: ["${NAMESPACE}"]
+  selector:
+    matchLabels:
+      app: batch-gateway-processor
+  endpoints:
+    - port: metrics
+      path: /metrics
+      interval: 15s
+EOF
+    log "  ServiceMonitor created (discovery label: release=${PROMETHEUS_RELEASE})"
 fi
 
 log "=== Scenario ${SCENARIO} ready in namespace ${NAMESPACE} ==="
