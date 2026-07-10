@@ -13,7 +13,8 @@ This guide demonstrates how to deploy batch-gateway on AKS using the **batch-gat
 | Namespace | Purpose |
 |-----------|---------|
 | `istio-system` | Istio control plane (istiod) — installed by RHAIIS |
-| `redhat-ods-applications` | KServe, inference-gateway, RHAIIS controllers, LLMInferenceService, model servers, InferencePool, EPP, batch-gateway-operator — installed by RHAIIS + kustomize |
+| `redhat-ods-applications` | KServe, inference-gateway, RHAIIS controllers, batch-gateway-operator — installed by RHAIIS + kustomize |
+| `llm` | LLMInferenceService, model servers, InferencePool, EPP, InferenceObjective CRDs |
 | `redhat-ods-operator` | RHAI operator — installed by RHAIIS |
 | `cert-manager` | cert-manager — installed by RHAIIS |
 | `kuadrant-system` | Kuadrant operator, Authorino, Limitador |
@@ -111,7 +112,7 @@ kubectl get pods -n redhat-ods-operator
 <details>
 <summary>Patch inference-gateway to allow routes from labeled namespaces</summary>
 
-By default, the RHAIIS inference-gateway only allows HTTPRoutes from `redhat-ods-applications` (`allowedRoutes.namespaces.from: Same`). Batch-gateway needs to attach routes from the `batch-api` namespace. Use a label selector to restrict attachment to explicitly labeled namespaces only:
+By default, the RHAIIS inference-gateway only allows HTTPRoutes from `redhat-ods-applications` (`allowedRoutes.namespaces.from: Same`). Batch-gateway needs to attach routes from the `batch-api` namespace, and model workloads live in the `llm` namespace. Use a label selector to restrict attachment to explicitly labeled namespaces only:
 
 ```bash
 # Build a patch for all listeners on the gateway
@@ -131,7 +132,7 @@ kubectl patch gateway inference-gateway -n redhat-ods-applications --type='json'
 kubectl label namespace redhat-ods-applications llm-d.ai/gateway-route=true --overwrite
 ```
 
-> The `batch-api` namespace is labeled later in step 3.5 when it is created.
+> The `llm` namespace is labeled in step 3.2 when the model is deployed. The `batch-api` namespace is labeled later in step 3.5 when it is created.
 
 
 > **Security**: Only namespaces with the `llm-d.ai/gateway-route: "true"` label can attach HTTPRoutes to the inference-gateway. This is the same pattern used by the batch-gateway Helm deployment (`deploy-k8s.md`). On RHOAI (OpenShift), this patch is not needed because all batch-gateway HTTPRoutes are deployed in the same namespace as the gateway.
@@ -193,9 +194,12 @@ The following example deploys a simulated model with `LLMInferenceService`.
 <summary>Deploy a simulated model with LLMInferenceService</summary>
 
 ```bash
-LLM_NS=redhat-ods-applications
+LLM_NS=llm
 MODEL_NAME="facebook/opt-125m"
 ISVC_NAME=$(echo "${MODEL_NAME}" | tr '/' '-' | tr '[:upper:]' '[:lower:]')
+
+kubectl create namespace "${LLM_NS}" 2>/dev/null || true
+kubectl label namespace "${LLM_NS}" llm-d.ai/gateway-route=true --overwrite
 
 kubectl apply -f - <<EOF
 apiVersion: serving.kserve.io/v1alpha1
@@ -454,7 +458,7 @@ The batch processor routes inference requests through a separate, ClusterIP-only
 
 Set the variables used throughout this section (re-set them if starting a new shell):
 ```bash
-LLM_NS=redhat-ods-applications
+LLM_NS=llm
 BATCH_NS=batch-api
 MODEL_NAME="facebook/opt-125m"
 ISVC_NAME=$(echo "${MODEL_NAME}" | tr '/' '-' | tr '[:upper:]' '[:lower:]')
@@ -571,9 +575,6 @@ kubectl wait --for=condition=Programmed --timeout=300s \
 <summary>Create batch-llm-route (HTTPRoute on Internal Gateway)</summary>
 
 ```bash
-# Label namespace for gateway access
-kubectl label namespace "${LLM_NS}" llm-d.ai/gateway-route=true --overwrite
-
 # Discover the workload service owned by the LLMInferenceService
 WORKLOAD_SVC=$(kubectl get svc -n ${LLM_NS} \
     -l "app.kubernetes.io/name=${ISVC_NAME},app.kubernetes.io/component=llminferenceservice-workload" \
@@ -967,7 +968,7 @@ EOF
 
 Set the variables used throughout this section (these were defined during installation — re-set them if starting a new shell):
 ```bash
-LLM_NS=redhat-ods-applications
+LLM_NS=llm
 BATCH_NS=batch-api
 MODEL_NAME="facebook/opt-125m"
 ISVC_NAME=$(echo "${MODEL_NAME}" | tr '/' '-' | tr '[:upper:]' '[:lower:]')
