@@ -380,6 +380,8 @@ EOF
 
 Apply authentication, authorization, and token rate limiting for direct inference requests via the inference-gateway.
 
+> **Rate limiting identity**: Authorino rules use `auth.identity.user.username`, but Kuadrant's wasm-shim rate limit counters use a flattened path (`auth.identity.username`). Each AuthPolicy that backs a RateLimitPolicy or TokenRateLimitPolicy must expose identity via a `response.success.filters.identity` block (below).
+
 <details>
 <summary>Apply AuthPolicy on inference-gateway</summary>
 
@@ -423,6 +425,14 @@ spec:
               expression: request.path.split("/")[2]
             verb:
               value: get
+    response:
+      success:
+        filters:
+          identity:
+            json:
+              properties:
+                username:
+                  selector: auth.identity.user.username
 EOF
 
 kubectl wait authpolicy/inference-gateway-auth \
@@ -457,7 +467,7 @@ spec:
       when:
       - predicate: request.path.endsWith("/v1/chat/completions")
       counters:
-      - expression: auth.identity.user.username
+      - expression: auth.identity.username
 EOF
 
 # Wait for policy to be enforced
@@ -945,6 +955,14 @@ spec:
         kubernetesTokenReview:
           audiences:
           - https://kubernetes.default.svc
+    response:
+      success:
+        filters:
+          identity:
+            json:
+              properties:
+                username:
+                  selector: auth.identity.user.username
 EOF
 ```
 
@@ -972,7 +990,7 @@ spec:
       - limit: 20
         window: 1m
       counters:
-      - expression: auth.identity.user.username
+      - expression: auth.identity.username
 EOF
 ```
 
@@ -1382,6 +1400,7 @@ Enable [Azure Monitor managed service for Prometheus](https://learn.microsoft.co
 | Batch requests return 403 | User lacks RBAC on `llminferenceservices` | Create Role/RoleBinding for `get llminferenceservices/<isvc-name>` |
 | Curl returns 000 (timeout) | External IP not routable from workstation | Port-forward: `kubectl port-forward svc/inference-gateway-istio -n redhat-ods-applications 8080:80` |
 | TokenRateLimitPolicy not Enforced | No HTTPRoutes attached to target gateway | Create HTTPRoute first, policy enforces automatically |
+| RateLimitPolicy `Enforced=True` but no 429 | Wasm-shim cannot resolve `auth.identity` for rate limit counters (check gateway logs for `NoSuchKey("identity")`); ratelimit `failureMode: allow` passes traffic through | Add `response.success.filters.identity` to the AuthPolicy (see [§3.4](#34-configure-authpolicy-and-tokenratelimitpolicy-for-inference-gateway)) and use `auth.identity.username` (not `auth.identity.user.username`) in RateLimitPolicy/TokenRateLimitPolicy counters |
 
 ## 8. Helm Install (Alternative)
 
