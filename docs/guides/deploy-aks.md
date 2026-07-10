@@ -195,11 +195,24 @@ The following example deploys a simulated model with `LLMInferenceService`.
 
 ```bash
 LLM_NS=llm   # any user-defined namespace; label it llm-d.ai/gateway-route=true below
+RHAIIS_NS=redhat-ods-applications
 MODEL_NAME="facebook/opt-125m"
 ISVC_NAME=$(echo "${MODEL_NAME}" | tr '/' '-' | tr '[:upper:]' '[:lower:]')
 
 kubectl create namespace "${LLM_NS}" 2>/dev/null || true
 kubectl label namespace "${LLM_NS}" llm-d.ai/gateway-route=true --overwrite
+
+# RHAIIS creates rhai-pull-secret in ${RHAIIS_NS}. Copy it into ${LLM_NS} so the
+# storage-initializer init container (triggered by hf:// model URIs) and workload
+# pods can pull quay.io/rhoai images.
+kubectl create secret generic rhai-pull-secret \
+  --namespace="${LLM_NS}" \
+  --type=kubernetes.io/dockerconfigjson \
+  --from-literal=.dockerconfigjson="$(
+    kubectl get secret rhai-pull-secret -n "${RHAIIS_NS}" \
+      -o jsonpath='{.data.\.dockerconfigjson}' | base64 -d
+  )" \
+  --dry-run=client -o yaml | kubectl apply -f -
 
 kubectl apply -f - <<EOF
 apiVersion: serving.kserve.io/v1alpha2
@@ -300,6 +313,8 @@ kubectl wait llminferenceservice/${ISVC_NAME} -n ${LLM_NS} \
 ```
 
 > **Key annotation**: `security.opendatahub.io/enable-auth: "true"` enables the Gateway-level AuthPolicy that uses SubjectAccessReview to check if the user has RBAC permission to `get` the specific `LLMInferenceService` resource.
+
+> **Pull secret**: The `hf://` model URI triggers a `storage-initializer` init container that pulls `quay.io/rhoai/odh-kserve-storage-initializer-rhel9`. Copy `rhai-pull-secret` into `${LLM_NS}` before applying the CR (run the full §3.2 block in one shell so `RHAIIS_NS` and `LLM_NS` are set). Without it, pods fail with `Init:ImagePullBackOff` / `401 UNAUTHORIZED`.
 
 > **Flow control config**: The `scheduler.config.inline` EndpointPickerConfig enables the `flowControl` feature gate with two priority bands: interactive (priority 100, round-robin fairness, FCFS ordering) and batch (priority -1, sheddable, SLO-deadline ordering). The `saturationDetector` monitors backend queue depth and KV-cache utilization to trigger head-of-line blocking when the system is saturated. See [1.6 Flow Control](#16-flow-control) for details.
 
@@ -1352,6 +1367,7 @@ Enable [Azure Monitor managed service for Prometheus](https://learn.microsoft.co
 | Symptom | Cause | Resolution |
 |---------|-------|------------|
 | RHAIIS pods `ImagePullBackOff` | Pull secret missing registry credentials | Check `~/pull-secret.txt` covers all registries (see [rhai-on-xks-chart README](https://github.com/opendatahub-io/odh-gitops/blob/main/charts/rhai-on-xks-chart/README.md)) |
+| Model pods `Init:ImagePullBackOff` in `llm` | `rhai-pull-secret` not copied into model namespace | Copy secret from `redhat-ods-applications` before applying the CR (see [§3.2](#32-deploy-model-with-llminferenceservice)); delete pods to retry |
 | `inference-gateway` not Programmed | Istio not ready | `kubectl get pods -n istio-system` and check Sail Operator |
 | `LLMInferenceService` stuck | Controller not ready or missing CRDs | `kubectl logs -n redhat-ods-applications -l app=llmisvc-controller-manager` |
 | `LLMBatchGateway` CR not accepted | CRD not installed | `kubectl get pods -n redhat-ods-applications -l app.kubernetes.io/name=llm-d-batch-gateway-operator`; verify operator is running |
