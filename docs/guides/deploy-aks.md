@@ -1169,11 +1169,40 @@ done
 
 ## 5. AKS-Specific Considerations
 
+This section documents AKS platform differences that apply regardless of install method (operator or Helm).
+
+### Gateway Networking
+
+Gateway Services on AKS provision an Azure Load Balancer. For internal-only clusters, annotate the relevant Service:
+
+**Operator path (this guide):**
+
+```bash
+kubectl annotate svc inference-gateway-istio -n ${RHAIIS_NS} \
+  service.beta.kubernetes.io/azure-load-balancer-internal=true --overwrite
+```
+
+**Helm path:** annotate `istio-gateway-istio` in `istio-ingress` — see [§8 Helm Install](#8-helm-install-alternative).
+
+Clients access the gateway from within the VNet (peered networks, VPN, ExpressRoute).
+
 ### File Storage
 
-AKS default storage classes (`managed-csi`, `managed-premium`) only support `ReadWriteOnce`. If you prefer Azure Files over MinIO:
+AKS default storage classes (`managed-csi`, `managed-premium`) are block storage and only support `ReadWriteOnce`. The batch-gateway requires shared access across apiserver, processor, and gc pods when using filesystem storage.
 
-1. Pre-create a storage account and file share:
+**Option A — S3-compatible (recommended):** Use MinIO as documented in [§3.5](#35-install-batch-gateway). No AKS-specific changes required.
+
+**Option B — Azure Files with pre-created storage account:** The built-in `azurefile-csi` and `azurefile-csi-premium` StorageClasses will fail if the subscription enforces HTTPS-only on storage accounts (the CSI driver creates accounts with HTTP enabled, which violates the policy). Pre-create the storage account and file share, then reference them via a static PV.
+
+1. Register the storage provider (if not already registered):
+
+```bash
+az provider register --namespace Microsoft.Storage
+az provider show --namespace Microsoft.Storage --query "registrationState" -o tsv
+# Wait until: Registered
+```
+
+2. Create a storage account and file share:
 
 ```bash
 az storage account create \
@@ -1192,9 +1221,63 @@ az storage share-rm create \
   --quota 100
 ```
 
-2. Create a Kubernetes secret and PV/PVC (see [deploy-k8s.md §5 File Storage](deploy-k8s.md#file-storage) for full instructions).
+3. Create a Kubernetes secret with the storage account key:
 
-3. Update the `LLMBatchGateway` CR to use filesystem storage:
+```bash
+STORAGE_KEY=$(az storage account keys list \
+  --account-name <storage-account-name> \
+  --resource-group <aks-resource-group> \
+  --query "[0].value" -o tsv)
+
+kubectl create secret generic azure-files-secret \
+  --namespace batch-api \
+  --from-literal=azurestorageaccountname=<storage-account-name> \
+  --from-literal=azurestorageaccountkey="$STORAGE_KEY"
+```
+
+4. Create PV and PVC:
+
+```bash
+kubectl apply -f - <<EOF
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: batch-gateway-files-pv
+spec:
+  capacity:
+    storage: 100Gi
+  accessModes:
+    - ReadWriteMany
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: ""
+  csi:
+    driver: file.csi.azure.com
+    volumeHandle: <storage-account-name>-batch-gateway
+    volumeAttributes:
+      shareName: batch-gateway
+    nodeStageSecretRef:
+      name: azure-files-secret
+      namespace: batch-api
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: batch-gateway-files
+  namespace: batch-api
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: ""
+  resources:
+    requests:
+      storage: 100Gi
+  volumeName: batch-gateway-files-pv
+EOF
+```
+
+5. Configure batch-gateway to use the PVC:
+
+**Operator path** — update the `LLMBatchGateway` CR:
 
 ```yaml
 spec:
@@ -1204,14 +1287,51 @@ spec:
       claimName: batch-gateway-files
 ```
 
-### Internal Load Balancer
+**Helm path** — see [§8 Helm Install](#8-helm-install-alternative).
 
-For clusters that should not expose the Gateway externally, annotate the Gateway's Service:
+### Monitoring CRDs
+
+The llm-d simulated-accelerators values enable `PodMonitor` resources. AKS clusters do not ship the Prometheus Operator CRDs by default. These options apply to the [Helm install path](#8-helm-install-alternative).
+
+**Option A — Install only the CRDs** (charts deploy successfully; no scraping):
 
 ```bash
-kubectl annotate svc inference-gateway-istio -n ${RHAIIS_NS} \
-  service.beta.kubernetes.io/azure-load-balancer-internal=true --overwrite
+kubectl apply --server-side -f \
+  https://raw.githubusercontent.com/prometheus-operator/prometheus-operator/main/example/prometheus-operator-crd/monitoring.coreos.com_podmonitors.yaml
+kubectl apply --server-side -f \
+  https://raw.githubusercontent.com/prometheus-operator/prometheus-operator/main/example/prometheus-operator-crd/monitoring.coreos.com_servicemonitors.yaml
 ```
+
+**Option B — Install the full Prometheus Operator** (CRDs + metric scraping):
+
+```bash
+helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+helm upgrade --install kube-prometheus-stack prometheus-community/kube-prometheus-stack \
+  --namespace monitoring --create-namespace
+```
+
+**Option C — Enable AKS managed Prometheus** (Azure Monitor):
+
+Enable [Azure Monitor managed service for Prometheus](https://learn.microsoft.com/en-us/azure/azure-monitor/essentials/prometheus-metrics-overview) on the cluster. This supports PodMonitor/ServiceMonitor CRDs natively.
+
+**Option D — Disable monitoring** (skip PodMonitor entirely):
+
+```bash
+# InferencePool (GAIE)
+--set inferenceExtension.monitoring.prometheus.enabled=false
+
+# ModelService
+--set decode.monitoring.podmonitor.enabled=false \
+--set prefill.monitoring.podmonitor.enabled=false
+```
+
+### AKS Known Issues
+
+| Issue | Impact | Workaround |
+|-------|--------|------------|
+| GC pod reports `0/1 Ready` (v0.1.0 only) | Startup probe misconfiguration; fixed in later versions | Upgrade to v0.2.0+, or ignore — no functional impact |
+| `azurefile-csi` / `azurefile-csi-premium` PVC provisioning fails | Subscription policy requires HTTPS-only storage accounts; CSI driver creates accounts without HTTPS | Pre-create storage account with `--https-only true` (see File Storage Option B above) |
+| `Microsoft.Storage` provider not registered | `az storage account create` returns `SubscriptionNotFound` | Run `az provider register --namespace Microsoft.Storage` and wait for `Registered` state |
 
 ## 6. Differences from RHOAI Guide
 
@@ -1227,18 +1347,60 @@ kubectl annotate svc inference-gateway-istio -n ${RHAIIS_NS} \
 | TLS certificates | OpenShift serving certs | cert-manager (installed by RHAIIS) |
 | Gateway hostname | DNS-based (`llm-inference.apps.<domain>`) | IP-based (LoadBalancer external IP) |
 
-## Troubleshooting
+## 7. Troubleshooting
 
 | Symptom | Cause | Resolution |
 |---------|-------|------------|
-| RHAIIS pods `ImagePullBackOff` | Pull secret missing registry credentials | Check `~/pull-secret.txt` covers all registries (see RHAIIS guide step 4b) |
+| RHAIIS pods `ImagePullBackOff` | Pull secret missing registry credentials | Check `~/pull-secret.txt` covers all registries (see [rhai-on-xks-chart README](https://github.com/opendatahub-io/odh-gitops/blob/main/charts/rhai-on-xks-chart/README.md)) |
 | `inference-gateway` not Programmed | Istio not ready | `kubectl get pods -n istio-system` and check Sail Operator |
 | `LLMInferenceService` stuck | Controller not ready or missing CRDs | `kubectl logs -n redhat-ods-applications -l app=llmisvc-controller-manager` |
 | `LLMBatchGateway` CR not accepted | CRD not installed | `kubectl get pods -n redhat-ods-applications -l app.kubernetes.io/name=llm-d-batch-gateway-operator`; verify operator is running |
 | Gateway unreachable externally | AKS internal LB or NSG rules | Use `kubectl port-forward` or allowlist your IP |
+| Gateway unreachable from client | Internal LB; client outside VNet | Access from within the VNet or use an in-cluster test pod |
+| Pods `Pending` on PVC | Dynamic provisioning failed (HTTPS policy or wrong storage class) | Use pre-created storage account ([§5 File Storage](#file-storage) Option B) or MinIO/S3 (Option A) |
+| PVC mount fails with `No such file or directory` | File share does not exist in the storage account | Create it with `az storage share-rm create --resource-group <rg> --storage-account <name> --name batch-gateway` |
+| PVC mount fails | AKS block storage doesn't support RWX | Use MinIO/S3 (recommended) or Azure Files with pre-created storage account |
+| File upload returns S3 error | `s3-secret-access-key` does not match `MINIO_ROOT_PASSWORD` | Recreate the `batch-gateway-secrets` secret with matching credentials |
 | Pods `CrashLoopBackOff` with URL parse error | Special characters in `postgresql-url` | URL-encode the password in the connection string |
 | `inference-gateway-istio` OOMKilled | Kuadrant wasm plugin exceeds default 1Gi memory | Increase memory to 2Gi in the `inference-gateway-config` ConfigMap (`data.deployment` → `containers[].resources.limits.memory`) and wait for rollout — do not patch the deployment directly, the Istio gateway controller will revert it |
 | Batch requests return 403 | User lacks RBAC on `llminferenceservices` | Create Role/RoleBinding for `get llminferenceservices/<isvc-name>` |
 | Curl returns 000 (timeout) | External IP not routable from workstation | Port-forward: `kubectl port-forward svc/inference-gateway-istio -n redhat-ods-applications 8080:80` |
-| PVC mount fails | AKS block storage doesn't support RWX | Use MinIO/S3 (recommended) or Azure Files with pre-created storage account |
 | TokenRateLimitPolicy not Enforced | No HTTPRoutes attached to target gateway | Create HTTPRoute first, policy enforces automatically |
+
+## 8. Helm Install (Alternative)
+
+This guide uses the **batch-gateway operator** on RHAIIS. For AKS deployments using open-source **Helm charts** instead (llm-d stack + batch-gateway Helm chart, without RHAIIS), follow [deploy-k8s.md](deploy-k8s.md).
+
+Apply the AKS platform considerations in [§5](#5-aks-specific-considerations) when following the Helm guide — especially gateway networking (`istio-gateway-istio` in `istio-ingress`), file storage, and monitoring CRDs.
+
+### Internal Load Balancer (Helm path)
+
+```bash
+kubectl annotate svc istio-gateway-istio -n istio-ingress \
+  service.beta.kubernetes.io/azure-load-balancer-internal=true --overwrite
+```
+
+### File Storage (Helm path)
+
+After creating the Azure Files PV/PVC in [§5 File Storage](#file-storage), install batch-gateway with:
+
+```bash
+helm upgrade --install batch-gateway ./charts/batch-gateway \
+  --namespace batch-api \
+  --set global.fileClient.type=fs \
+  --set global.fileClient.fs.basePath=/tmp/batch-gateway \
+  --set global.fileClient.fs.pvcName=batch-gateway-files \
+  # ... remaining flags per deploy-k8s.md §3.7
+```
+
+### OCI Chart Registry
+
+The published OCI chart is available at `oci://ghcr.io/llm-d-incubation/charts/batch-gateway`. Use this as an alternative to the local chart path when deploying without a source checkout:
+
+```bash
+helm upgrade --install batch-gateway \
+  oci://ghcr.io/llm-d-incubation/charts/batch-gateway \
+  --version 0.2.0 \
+  --namespace batch-api \
+  # ... same --set flags as deploy-k8s.md §3.7
+```
