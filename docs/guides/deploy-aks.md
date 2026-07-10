@@ -1,6 +1,6 @@
 # Batch Gateway on AKS with RHAIIS (Operator-based)
 
-This guide demonstrates how to deploy batch-gateway on AKS using the **batch-gateway operator** on top of [RHAIIS](https://silver-adventure-qmlnoqj.pages.github.io/guides/rhaii-on-xks-installation/), using [Kuadrant](https://kuadrant.io/) for authentication, authorization, and rate limiting.
+This guide demonstrates how to deploy batch-gateway on AKS using the **batch-gateway operator** on top of [RHAIIS](https://github.com/opendatahub-io/odh-gitops/blob/main/charts/rhai-on-xks-chart/README.md), using [Kuadrant](https://kuadrant.io/) for authentication, authorization, and rate limiting.
 
 > **Note**: The batch gateway does not depend on Kuadrant. This guide uses Kuadrant for gateway-level auth and rate limiting, but any policy engine that works with Gateway API can be used instead.
 
@@ -14,7 +14,7 @@ This guide demonstrates how to deploy batch-gateway on AKS using the **batch-gat
 |-----------|---------|
 | `istio-system` | Istio control plane (istiod) — installed by RHAIIS |
 | `redhat-ods-applications` | KServe, inference-gateway, RHAIIS controllers, batch-gateway-operator — installed by RHAIIS + kustomize |
-| `llm` | LLMInferenceService, model servers, InferencePool, EPP, InferenceObjective CRDs |
+| `llm` (example; any user-defined namespace) | LLMInferenceService, model servers, InferencePool, EPP, InferenceObjective CRDs |
 | `redhat-ods-operator` | RHAI operator — installed by RHAIIS |
 | `cert-manager` | cert-manager — installed by RHAIIS |
 | `kuadrant-system` | Kuadrant operator, Authorino, Limitador |
@@ -82,7 +82,7 @@ For full details on flow control configuration, see the [Flow Control Setup Guid
 ## 2. Prerequisites
 
 - AKS cluster (Kubernetes 1.28+) with GPU nodes
-- **RHAIIS installed** (latest version) — follow the [RHAIIS on xKS Installation Guide](https://silver-adventure-qmlnoqj.pages.github.io/guides/rhaii-on-xks-installation/) steps 1–6
+- **RHAIIS installed** (latest version) — follow the [rhai-on-xks-chart README](https://github.com/opendatahub-io/odh-gitops/blob/main/charts/rhai-on-xks-chart/README.md) to install RHAIIS on AKS
 - CLI tools: `kubectl`, `helm`, `curl`, `jq`, `skopeo`
 - Pull secret at `~/pull-secret.txt` (for quay.io/rhoai and registry images)
 
@@ -186,7 +186,7 @@ kubectl wait kuadrant/kuadrant --for="condition=Ready=true" \
 
 ### 3.2 Deploy model with LLMInferenceService
 
-Follow the [RHAIIS on xKS guide step 8](https://silver-adventure-qmlnoqj.pages.github.io/guides/rhaii-on-xks-installation/) to deploy a model, or use the simulated model below for testing.
+Follow the [RHAIIS on xKS deployment guide](https://github.com/opendatahub-io/rhaii-on-xks/blob/main/docs/deploying-rhaii-helmcharts-on-xks-ea2.md) to deploy a model, or use the simulated model below for testing.
 
 The following example deploys a simulated model with `LLMInferenceService`.
 
@@ -194,7 +194,7 @@ The following example deploys a simulated model with `LLMInferenceService`.
 <summary>Deploy a simulated model with LLMInferenceService</summary>
 
 ```bash
-LLM_NS=llm
+LLM_NS=llm   # any user-defined namespace; label it llm-d.ai/gateway-route=true below
 MODEL_NAME="facebook/opt-125m"
 ISVC_NAME=$(echo "${MODEL_NAME}" | tr '/' '-' | tr '[:upper:]' '[:lower:]')
 
@@ -202,7 +202,7 @@ kubectl create namespace "${LLM_NS}" 2>/dev/null || true
 kubectl label namespace "${LLM_NS}" llm-d.ai/gateway-route=true --overwrite
 
 kubectl apply -f - <<EOF
-apiVersion: serving.kserve.io/v1alpha1
+apiVersion: serving.kserve.io/v1alpha2
 kind: LLMInferenceService
 metadata:
   name: ${ISVC_NAME}
@@ -220,6 +220,9 @@ spec:
       template:
         imagePullSecrets:
           - name: rhai-pull-secret
+        containers:
+          - name: main
+          - name: tokenizer
       config:
         inline:
           apiVersion: inference.networking.x-k8s.io/v1alpha1
@@ -419,8 +422,6 @@ kubectl wait authpolicy/inference-gateway-auth \
 
 > **Note**: The TokenRateLimitPolicy targets the Gateway (not HTTPRoute) because LLMInferenceService dynamically generates the inference HTTPRoute name.
 
-> **Known issue (RHCL 1.4.0)**: The Kuadrant wasm plugin in RHCL 1.4.0 fails to call Limitador correctly, so rate limiting (both `RateLimitPolicy` and `TokenRateLimitPolicy`) never triggers 429. The policy will report `Enforced: True` but will not function. A fix is expected in a future RHCL release.
-
 ```bash
 kubectl apply -f - <<EOF
 apiVersion: kuadrant.io/v1alpha1
@@ -458,7 +459,7 @@ The batch processor routes inference requests through a separate, ClusterIP-only
 
 Set the variables used throughout this section (re-set them if starting a new shell):
 ```bash
-LLM_NS=llm
+LLM_NS=llm   # any user-defined namespace
 BATCH_NS=batch-api
 MODEL_NAME="facebook/opt-125m"
 ISVC_NAME=$(echo "${MODEL_NAME}" | tr '/' '-' | tr '[:upper:]' '[:lower:]')
@@ -484,7 +485,7 @@ fi
 <details>
 <summary>Install batch-gateway operator (via kustomize)</summary>
 
-Install the batch-gateway-operator directly from `opendatahub-io/llm-d-batch-gateway-operator`. The `rhoai` overlay deploys into `redhat-ods-applications` with v3.5-EA2 images:
+Install the batch-gateway-operator directly from `opendatahub-io/llm-d-batch-gateway-operator`. The `rhoai` overlay deploys into `redhat-ods-applications` with midstream `odh-stable` images. On RHOAI (OpenShift), downstream v3.5-EA2 images are injected via the `RELATED_IMAGE_*` mechanism; without that, midstream images are used.
 
 ```bash
 kubectl apply -k "https://github.com/opendatahub-io/llm-d-batch-gateway-operator/config/overlays/rhoai?ref=main"
@@ -937,8 +938,6 @@ EOF
 <details>
 <summary>Create RateLimitPolicy for Batch API Server</summary>
 
-> **Known issue (RHCL 1.4.0)**: The Kuadrant wasm plugin in RHCL 1.4.0 fails to call Limitador correctly, so `RateLimitPolicy` never triggers 429 responses. The policy will report `Enforced: True` but rate limiting will not function. This affects both `RateLimitPolicy` and `TokenRateLimitPolicy`. A fix is expected in a future RHCL release.
-
 ```bash
 # Batch RateLimitPolicy (20 requests/min per user)
 kubectl apply -f - <<EOF
@@ -968,7 +967,7 @@ EOF
 
 Set the variables used throughout this section (these were defined during installation — re-set them if starting a new shell):
 ```bash
-LLM_NS=llm
+LLM_NS=llm   # any user-defined namespace
 BATCH_NS=batch-api
 MODEL_NAME="facebook/opt-125m"
 ISVC_NAME=$(echo "${MODEL_NAME}" | tr '/' '-' | tr '[:upper:]' '[:lower:]')
