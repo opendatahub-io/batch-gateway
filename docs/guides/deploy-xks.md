@@ -81,10 +81,11 @@ For full details on flow control configuration, see the [Flow Control Setup Guid
 
 ## 2. Prerequisites
 
-- XKS cluster (Kubernetes 1.28+) with GPU nodes
-- **RHAIIS installed** (latest version) — follow the [rhai-on-xks-chart README](https://github.com/opendatahub-io/odh-gitops/blob/main/charts/rhai-on-xks-chart/README.md) to install RHAIIS on XKS
-- CLI tools: `kubectl`, `helm`, `curl`, `jq`, `skopeo`
-- Pull secret at `~/pull-secret.txt` (for quay.io/rhoai and registry images)
+- XKS cluster (Kubernetes 1.28+) with GPU nodes (or CPU nodes for simulator testing)
+- **RHAIIS installed** — follow the [rhai-on-xks-chart README](https://github.com/opendatahub-io/odh-gitops/blob/main/charts/rhai-on-xks-chart/README.md) to install RHAIIS
+- CLI tools: `kubectl`, `helm`, `curl`, `jq`
+- Pull secret at `~/pull-secret.json` (for quay.io/rhoai and registry.redhat.io images)
+- **CKS**: NVIDIA device plugin is pre-installed by CoreWeave. No additional GPU setup needed.
 
 ### Verify RHAIIS Installation
 
@@ -181,6 +182,50 @@ EOF
 kubectl wait kuadrant/kuadrant --for="condition=Ready=true" \
     -n "${KUADRANT_NS}" --timeout=300s
 ```
+
+</details>
+
+<details>
+<summary>CKS alternative: Install RHCL via rhaii-on-xks helmfile</summary>
+
+On CKS, Kuadrant is installed as RHCL (Red Hat Connectivity Link) via the rhaii-on-xks helmfile:
+
+```bash
+cd ~/redhat/rhaii-on-xks
+make deploy-rhcl
+```
+
+> **CKS gotcha**: The Kuadrant operator RBAC is missing `monitoring.coreos.com` permissions and will CrashLoopBackOff. Fix:
+
+```bash
+kubectl apply -f - <<'EOF'
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kuadrant-monitoring-fix
+rules:
+- apiGroups: ["monitoring.coreos.com"]
+  resources: ["podmonitors", "servicemonitors"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kuadrant-monitoring-fix
+subjects:
+- kind: ServiceAccount
+  name: kuadrant-operator-controller-manager
+  namespace: kuadrant-operators
+roleRef:
+  kind: ClusterRole
+  name: kuadrant-monitoring-fix
+  apiGroup: rbac.authorization.k8s.io
+EOF
+
+kubectl delete pod -l control-plane=controller-manager -n kuadrant-operators
+```
+
+> **Known issue (RHCL only)**: The Kuadrant wasm plugin in RHCL 1.4.0 fails to call Limitador correctly, so rate limiting never triggers 429. This does not affect vanilla Kuadrant Helm installs (AKS path above). A fix is expected in a future RHCL release.
 
 </details>
 
@@ -697,6 +742,7 @@ kubectl label namespace "${BATCH_NS}" llm-d.ai/gateway-route=true --overwrite
 # Install Redis (or Valkey — see alternative below)
 helm upgrade --install redis oci://registry-1.docker.io/bitnamicharts/redis \
     --namespace ${BATCH_NS} --create-namespace \
+    --version 27.0.14 \
     --set architecture=standalone \
     --set auth.enabled=false
 kubectl rollout status statefulset/redis-master -n ${BATCH_NS} --timeout=120s
@@ -714,13 +760,14 @@ kubectl rollout status statefulset/redis-master -n ${BATCH_NS} --timeout=120s
 PG_PASSWORD="<your-password>"   # set once, referenced below
 helm upgrade --install postgresql oci://registry-1.docker.io/bitnamicharts/postgresql \
     --namespace ${BATCH_NS} --create-namespace \
+    --version 18.7.12 \
     --set "auth.postgresPassword=${PG_PASSWORD}" \
     --set auth.database=batch
 kubectl rollout status statefulset/postgresql -n ${BATCH_NS} --timeout=120s
 
 # Install MinIO (S3-compatible object storage for batch files)
-MINIO_USER=<your-minio-user>
-MINIO_PASSWORD=<your-minio-password>
+MINIO_USER="<your-minio-user>"
+MINIO_PASSWORD="<your-minio-password>"
 MINIO_BUCKET=batch-gateway
 
 kubectl apply -f - <<EOF
@@ -795,6 +842,8 @@ kubectl create secret generic batch-gateway-secrets \
 ```
 
 > **Note**: Redis auth is disabled for demo purposes. For production, enable Redis authentication.
+
+> **Demo only**: MinIO uses `emptyDir` — data is lost on pod restart. For production, use a PVC with `ReadWriteMany` or a managed S3-compatible service.
 
 </details>
 
@@ -995,6 +1044,33 @@ EOF
 ```
 
 </details>
+
+> **CKS gotcha**: EPP pods may crash with "failed waiting for InferenceModelRewrite Informer to sync". This is an RBAC gap — the EPP ServiceAccount lacks `llm-d.ai` API group permissions. Fix per LLMInferenceService:
+
+```bash
+kubectl apply -n ${LLM_NS} -f - <<EOF
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: epp-llmd-fix
+rules:
+- apiGroups: ["llm-d.ai"]
+  resources: ["inferencemodelrewrites", "inferenceobjectives"]
+  verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: epp-llmd-fix
+subjects:
+- kind: ServiceAccount
+  name: ${ISVC_NAME}-epp-sa
+roleRef:
+  kind: Role
+  name: epp-llmd-fix
+  apiGroup: rbac.authorization.k8s.io
+EOF
+```
 
 ## 4. Test
 
@@ -1200,7 +1276,9 @@ for i in $(seq 1 25); do
 done
 ```
 
-## 5. AKS-Specific Considerations
+## 5. Platform-Specific Considerations
+
+### AKS
 
 This section documents AKS platform differences that apply regardless of install method (operator or Helm).
 
@@ -1359,6 +1437,20 @@ Disable PodMonitor in the chart values used by [deploy-k8s.md](deploy-k8s.md). T
 | `azurefile-csi` / `azurefile-csi-premium` PVC provisioning fails | Subscription policy requires HTTPS-only storage accounts; CSI driver creates accounts without HTTPS | Pre-create storage account with `--https-only true` (see File Storage Option B above) |
 | `Microsoft.Storage` provider not registered | `az storage account create` returns `SubscriptionNotFound` | Run `az provider register --namespace Microsoft.Storage` and wait for `Registered` state |
 
+### CKS (CoreWeave)
+
+- **Storage**: CoreWeave provides `shared-vast` with ReadWriteMany — no Azure Files setup needed for filesystem storage mode
+- **NVIDIA device plugin**: Pre-installed by CoreWeave, no additional GPU setup
+- **PKI naming**: The RHAIIS helmfile creates certificates with `opendatahub-*` names, while the rhai-on-xks-chart expects `rhai-*` names. On shared clusters, you may need both sets of PKI resources
+- **Monitoring CRDs**: CKS clusters do not ship Prometheus Operator CRDs by default. If Helm charts fail on PodMonitor/ServiceMonitor resources:
+
+```bash
+kubectl apply --server-side -f \
+  https://raw.githubusercontent.com/prometheus-operator/prometheus-operator/v0.80.0/example/prometheus-operator-crd/monitoring.coreos.com_podmonitors.yaml
+kubectl apply --server-side -f \
+  https://raw.githubusercontent.com/prometheus-operator/prometheus-operator/v0.80.0/example/prometheus-operator-crd/monitoring.coreos.com_servicemonitors.yaml
+```
+
 ## 6. Troubleshooting
 
 | Symptom | Cause | Resolution |
@@ -1380,6 +1472,9 @@ Disable PodMonitor in the chart values used by [deploy-k8s.md](deploy-k8s.md). T
 | Curl returns 000 (timeout) | External IP not routable from workstation | Port-forward: `kubectl port-forward svc/inference-gateway-istio -n redhat-ods-applications 8080:80` |
 | TokenRateLimitPolicy not Enforced | No HTTPRoutes attached to target gateway | Create HTTPRoute first, policy enforces automatically |
 | RateLimitPolicy `Enforced=True` but no 429 | Wasm-shim cannot resolve `auth.identity` for rate limit counters (check gateway logs for `NoSuchKey("identity")`); ratelimit `failureMode: allow` passes traffic through | Add `response.success.filters.identity` to the AuthPolicy (see [§3.4](#34-configure-authpolicy-and-tokenratelimitpolicy-for-inference-gateway)) and use `auth.identity.username` (not `auth.identity.user.username`) in RateLimitPolicy/TokenRateLimitPolicy counters |
+| Kuadrant operator CrashLoopBackOff | Missing `monitoring.coreos.com` RBAC (CKS) | Apply ClusterRole fix (see step 3.1 CKS alternative) |
+| EPP pods CrashLoopBackOff | Missing `llm-d.ai` RBAC (CKS) | Apply Role/RoleBinding fix (see after step 3.6) |
+| CRD field manager conflict | Pre-existing CRDs on shared cluster | `kubectl apply --server-side --force-conflicts` |
 
 ## 7. Helm Install (Alternative)
 
