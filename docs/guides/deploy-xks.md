@@ -1,10 +1,10 @@
-# Batch Gateway on AKS with RHAIIS (Operator-based)
+# Batch Gateway on XKS with RHAIIS
 
-This guide demonstrates how to deploy batch-gateway on AKS using the **batch-gateway operator** on top of [RHAIIS](https://github.com/opendatahub-io/odh-gitops/blob/main/charts/rhai-on-xks-chart/README.md), using [Kuadrant](https://kuadrant.io/) for authentication, authorization, and rate limiting.
+This guide demonstrates how to deploy batch-gateway on external Kubernetes services (Azure, CoreWeave) using the **batch-gateway operator** on top of [RHAIIS](https://github.com/opendatahub-io/odh-gitops/blob/main/charts/rhai-on-xks-chart/README.md), using [Kuadrant](https://kuadrant.io/) for authentication, authorization, and rate limiting.
 
 > **Note**: The batch gateway does not depend on Kuadrant. This guide uses Kuadrant for gateway-level auth and rate limiting, but any policy engine that works with Gateway API can be used instead.
 
-> **Note**: This guide is for AKS clusters **without** OpenShift. If you have OpenShift, see [deploy-rhoai.md](deploy-rhoai.md).
+> **Note**: This guide is for XKS clusters **without** OpenShift. If you have OpenShift, see [deploy-rhoai.md](deploy-rhoai.md).
 
 ## 1. Architecture Overview
 
@@ -77,12 +77,12 @@ This is configured through three components:
 
 For full details on flow control configuration, see the [Flow Control Setup Guide](flow-control-setup.md).
 
-> **AKS limitation**: On RHAIIS/AKS, the batch-internal-gateway routes directly to the workload service (bypassing InferencePool/EPP) because only the `inference-gateway` has the ext_proc extension needed for InferencePool support. This means EPP flow control prioritization does not apply to batch requests. Batch and interactive requests are served equally by the model server. If flow control is critical, consider routing batch traffic through the `inference-gateway` instead (with appropriate policy exemptions).
+> **XKS limitation**: On RHAIIS/XKS, the batch-internal-gateway routes directly to the workload service (bypassing InferencePool/EPP) because only the `inference-gateway` has the ext_proc extension needed for InferencePool support. This means EPP flow control prioritization does not apply to batch requests. Batch and interactive requests are served equally by the model server. If flow control is critical, consider routing batch traffic through the `inference-gateway` instead (with appropriate policy exemptions).
 
 ## 2. Prerequisites
 
-- AKS cluster (Kubernetes 1.28+) with GPU nodes
-- **RHAIIS installed** (latest version) — follow the [rhai-on-xks-chart README](https://github.com/opendatahub-io/odh-gitops/blob/main/charts/rhai-on-xks-chart/README.md) to install RHAIIS on AKS
+- XKS cluster (Kubernetes 1.28+) with GPU nodes
+- **RHAIIS installed** (latest version) — follow the [rhai-on-xks-chart README](https://github.com/opendatahub-io/odh-gitops/blob/main/charts/rhai-on-xks-chart/README.md) to install RHAIIS on XKS
 - CLI tools: `kubectl`, `helm`, `curl`, `jq`, `skopeo`
 - Pull secret at `~/pull-secret.txt` (for quay.io/rhoai and registry images)
 
@@ -1215,7 +1215,7 @@ kubectl annotate svc inference-gateway-istio -n ${RHAIIS_NS} \
   service.beta.kubernetes.io/azure-load-balancer-internal=true --overwrite
 ```
 
-**Helm path:** annotate `istio-gateway-istio` in `istio-ingress` — see [§8 Helm Install](#8-helm-install-alternative).
+**Helm path:** annotate `istio-gateway-istio` in `istio-ingress` — see [§7 Helm Install](#7-helm-install-alternative).
 
 Clients access the gateway from within the VNet (peered networks, VPN, ExpressRoute).
 
@@ -1320,11 +1320,11 @@ spec:
       claimName: batch-gateway-files
 ```
 
-**Helm path** — see [§8 Helm Install](#8-helm-install-alternative).
+**Helm path** — see [§7 Helm Install](#7-helm-install-alternative).
 
 ### Monitoring CRDs
 
-The llm-d simulated-accelerators values enable `PodMonitor` resources. AKS clusters do not ship the Prometheus Operator CRDs by default. These options apply to the [Helm install path](#8-helm-install-alternative).
+The llm-d simulated-accelerators values enable `PodMonitor` resources. AKS clusters do not ship the Prometheus Operator CRDs by default. These options apply to the [Helm install path](#7-helm-install-alternative).
 
 **Option A — Install only the CRDs** (charts deploy successfully; no scraping):
 
@@ -1343,7 +1343,7 @@ helm upgrade --install kube-prometheus-stack prometheus-community/kube-prometheu
   --namespace monitoring --create-namespace
 ```
 
-**Option C — Enable AKS managed Prometheus** (Azure Monitor):
+**Option C — Enable managed Prometheus** (cloud provider monitoring):
 
 Enable [Azure Monitor managed service for Prometheus](https://learn.microsoft.com/en-us/azure/azure-monitor/essentials/prometheus-metrics-overview) on the cluster. This supports PodMonitor/ServiceMonitor CRDs natively.
 
@@ -1366,21 +1366,7 @@ Enable [Azure Monitor managed service for Prometheus](https://learn.microsoft.co
 | `azurefile-csi` / `azurefile-csi-premium` PVC provisioning fails | Subscription policy requires HTTPS-only storage accounts; CSI driver creates accounts without HTTPS | Pre-create storage account with `--https-only true` (see File Storage Option B above) |
 | `Microsoft.Storage` provider not registered | `az storage account create` returns `SubscriptionNotFound` | Run `az provider register --namespace Microsoft.Storage` and wait for `Registered` state |
 
-## 6. Differences from RHOAI Guide
-
-| Aspect | RHOAI (OCP) | AKS (this guide) |
-|--------|-------------|-------------------|
-| Platform stack | RHOAI operator (OLM) | RHAIIS Helm chart (`rhai-on-xks-chart`) |
-| CLI | `oc` | `kubectl` |
-| Gateway class | `openshift-default` | `istio` (via RHAIIS Sail Operator) |
-| External gateway | `openshift-ai-inference` in `openshift-ingress` | `inference-gateway` in `redhat-ods-applications` |
-| Internal gateway namespace | `openshift-ingress` | `redhat-ods-applications` |
-| Batch gateway operator | Managed by RHOAI DataScienceCluster | `llm-d-batch-gateway-operator` via kustomize (no OLM) |
-| Auth/Rate limiting | RHCL (OLM) | Kuadrant (Helm) |
-| TLS certificates | OpenShift serving certs | cert-manager (installed by RHAIIS) |
-| Gateway hostname | DNS-based (`llm-inference.apps.<domain>`) | IP-based (LoadBalancer external IP) |
-
-## 7. Troubleshooting
+## 6. Troubleshooting
 
 | Symptom | Cause | Resolution |
 |---------|-------|------------|
@@ -1389,11 +1375,11 @@ Enable [Azure Monitor managed service for Prometheus](https://learn.microsoft.co
 | `inference-gateway` not Programmed | Istio not ready | `kubectl get pods -n istio-system` and check Sail Operator |
 | `LLMInferenceService` stuck | Controller not ready or missing CRDs | `kubectl logs -n redhat-ods-applications -l app=llmisvc-controller-manager` |
 | `LLMBatchGateway` CR not accepted | CRD not installed | `kubectl get pods -n redhat-ods-applications -l app.kubernetes.io/name=llm-d-batch-gateway-operator`; verify operator is running |
-| Gateway unreachable externally | AKS internal LB or NSG rules | Use `kubectl port-forward` or allowlist your IP |
+| Gateway unreachable externally | Internal LB or cloud security group rules | Use `kubectl port-forward` or allowlist your IP |
 | Gateway unreachable from client | Internal LB; client outside VNet | Access from within the VNet or use an in-cluster test pod |
 | Pods `Pending` on PVC | Dynamic provisioning failed (HTTPS policy or wrong storage class) | Use pre-created storage account ([§5 File Storage](#file-storage) Option B) or MinIO/S3 (Option A) |
 | PVC mount fails with `No such file or directory` | File share does not exist in the storage account | Create it with `az storage share-rm create --resource-group <rg> --storage-account <name> --name batch-gateway` |
-| PVC mount fails | AKS block storage doesn't support RWX | Use MinIO/S3 (recommended) or Azure Files with pre-created storage account |
+| PVC mount fails | Block storage doesn't support RWX | Use MinIO/S3 (recommended) or cloud-provider shared file storage with pre-created storage account |
 | File upload returns S3 error | `s3-secret-access-key` does not match `MINIO_ROOT_PASSWORD` | Recreate the `batch-gateway-secrets` secret with matching credentials |
 | Pods `CrashLoopBackOff` with URL parse error | Special characters in `postgresql-url` | URL-encode the password in the connection string |
 | `inference-gateway-istio` OOMKilled | Kuadrant wasm plugin exceeds default 1Gi memory | Increase memory to 2Gi in the `inference-gateway-config` ConfigMap (`data.deployment` → `containers[].resources.limits.memory`) and wait for rollout — do not patch the deployment directly, the Istio gateway controller will revert it |
@@ -1402,22 +1388,22 @@ Enable [Azure Monitor managed service for Prometheus](https://learn.microsoft.co
 | TokenRateLimitPolicy not Enforced | No HTTPRoutes attached to target gateway | Create HTTPRoute first, policy enforces automatically |
 | RateLimitPolicy `Enforced=True` but no 429 | Wasm-shim cannot resolve `auth.identity` for rate limit counters (check gateway logs for `NoSuchKey("identity")`); ratelimit `failureMode: allow` passes traffic through | Add `response.success.filters.identity` to the AuthPolicy (see [§3.4](#34-configure-authpolicy-and-tokenratelimitpolicy-for-inference-gateway)) and use `auth.identity.username` (not `auth.identity.user.username`) in RateLimitPolicy/TokenRateLimitPolicy counters |
 
-## 8. Helm Install (Alternative)
+## 7. Helm Install (Alternative)
 
-This guide uses the **batch-gateway operator** on RHAIIS. For AKS deployments using open-source **Helm charts** instead (llm-d stack + batch-gateway Helm chart, without RHAIIS), follow [deploy-k8s.md](deploy-k8s.md).
-
-Apply the AKS platform considerations in [§5](#5-aks-specific-considerations) when following the Helm guide — especially gateway networking (`istio-gateway-istio` in `istio-ingress`), file storage, and monitoring CRDs.
+This guide uses the **batch-gateway operator** on RHAIIS. For XKS deployments using open-source **Helm charts** instead (llm-d stack + batch-gateway Helm chart, without RHAIIS), follow [deploy-k8s.md](deploy-k8s.md).
 
 ### Internal Load Balancer (Helm path)
 
+For internal-only clusters, annotate the gateway Service with your cloud provider's internal load balancer annotation:
+
 ```bash
 kubectl annotate svc istio-gateway-istio -n istio-ingress \
-  service.beta.kubernetes.io/azure-load-balancer-internal=true --overwrite
+  <cloud-provider-internal-lb-annotation>=true --overwrite
 ```
 
 ### File Storage (Helm path)
 
-After creating the Azure Files PV/PVC in [§5 File Storage](#file-storage), install batch-gateway with:
+If using filesystem storage instead of S3, configure batch-gateway with a `ReadWriteMany` PVC:
 
 ```bash
 helm upgrade --install batch-gateway ./charts/batch-gateway \
@@ -1427,6 +1413,8 @@ helm upgrade --install batch-gateway ./charts/batch-gateway \
   --set global.fileClient.fs.pvcName=batch-gateway-files \
   # ... remaining flags per deploy-k8s.md §3.7
 ```
+
+> For AKS-specific file storage setup (Azure Files PV/PVC), see [§5 AKS-Specific Considerations](#file-storage).
 
 ### OCI Chart Registry
 
