@@ -16,7 +16,7 @@ set -euo pipefail
 # Ref: https://docs.redhat.com/en/documentation/openshift_container_platform/4.19/html/ingress_and_load_balancing/configuring-ingress-cluster-traffic#ingress-gateway-api
 # Ref: https://docs.redhat.com/en/documentation/red_hat_openshift_ai_self-managed/3.4/html/deploying_models/index
 # Ref: https://github.com/red-hat-data-services/kserve/tree/rhoai-3.4/docs/samples/llmisvc
-# Ref: https://docs.redhat.com/en/documentation/red_hat_connectivity_link/1.3
+# Ref: https://docs.redhat.com/en/documentation/red_hat_connectivity_link
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
@@ -150,7 +150,15 @@ EOF
 
 # ── 3. GatewayClass + Gateway ───────────────────────────────────────────────
 
-create_openshift_gateway() {
+# Verify the inference gateway pod is healthy.
+# Especially after Kuadrant injects a WasmPlugin into the Gateway's Envoy proxy; if the wasm binary
+# fails to load the pod enters CrashLoopBackOff.
+check_inference_external_gateway() {
+    wait_for_deployment "istiod-openshift-gateway" "openshift-ingress"
+    wait_for_deployment "${GATEWAY_NAME}-${GATEWAY_CLASS_NAME}" "${GATEWAY_NAMESPACE}"
+}
+
+create_inference_external_gateway() {
     step "Creating OpenShift GatewayClass and Gateway..."
 
     # GatewayClass
@@ -214,13 +222,13 @@ EOF
     fi
 
     step "Waiting for Istio control plane (istiod) to be ready..."
-    wait_for_deployment "istiod-openshift-gateway" "openshift-ingress"
+    check_inference_external_gateway
 
     log "OpenShift Gateway created."
 }
 
 # ── 4. Red Hat Connectivity Link (Kuadrant) ──────────────────────────────────
-# Ref: https://docs.redhat.com/en/documentation/red_hat_connectivity_link/1.3
+# Ref: https://docs.redhat.com/en/documentation/red_hat_connectivity_link
 
 install_connectivity_link() {
     local ns="${KUADRANT_NAMESPACE}"
@@ -1013,6 +1021,9 @@ EOF
         -n "${GATEWAY_NAMESPACE}" --timeout=180s 2>/dev/null \
         || die "TokenRateLimitPolicy not enforced after 180s."
 
+    sleep 15
+    check_inference_external_gateway
+
     log "TokenRateLimitPolicy applied."
 }
 
@@ -1068,6 +1079,9 @@ spec:
       counters:
       - expression: auth.identity.user.username
 EOF
+
+    sleep 15
+    check_inference_external_gateway
 
     log "RateLimitPolicy applied (20 req/min per user)."
 }
@@ -1253,7 +1267,7 @@ cmd_install() {
     create_selfsigned_issuer
 
     install_lws_operator
-    create_openshift_gateway
+    create_inference_external_gateway
 
     # TODO
     # Pin RHCL to 1.3.x to work around wasm plugin incompatibility with Service Mesh 3.x.
