@@ -8,19 +8,7 @@ This guide demonstrates how to deploy batch-gateway on external Kubernetes servi
 
 ## 1. Architecture Overview
 
-### 1.1 Namespace Layout
-
-| Namespace | Purpose |
-|-----------|---------|
-| `istio-system` | Istio control plane (istiod) — installed by RHAIIS |
-| `redhat-ods-applications` | KServe, inference-gateway, RHAIIS controllers, batch-gateway-operator — installed by RHAIIS + kustomize |
-| `llm` (example; any user-defined namespace) | LLMInferenceService, model servers, InferencePool, EPP, InferenceObjective resources |
-| `redhat-ods-operator` | RHAI operator — installed by RHAIIS |
-| `cert-manager` | cert-manager — installed by RHAIIS |
-| `kuadrant-system` | Kuadrant operator, Authorino, Limitador |
-| `batch-api` | batch-gateway (apiserver + processor + gc), Redis, PostgreSQL |
-
-### 1.2 Data Flow
+### 1.1 Data Flow
 
 **Batch inference flow**:
 1. Client sends a batch request (e.g. `POST /v1/batches`) to the inference Gateway (`inference-gateway`) with a Kubernetes token
@@ -34,21 +22,21 @@ This guide demonstrates how to deploy batch-gateway on external Kubernetes servi
     - **No TokenRateLimitPolicy** — batch inference requests are exempt from per-user token rate limits
 5. Request is routed directly to the **vLLM model server** (workload Service, port 8000 with TLS). The Internal Gateway does not use InferencePool/EPP routing because it lacks the ext_proc extension — only the inference-gateway (provisioned by RHAIIS) has InferencePool support. The response is returned to the Processor, which adds the response to the batch job's output file
 
-### 1.3 Authentication
+### 1.2 Authentication
 
 Both the LLM route and the batch route use **kubernetesTokenReview** for authentication. Clients provide a valid Kubernetes token via the `Authorization: Bearer <token>` header. The token must include the audience `https://kubernetes.default.svc`. Tokens are typically created from a ServiceAccount using `kubectl create token`.
 
 - **LLM route**: Requires a valid Kubernetes token — unauthenticated requests are rejected with **401**
 - **Batch route**: Requires a valid Kubernetes token — unauthenticated requests are rejected with **401**
 
-### 1.4 Authorization Model
+### 1.3 Authorization Model
 
 Model access is controlled through Kubernetes RBAC. Users need `get` permission on the specific `LLMInferenceService` resource to access a model. This is granted by creating a Role and RoleBinding in the model's namespace.
 
 - **LLM route**: SubjectAccessReview checks if user can `get llminferenceservices/<name>` — unauthorized requests are rejected with **403**
 - **Batch route**: No authorization check — authorization is enforced by the batch-llm-route on the Internal Gateway when the processor forwards inference requests with the user's original token
 
-### 1.5 Security boundary: batch-route vs batch-llm-route
+### 1.4 Security boundary: batch-route vs batch-llm-route
 
 For security and operations readers: **admission on the batch API is not the same as authorization for inference.**
 
@@ -57,7 +45,7 @@ For security and operations readers: **admission on the batch API is not the sam
 
 The `Authorization` header is included in `passThroughHeaders` by default. Without it, the Internal Gateway cannot attribute inference traffic to the original caller and model-level checks cannot run as intended.
 
-### 1.6 Flow Control
+### 1.5 Flow Control
 
 Flow control ensures interactive inference requests are always served before batch requests. The EPP (Endpoint Picker Plugin) uses GIE's flow control feature to assign requests to priority bands based on the `x-gateway-inference-objective` header:
 
@@ -128,15 +116,12 @@ done
 PATCH="${PATCH}]"
 
 kubectl patch gateway inference-gateway -n redhat-ods-applications --type='json' -p="${PATCH}"
-
-# Label namespaces that need to attach routes to the inference-gateway
-kubectl label namespace redhat-ods-applications llm-d.ai/gateway-route=true --overwrite
 ```
 
-> The `llm` namespace is labeled in step 3.2 when the model is deployed. The `batch-api` namespace is labeled later in step 3.5 when it is created.
+> The `llm` and `batch-api` namespaces are labeled with `llm-d.ai/gateway-route=true` later when they are created (steps 3.2 and 3.5 respectively).
 
 
-> **Security**: Only namespaces with the `llm-d.ai/gateway-route: "true"` label can attach HTTPRoutes to the inference-gateway. This is the same pattern used by the batch-gateway Helm deployment (`deploy-k8s.md`). On RHOAI (OpenShift), this patch is not needed because all batch-gateway HTTPRoutes are deployed in the same namespace as the gateway.
+> **Security**: Only namespaces with the `llm-d.ai/gateway-route: "true"` label can attach HTTPRoutes to the inference-gateway. On RHOAI (OpenShift), this patch is not needed because all batch-gateway HTTPRoutes are deployed in the same namespace as the gateway.
 
 > **Note**: If the RHAIIS cloud-manager reconciles the gateway back to `Same`, you may need to disable gateway management or use a separate gateway for batch traffic.
 
@@ -361,7 +346,7 @@ kubectl wait llminferenceservice/${ISVC_NAME} -n ${LLM_NS} \
 
 > **Pull secret**: The `hf://` model URI triggers a `storage-initializer` init container that pulls `quay.io/rhoai/odh-kserve-storage-initializer-rhel9`. Copy `rhai-pull-secret` into `${LLM_NS}` before applying the CR (run the full §3.2 block in one shell so `RHAIIS_NS` and `LLM_NS` are set). Without it, pods fail with `Init:ImagePullBackOff` / `401 UNAUTHORIZED`.
 
-> **Flow control config**: The `scheduler.config.inline` EndpointPickerConfig enables the `flowControl` feature gate with two priority bands: interactive (priority 100, round-robin fairness, FCFS ordering) and batch (priority -1, sheddable, SLO-deadline ordering). The `saturationDetector` monitors backend queue depth and KV-cache utilization to trigger head-of-line blocking when the system is saturated. See [1.6 Flow Control](#16-flow-control) for details.
+> **Flow control config**: The `scheduler.config.inline` EndpointPickerConfig enables the `flowControl` feature gate with two priority bands: interactive (priority 100, round-robin fairness, FCFS ordering) and batch (priority -1, sheddable, SLO-deadline ordering). The `saturationDetector` monitors backend queue depth and KV-cache utilization to trigger head-of-line blocking when the system is saturated. See [1.5 Flow Control](#15-flow-control) for details.
 
 </details>
 
@@ -535,22 +520,6 @@ MODEL_NAME="facebook/opt-125m"
 ISVC_NAME=$(echo "${MODEL_NAME}" | tr '/' '-' | tr '[:upper:]' '[:lower:]')
 RHAIIS_NS=redhat-ods-applications
 ```
-
-<details>
-<summary>Patch RHAIIS llmisvc-controller-manager (if needed)</summary>
-
-The RHAIIS `llmisvc-controller-manager` may lack `imagePullSecrets` for midstream images. Patch it if the pod is in `ImagePullBackOff`:
-
-```bash
-RHAIIS_NS=redhat-ods-applications
-if kubectl get deploy llmisvc-controller-manager -n "${RHAIIS_NS}" &>/dev/null; then
-    kubectl patch deploy llmisvc-controller-manager -n "${RHAIIS_NS}" --type='json' \
-      -p='[{"op": "add", "path": "/spec/template/spec/imagePullSecrets", "value": [{"name": "rhai-pull-secret"}]}]'
-    kubectl rollout status deploy/llmisvc-controller-manager -n "${RHAIIS_NS}" --timeout=120s
-fi
-```
-
-</details>
 
 <details>
 <summary>Install batch-gateway operator (via kustomize)</summary>
@@ -733,30 +702,49 @@ EOF
 </details>
 
 <details>
-<summary>Create namespace and install dependencies</summary>
+<summary>Create namespace</summary>
 
 ```bash
 kubectl create namespace "${BATCH_NS}" 2>/dev/null || true
 kubectl label namespace "${BATCH_NS}" llm-d.ai/gateway-route=true --overwrite
+```
 
-# Install Redis (or Valkey — see alternative below)
+</details>
+
+> **Note**: The batch gateway requires Redis, PostgreSQL, and S3-compatible object storage. If you already have these services available, skip ahead to [Create application secret](#create-application-secret) and update the connection URLs to point to your existing services.
+
+<details>
+<summary>Install Redis</summary>
+
+```bash
 helm upgrade --install redis oci://registry-1.docker.io/bitnamicharts/redis \
     --namespace ${BATCH_NS} --create-namespace \
     --version 27.0.14 \
     --set architecture=standalone \
     --set auth.enabled=false
 kubectl rollout status statefulset/redis-master -n ${BATCH_NS} --timeout=120s
+```
 
-# Alternative: Install Valkey (wire-protocol compatible with Redis)
-# helm upgrade --install redis oci://registry-1.docker.io/bitnamicharts/valkey \
-#     --namespace ${BATCH_NS} --create-namespace \
-#     --set architecture=standalone \
-#     --set auth.enabled=false
-# kubectl rollout status statefulset/redis-valkey-primary -n ${BATCH_NS} --timeout=120s
-# Note: when using Valkey, update the redis-url secret below to use:
-#   redis://redis-valkey-primary.${BATCH_NS}.svc.cluster.local:6379/0
+> **Alternative**: You can install [Valkey](https://valkey.io/) (wire-protocol compatible with Redis) instead:
+>
+> ```bash
+> helm upgrade --install redis oci://registry-1.docker.io/bitnamicharts/valkey \
+>     --namespace ${BATCH_NS} --create-namespace \
+>     --set architecture=standalone \
+>     --set auth.enabled=false
+> kubectl rollout status statefulset/redis-valkey-primary -n ${BATCH_NS} --timeout=120s
+> ```
+>
+> When using Valkey, update the `redis-url` in the secret below to: `redis://redis-valkey-primary.${BATCH_NS}.svc.cluster.local:6379/0`
 
-# Install PostgreSQL
+> **Note**: Redis auth is disabled for demo purposes. For production, enable Redis authentication.
+
+</details>
+
+<details>
+<summary>Install PostgreSQL</summary>
+
+```bash
 PG_PASSWORD="<your-password>"   # set once, referenced below
 helm upgrade --install postgresql oci://registry-1.docker.io/bitnamicharts/postgresql \
     --namespace ${BATCH_NS} --create-namespace \
@@ -764,8 +752,14 @@ helm upgrade --install postgresql oci://registry-1.docker.io/bitnamicharts/postg
     --set "auth.postgresPassword=${PG_PASSWORD}" \
     --set auth.database=batch
 kubectl rollout status statefulset/postgresql -n ${BATCH_NS} --timeout=120s
+```
 
-# Install MinIO (S3-compatible object storage for batch files)
+</details>
+
+<details>
+<summary>Install MinIO (S3-compatible object storage)</summary>
+
+```bash
 MINIO_USER="<your-minio-user>"
 MINIO_PASSWORD="<your-minio-password>"
 MINIO_BUCKET=batch-gateway
@@ -831,8 +825,16 @@ EOF
 
 until kubectl get deployment minio -n ${BATCH_NS} &>/dev/null; do sleep 5; done
 kubectl rollout status deployment/minio -n ${BATCH_NS} --timeout=180s
+```
 
-# Create application secret
+> **Demo only**: MinIO uses `emptyDir` — data is lost on pod restart. For production, use a PVC with `ReadWriteMany` or a managed S3-compatible service.
+
+</details>
+
+<details>
+<summary>Create application secret</summary>
+
+```bash
 kubectl create secret generic batch-gateway-secrets \
     --namespace ${BATCH_NS} \
     --from-literal=redis-url="redis://redis-master.${BATCH_NS}.svc.cluster.local:6379/0" \
@@ -841,9 +843,7 @@ kubectl create secret generic batch-gateway-secrets \
     --dry-run=client -o yaml | kubectl apply -f -
 ```
 
-> **Note**: Redis auth is disabled for demo purposes. For production, enable Redis authentication.
-
-> **Demo only**: MinIO uses `emptyDir` — data is lost on pod restart. For production, use a PVC with `ReadWriteMany` or a managed S3-compatible service.
+> Update the connection URLs above if you are using existing Redis, PostgreSQL, or S3 services.
 
 </details>
 
@@ -1276,24 +1276,32 @@ for i in $(seq 1 25); do
 done
 ```
 
-## 5. Platform-Specific Considerations
+## 5. Namespace Layout
+
+| Namespace | Purpose |
+|-----------|---------|
+| `istio-system` | Istio control plane (istiod) — installed by RHAIIS |
+| `redhat-ods-applications` | KServe, inference-gateway, RHAIIS controllers, batch-gateway-operator — installed by RHAIIS + kustomize |
+| `llm` (example; any user-defined namespace) | LLMInferenceService, model servers, InferencePool, EPP, InferenceObjective resources |
+| `redhat-ods-operator` | RHAI operator — installed by RHAIIS |
+| `cert-manager` | cert-manager — installed by RHAIIS |
+| `kuadrant-system` | Kuadrant operator, Authorino, Limitador |
+| `batch-api` | batch-gateway (apiserver + processor + gc), Redis, PostgreSQL |
+
+## 6. Platform-Specific Considerations
 
 ### AKS
 
-This section documents AKS platform differences that apply regardless of install method (operator or Helm).
+This section documents AKS platform differences.
 
 ### Gateway Networking
 
 Gateway Services on AKS provision an Azure Load Balancer. For internal-only clusters, annotate the relevant Service:
 
-**Operator path (this guide):**
-
 ```bash
 kubectl annotate svc inference-gateway-istio -n ${RHAIIS_NS} \
   service.beta.kubernetes.io/azure-load-balancer-internal=true --overwrite
 ```
-
-**Helm path:** annotate `istio-gateway-istio` in `istio-ingress` — see [§7 Helm Install](#7-helm-install-alternative).
 
 Clients access the gateway from within the VNet (peered networks, VPN, ExpressRoute).
 
@@ -1386,9 +1394,7 @@ spec:
 EOF
 ```
 
-5. Configure batch-gateway to use the PVC:
-
-**Operator path** — update the `LLMBatchGateway` CR:
+5. Configure batch-gateway to use the PVC by updating the `LLMBatchGateway` CR:
 
 ```yaml
 spec:
@@ -1398,11 +1404,9 @@ spec:
       claimName: batch-gateway-files
 ```
 
-**Helm path** — see [§7 Helm Install](#7-helm-install-alternative).
-
 ### Monitoring CRDs
 
-The llm-d simulated-accelerators values enable `PodMonitor` resources. AKS clusters do not ship the Prometheus Operator CRDs by default. These options apply to the [Helm install path](#7-helm-install-alternative).
+AKS clusters do not ship the Prometheus Operator CRDs by default. If any component creates `PodMonitor` or `ServiceMonitor` resources, install the CRDs.
 
 **Option A — Install only the CRDs** (charts deploy successfully; no scraping):
 
@@ -1425,10 +1429,6 @@ helm upgrade --install kube-prometheus-stack prometheus-community/kube-prometheu
 
 Enable [Azure Monitor managed service for Prometheus](https://learn.microsoft.com/en-us/azure/azure-monitor/essentials/prometheus-metrics-overview) on the cluster. This supports PodMonitor/ServiceMonitor CRDs natively.
 
-**Option D — Disable monitoring** (skip PodMonitor entirely):
-
-Disable PodMonitor in the chart values used by [deploy-k8s.md](deploy-k8s.md). The specific flags depend on the llm-d chart version being deployed.
-
 ### AKS Known Issues
 
 | Issue | Impact | Workaround |
@@ -1442,7 +1442,7 @@ Disable PodMonitor in the chart values used by [deploy-k8s.md](deploy-k8s.md). T
 - **Storage**: CoreWeave provides `shared-vast` with ReadWriteMany — no Azure Files setup needed for filesystem storage mode
 - **NVIDIA device plugin**: Pre-installed by CoreWeave, no additional GPU setup
 - **PKI naming**: The RHAIIS helmfile creates certificates with `opendatahub-*` names, while the rhai-on-xks-chart expects `rhai-*` names. On shared clusters, you may need both sets of PKI resources
-- **Monitoring CRDs**: CKS clusters do not ship Prometheus Operator CRDs by default. If Helm charts fail on PodMonitor/ServiceMonitor resources:
+- **Monitoring CRDs**: CKS clusters do not ship Prometheus Operator CRDs by default. If components fail on missing PodMonitor/ServiceMonitor resources:
 
 ```bash
 kubectl apply --server-side -f \
@@ -1451,67 +1451,27 @@ kubectl apply --server-side -f \
   https://raw.githubusercontent.com/prometheus-operator/prometheus-operator/v0.80.0/example/prometheus-operator-crd/monitoring.coreos.com_servicemonitors.yaml
 ```
 
-## 6. Troubleshooting
+## 7. Troubleshooting
 
 | Symptom | Cause | Resolution |
 |---------|-------|------------|
-| RHAIIS pods `ImagePullBackOff` | Pull secret missing registry credentials | Check `~/pull-secret.txt` covers all registries (see [rhai-on-xks-chart README](https://github.com/opendatahub-io/odh-gitops/blob/main/charts/rhai-on-xks-chart/README.md)) |
+| RHAIIS pods `ImagePullBackOff` | Pull secret missing registry credentials | Check `~/pull-secret.json` covers all registries (see [rhai-on-xks-chart README](https://github.com/opendatahub-io/odh-gitops/blob/main/charts/rhai-on-xks-chart/README.md)) |
 | Model pods `Init:ImagePullBackOff` in `llm` | `rhai-pull-secret` not copied into model namespace | Copy secret from `redhat-ods-applications` before applying the CR (see [§3.2](#32-deploy-model-with-llminferenceservice)); delete pods to retry |
 | `inference-gateway` not Programmed | Istio not ready | `kubectl get pods -n istio-system` and check Sail Operator |
 | `LLMInferenceService` stuck | Controller not ready or missing CRDs | `kubectl logs -n redhat-ods-applications -l app=llmisvc-controller-manager` |
 | `LLMBatchGateway` CR not accepted | CRD not installed | `kubectl get pods -n redhat-ods-applications -l app.kubernetes.io/name=llm-d-batch-gateway-operator`; verify operator is running |
 | Gateway unreachable externally | Internal LB or cloud security group rules | Use `kubectl port-forward` or allowlist your IP |
 | Gateway unreachable from client | Internal LB; client outside VNet | Access from within the VNet or use an in-cluster test pod |
-| Pods `Pending` on PVC | Dynamic provisioning failed (HTTPS policy or wrong storage class) | Use pre-created storage account ([§5 File Storage](#file-storage) Option B) or MinIO/S3 (Option A) |
+| Pods `Pending` on PVC | Dynamic provisioning failed (HTTPS policy or wrong storage class) | Use pre-created storage account ([§6 File Storage](#file-storage) Option B) or MinIO/S3 (Option A) |
 | PVC mount fails with `No such file or directory` | File share does not exist in the storage account | Create it with `az storage share-rm create --resource-group <rg> --storage-account <name> --name batch-gateway` |
 | PVC mount fails | Block storage doesn't support RWX | Use MinIO/S3 (recommended) or cloud-provider shared file storage with pre-created storage account |
 | File upload returns S3 error | `s3-secret-access-key` does not match `MINIO_ROOT_PASSWORD` | Recreate the `batch-gateway-secrets` secret with matching credentials |
 | Pods `CrashLoopBackOff` with URL parse error | Special characters in `postgresql-url` | URL-encode the password in the connection string |
 | `inference-gateway-istio` OOMKilled | Kuadrant wasm plugin exceeds default 1Gi memory | Increase memory to 2Gi in the `inference-gateway-config` ConfigMap (`data.deployment` → `containers[].resources.limits.memory`) and wait for rollout — do not patch the deployment directly, the Istio gateway controller will revert it |
 | Batch requests return 403 | User lacks RBAC on `llminferenceservices` | Create Role/RoleBinding for `get llminferenceservices/<isvc-name>` |
-| Curl returns 000 (timeout) | External IP not routable from workstation | Port-forward: `kubectl port-forward svc/inference-gateway-istio -n redhat-ods-applications 8080:80` |
+| Curl returns 000 (timeout) | External IP not routable from workstation | Port-forward: `kubectl port-forward svc/inference-gateway-istio -n redhat-ods-applications 8443:443` |
 | TokenRateLimitPolicy not Enforced | No HTTPRoutes attached to target gateway | Create HTTPRoute first, policy enforces automatically |
 | RateLimitPolicy `Enforced=True` but no 429 | Wasm-shim cannot resolve `auth.identity` for rate limit counters (check gateway logs for `NoSuchKey("identity")`); ratelimit `failureMode: allow` passes traffic through | Add `response.success.filters.identity` to the AuthPolicy (see [§3.4](#34-configure-authpolicy-and-tokenratelimitpolicy-for-inference-gateway)) and use `auth.identity.username` (not `auth.identity.user.username`) in RateLimitPolicy/TokenRateLimitPolicy counters |
 | Kuadrant operator CrashLoopBackOff | Missing `monitoring.coreos.com` RBAC (CKS) | Apply ClusterRole fix (see step 3.1 CKS alternative) |
 | EPP pods CrashLoopBackOff | Missing `llm-d.ai` RBAC (CKS) | Apply Role/RoleBinding fix (see after step 3.6) |
 | CRD field manager conflict | Pre-existing CRDs on shared cluster | `kubectl apply --server-side --force-conflicts` |
-
-## 7. Helm Install (Alternative)
-
-This guide uses the **batch-gateway operator** on RHAIIS. For XKS deployments using open-source **Helm charts** instead (llm-d stack + batch-gateway Helm chart, without RHAIIS), follow [deploy-k8s.md](deploy-k8s.md).
-
-### Internal Load Balancer (Helm path)
-
-For internal-only clusters, annotate the gateway Service with your cloud provider's internal load balancer annotation:
-
-```bash
-kubectl annotate svc istio-gateway-istio -n istio-ingress \
-  <cloud-provider-internal-lb-annotation>=true --overwrite
-```
-
-### File Storage (Helm path)
-
-If using filesystem storage instead of S3, configure batch-gateway with a `ReadWriteMany` PVC:
-
-```bash
-helm upgrade --install batch-gateway ./charts/batch-gateway \
-  --namespace batch-api \
-  --set global.fileClient.type=fs \
-  --set global.fileClient.fs.basePath=/tmp/batch-gateway \
-  --set global.fileClient.fs.pvcName=batch-gateway-files \
-  # ... remaining flags per deploy-k8s.md §3.7
-```
-
-> For AKS-specific file storage setup (Azure Files PV/PVC), see [§5 AKS-Specific Considerations](#file-storage).
-
-### OCI Chart Registry
-
-The published OCI chart is available at `oci://ghcr.io/llm-d-incubation/charts/batch-gateway`. Use this as an alternative to the local chart path when deploying without a source checkout:
-
-```bash
-helm upgrade --install batch-gateway \
-  oci://ghcr.io/llm-d-incubation/charts/batch-gateway \
-  --version 0.2.0 \
-  --namespace batch-api \
-  # ... same --set flags as deploy-k8s.md §3.7
-```
