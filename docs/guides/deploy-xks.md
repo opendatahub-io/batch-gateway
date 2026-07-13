@@ -14,7 +14,7 @@ This guide demonstrates how to deploy batch-gateway on external Kubernetes servi
 |-----------|---------|
 | `istio-system` | Istio control plane (istiod) — installed by RHAIIS |
 | `redhat-ods-applications` | KServe, inference-gateway, RHAIIS controllers, batch-gateway-operator — installed by RHAIIS + kustomize |
-| `llm` (example; any user-defined namespace) | LLMInferenceService, model servers, InferencePool, EPP, InferenceObjective CRDs |
+| `llm` (example; any user-defined namespace) | LLMInferenceService, model servers, InferencePool, EPP, InferenceObjective resources |
 | `redhat-ods-operator` | RHAI operator — installed by RHAIIS |
 | `cert-manager` | cert-manager — installed by RHAIIS |
 | `kuadrant-system` | Kuadrant operator, Authorino, Limitador |
@@ -72,7 +72,7 @@ When the backend is not saturated, both interactive and batch requests are dispa
 This is configured through three components:
 
 1. **EndpointPickerConfig** in the LLMInferenceService CR (`spec.router.scheduler.config.inline`) enables the `flowControl` feature gate and defines priority bands, fairness policies, and saturation detection thresholds.
-2. **InferenceObjective CRDs** map objective names to priority levels. The batch processor sends the `x-gateway-inference-objective: batch-sheddable` header, which EPP resolves to priority -1.
+2. **InferenceObjective resources** map objective names to priority levels. The batch processor sends the `x-gateway-inference-objective: batch-sheddable` header, which EPP resolves to priority -1.
 3. **Batch processor `inferenceObjective` config** sets which `InferenceObjective` name is sent in the header on each inference request.
 
 For full details on flow control configuration, see the [Flow Control Setup Guide](flow-control-setup.md).
@@ -332,12 +332,12 @@ kubectl get httproute -n ${LLM_NS}
 
 </details>
 
-### 3.3 Create InferenceObjective CRDs
+### 3.3 Create InferenceObjective Resources
 
 Create `InferenceObjective` resources that map the `x-gateway-inference-objective` header value to a priority band in EPP's flow control. The batch processor sends the `batch-sheddable` objective on each inference request.
 
 <details>
-<summary>Create InferenceObjective CRDs</summary>
+<summary>Create InferenceObjective resources</summary>
 
 ```bash
 # Discover the InferencePool created by the LLMInferenceService
@@ -1013,11 +1013,11 @@ RHAIIS_NS=redhat-ods-applications
 # Get Gateway address
 GW_ADDR=$(kubectl get gateway inference-gateway -n ${RHAIIS_NS} \
     -o jsonpath='{.status.addresses[0].value}')
-GW_URL="http://${GW_ADDR}"
+GW_URL="https://${GW_ADDR}"
 
 # If the gateway IP is not reachable externally, use port-forward:
-# kubectl port-forward svc/inference-gateway-istio -n ${RHAIIS_NS} 8080:80 &
-# GW_URL="http://localhost:8080"
+# kubectl port-forward svc/inference-gateway-istio -n ${RHAIIS_NS} 8443:443 &
+# GW_URL="https://localhost:8443"
 
 # Create authorized SA with RBAC to access the LLMInferenceService
 kubectl create serviceaccount test-authorized-sa -n ${LLM_NS} 2>/dev/null || true
@@ -1349,14 +1349,7 @@ Enable [Azure Monitor managed service for Prometheus](https://learn.microsoft.co
 
 **Option D — Disable monitoring** (skip PodMonitor entirely):
 
-```bash
-# InferencePool (GAIE)
---set inferenceExtension.monitoring.prometheus.enabled=false
-
-# ModelService
---set decode.monitoring.podmonitor.enabled=false \
---set prefill.monitoring.podmonitor.enabled=false
-```
+Disable PodMonitor in the chart values used by [deploy-k8s.md](deploy-k8s.md). The specific flags depend on the llm-d chart version being deployed.
 
 ### AKS Known Issues
 
