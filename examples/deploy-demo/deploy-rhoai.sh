@@ -39,9 +39,11 @@ BATCH_INTERNAL_GATEWAY_NAMESPACE="${BATCH_INTERNAL_GATEWAY_NAMESPACE:-${GATEWAY_
 
 # LLMInferenceService configuration
 MODEL_NAME="${MODEL_NAME:-facebook/opt-125m}"
-MODEL_URI="${MODEL_URI:-hf://sshleifer/tiny-gpt2}"
+MODEL_URI="${MODEL_URI:-hf://facebook/opt-125m}"
 MODEL_REPLICAS="${MODEL_REPLICAS:-1}"
 ISVC_NAME="${ISVC_NAME:-$(echo "${MODEL_NAME}" | tr '/' '-' | tr '[:upper:]' '[:lower:]')}"
+# For real CPU inference (no GPU, ~8Gi memory, slower startup):
+#   SIM_IMAGE=public.ecr.aws/q9t5s3a7/vllm-cpu-release-repo:v0.19.0
 SIM_IMAGE="${SIM_IMAGE:-ghcr.io/llm-d/llm-d-inference-sim:v0.7.1}"
 
 # Flow control: GIE priority-based dispatch (interactive > batch).
@@ -150,7 +152,37 @@ EOF
 
 # ── 3. GatewayClass + Gateway ───────────────────────────────────────────────
 
-# Verify the inference gateway pod is healthy.
+# RHCL 1.4 wasm plugin compilation requires more than the default 1Gi memory.
+# Uses Gateway API infrastructure.parametersRef to override proxy resources
+# without being reverted by istiod reconciliation.
+patch_gateway_memory() {
+    local gw_name="$1" gw_ns="$2" cm_name="$3"
+    if ! kubectl get gateway "${gw_name}" -n "${gw_ns}" &>/dev/null; then
+        return
+    fi
+    step "Patching Gateway '${gw_name}' memory limit to 2Gi..."
+    kubectl apply -f - <<EOF
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ${cm_name}
+  namespace: ${gw_ns}
+data:
+  deployment: |
+    spec:
+      template:
+        spec:
+          containers:
+          - name: istio-proxy
+            resources:
+              limits:
+                memory: 2Gi
+EOF
+    kubectl patch gateway "${gw_name}" -n "${gw_ns}" --type=merge \
+        -p "{\"spec\":{\"infrastructure\":{\"parametersRef\":{\"group\":\"\",\"kind\":\"ConfigMap\",\"name\":\"${cm_name}\"}}}}"
+    log "Gateway '${gw_name}' memory limit patched to 2Gi."
+}
+
 # Especially after Kuadrant injects a WasmPlugin into the Gateway's Envoy proxy; if the wasm binary
 # fails to load the pod enters CrashLoopBackOff.
 check_inference_external_gateway() {
@@ -222,6 +254,9 @@ EOF
     fi
 
     step "Waiting for Istio control plane (istiod) to be ready..."
+    check_inference_external_gateway
+
+    patch_gateway_memory "${GATEWAY_NAME}" "${GATEWAY_NAMESPACE}" "${GATEWAY_NAME}-proxy-config"
     check_inference_external_gateway
 
     log "OpenShift Gateway created."
@@ -348,155 +383,6 @@ EOF
     fi
 
     log "Red Hat Connectivity Link installed with Authorino SSL."
-}
-
-install_connectivity_link_v1_3() {
-    local ns="${KUADRANT_NAMESPACE}"
-    local rhcl_csv="rhcl-operator.v1.3.5"
-
-    step "Installing Red Hat Connectivity Link 1.3.5 (pinned) in namespace '${ns}'..."
-
-    if kubectl get subscription.operators.coreos.com rhcl-operator \
-        -n "${ns}" &>/dev/null 2>&1; then
-        log "Connectivity Link operator already installed. Skipping."
-    else
-        kubectl create namespace "${ns}" 2>/dev/null || true
-
-        kubectl apply -f - <<EOF
-apiVersion: operators.coreos.com/v1alpha1
-kind: Subscription
-metadata:
-  name: rhcl-operator
-  namespace: ${ns}
-spec:
-  channel: stable
-  installPlanApproval: Manual
-  name: rhcl-operator
-  source: redhat-operators
-  sourceNamespace: openshift-marketplace
-  startingCSV: ${rhcl_csv}
----
-apiVersion: operators.coreos.com/v1
-kind: OperatorGroup
-metadata:
-  name: kuadrant
-  namespace: ${ns}
-spec:
-  upgradeStrategy: Default
-EOF
-
-        # Approve install plans as they appear (RHCL + sub-operators)
-        step "Approving install plans for RHCL 1.3.x..."
-        local approved=0
-        for i in $(seq 1 30); do
-            local plans
-            plans=$(kubectl get installplan -n "${ns}" -o jsonpath='{range .items[?(@.spec.approved==false)]}{.metadata.name}{"\n"}{end}' 2>/dev/null)
-            if [ -n "${plans}" ]; then
-                for plan in ${plans}; do
-                    local csv_list
-                    csv_list=$(kubectl get installplan "${plan}" -n "${ns}" -o jsonpath='{.spec.clusterServiceVersionNames[*]}' 2>/dev/null)
-                    # Only approve 1.3.x plans
-                    if ! echo "${csv_list}" | grep -qE 'rhcl-operator\.v1\.3'; then
-                        log "Skipping install plan ${plan} (not RHCL 1.3.x: ${csv_list})"
-                        continue
-                    fi
-                    log "Approving install plan ${plan} (${csv_list})"
-                    kubectl patch installplan "${plan}" -n "${ns}" --type=merge -p '{"spec":{"approved":true}}'
-                    approved=$((approved + 1))
-                done
-            fi
-            # Check if RHCL CSV is installed
-            local phase
-            phase=$(kubectl get csv "${rhcl_csv}" -n "${ns}" -o jsonpath='{.status.phase}' 2>/dev/null || echo "")
-            if [ "${phase}" = "Succeeded" ]; then
-                log "RHCL ${rhcl_csv} installed (approved ${approved} install plans)."
-                break
-            fi
-            sleep 10
-        done
-
-        local phase
-        phase=$(kubectl get csv "${rhcl_csv}" -n "${ns}" -o jsonpath='{.status.phase}' 2>/dev/null || echo "")
-        if [ "${phase}" != "Succeeded" ]; then
-            die "RHCL ${rhcl_csv} not installed after 300s. Phase: ${phase}"
-        fi
-
-        step "Waiting for Connectivity Link sub-operators..."
-        for deploy in authorino-operator \
-                      limitador-operator-controller-manager \
-                      dns-operator-controller-manager; do
-            wait_for_deployment "$deploy" "${ns}" 180s
-        done
-    fi
-
-    # Create Kuadrant CR with retry (same logic as install_connectivity_link)
-    local kuadrant_ready=false
-    for attempt in 1 2 3; do
-        log "Waiting 30s for Kuadrant operator to register sub-operators..."
-        sleep 30
-
-        step "Creating Kuadrant CR (attempt ${attempt}/3)..."
-        kubectl apply -f - <<EOF
-apiVersion: kuadrant.io/v1beta1
-kind: Kuadrant
-metadata:
-  name: kuadrant
-  namespace: ${ns}
-spec: {}
-EOF
-
-        if kubectl wait kuadrant/kuadrant --for="condition=Ready=true" \
-            -n "${ns}" --timeout=180s 2>/dev/null; then
-            kuadrant_ready=true
-            break
-        fi
-
-        warn "Kuadrant CR not ready, force-restarting operator pod..."
-        kubectl delete kuadrant/kuadrant -n "${ns}" --ignore-not-found 2>/dev/null || true
-        kubectl delete pod -n "${ns}" -l control-plane=controller-manager,app=kuadrant --force 2>/dev/null || true
-        wait_for_deployment "kuadrant-operator-controller-manager" "${ns}" 120s
-    done
-
-    if [ "${kuadrant_ready}" != "true" ]; then
-        die "Kuadrant CR did not become ready after 3 attempts"
-    fi
-
-    # Configure Authorino for authentication (SSL with OpenShift serving certs)
-    step "Configuring Authorino SSL..."
-    oc annotate svc/authorino-authorino-authorization \
-        service.beta.openshift.io/serving-cert-secret-name=authorino-server-cert \
-        -n "${ns}" --overwrite
-    sleep 2
-
-    kubectl apply -f - <<EOF
-apiVersion: operator.authorino.kuadrant.io/v1beta1
-kind: Authorino
-metadata:
-  name: authorino
-  namespace: ${ns}
-spec:
-  replicas: 1
-  clusterWide: true
-  listener:
-    tls:
-      enabled: true
-      certSecretRef:
-        name: authorino-server-cert
-  oidcServer:
-    tls:
-      enabled: false
-EOF
-
-    step "Waiting for Authorino deployment to be ready..."
-    wait_for_deployment "authorino" "${ns}" 180s
-
-    if kubectl get deployment odh-model-controller -n redhat-ods-applications &>/dev/null; then
-        step "Restarting RHOAI controllers to pick up Connectivity Link..."
-        kubectl delete pod -n redhat-ods-applications -l app=odh-model-controller 2>/dev/null || true
-        kubectl delete pod -n redhat-ods-applications -l control-plane=kserve-controller-manager 2>/dev/null || true
-    fi
-
-    log "Red Hat Connectivity Link 1.3.5 installed (pinned) with Authorino SSL."
 }
 
 # ── 5. RHOAI / ODH operator ─────────────────────────────────────────────────
@@ -660,6 +546,23 @@ EOF
             -o jsonpath='{.status.phase}' 2>/dev/null || echo "Unknown")
         if [ "${phase}" = "Ready" ]; then
             log "DataScienceCluster is ready."
+            if kubectl get gateway data-science-gateway -n "${GATEWAY_NAMESPACE}" &>/dev/null; then
+                local dsg_cm
+                dsg_cm=$(kubectl get gateway data-science-gateway -n "${GATEWAY_NAMESPACE}" \
+                    -o jsonpath='{.spec.infrastructure.parametersRef.name}' 2>/dev/null || echo "")
+                if [ -n "${dsg_cm}" ] && kubectl get configmap "${dsg_cm}" -n "${GATEWAY_NAMESPACE}" &>/dev/null; then
+                    step "Patching ConfigMap '${dsg_cm}' with proxy memory 2Gi..."
+                    kubectl patch configmap "${dsg_cm}" -n "${GATEWAY_NAMESPACE}" --type=merge -p "{
+                      \"data\": {
+                        \"deployment\": \"spec:\\n  template:\\n    spec:\\n      containers:\\n      - name: istio-proxy\\n        resources:\\n          limits:\\n            memory: 2Gi\\n          requests:\\n            memory: 256Mi\\n\"
+                      }
+                    }"
+                else
+                    patch_gateway_memory "data-science-gateway" "${GATEWAY_NAMESPACE}" "data-science-gateway-proxy-config"
+                fi
+                sleep 10
+                wait_for_deployment "data-science-gateway-data-science-gateway-class" "${GATEWAY_NAMESPACE}" 300s
+            fi
             return
         fi
         echo "  Status: ${phase} (${i}/60)"
@@ -738,9 +641,7 @@ kind: LLMInferenceService
 metadata:
   name: ${isvc_name}
   namespace: ${LLM_NAMESPACE}
-  annotations:
-    # Enables Gateway-level AuthPolicy (SubjectAccessReview on LLMInferenceService)
-    security.opendatahub.io/enable-auth: "true"
+  annotations: {}
 spec:
   model:
     uri: ${MODEL_URI}
@@ -985,7 +886,91 @@ EOF
     log "Batch LLM AuthPolicy applied."
 }
 
-# ── 6f. TokenRateLimitPolicy for inference ───────────────────────────────────
+# ── 6f. AuthPolicy for inference gateway ─────────────────────────────────────
+# With enable-auth=false, odh-model-controller creates an anonymous AuthPolicy
+# on the HTTPRoute. We create our own Gateway-level AuthPolicy with:
+#   - K8s TokenReview authentication
+#   - SubjectAccessReview authorization on LLMInferenceService
+#   - response.success.filters.identity to populate wasm shim CEL context
+#     (required for RHCL 1.4 rate limit counters using auth.identity.*)
+#   - response headers for batch credential delegation
+
+apply_inference_auth_policy() {
+    local isvc_name="${ISVC_NAME}"
+    local route_name="${isvc_name}-kserve-route"
+
+    step "Creating inference AuthPolicy on HTTPRoute '${route_name}' (authn + authz + wasm identity)..."
+    kubectl apply -f - <<EOF
+apiVersion: kuadrant.io/v1
+kind: AuthPolicy
+metadata:
+  name: ${route_name}-auth
+  namespace: ${LLM_NAMESPACE}
+spec:
+  targetRef:
+    group: gateway.networking.k8s.io
+    kind: HTTPRoute
+    name: ${route_name}
+  rules:
+    authentication:
+      kubernetes-user:
+        kubernetesTokenReview:
+          audiences:
+          - https://kubernetes.default.svc
+        metrics: false
+        priority: 0
+    authorization:
+      inference-access:
+        kubernetesSubjectAccessReview:
+          user:
+            expression: auth.identity.user.username
+          resourceAttributes:
+            group:
+              value: serving.kserve.io
+            resource:
+              value: llminferenceservices
+            verb:
+              value: get
+            namespace:
+              expression: request.path.split("/")[1]
+            name:
+              expression: request.path.split("/")[2]
+        metrics: false
+        priority: 1
+        when:
+        - predicate: '!(request.path == "/v1/files" || request.path.startsWith("/v1/files/") || request.path == "/v1/batches" || request.path.startsWith("/v1/batches/"))'
+    response:
+      success:
+        filters:
+          identity:
+            json:
+              properties:
+                userid:
+                  expression: auth.identity.user.username
+                user:
+                  expression: auth.identity.user
+            metrics: false
+            priority: 0
+        headers:
+          x-maas-user:
+            plain:
+              expression: auth.identity.user.username
+            metrics: false
+            priority: 0
+            when:
+            - predicate: request.path == '/v1/files' || request.path.startsWith('/v1/files/') || request.path == '/v1/batches' || request.path.startsWith('/v1/batches/')
+          x-maas-groups:
+            plain:
+              expression: auth.identity.user.groups.join(',')
+            metrics: false
+            priority: 0
+            when:
+            - predicate: request.path == '/v1/files' || request.path.startsWith('/v1/files/') || request.path == '/v1/batches' || request.path.startsWith('/v1/batches/')
+EOF
+    log "Inference Gateway AuthPolicy applied."
+}
+
+# ── 6g. TokenRateLimitPolicy for inference ───────────────────────────────────
 
 apply_llm_token_rate_limit() {
     local isvc_name="${ISVC_NAME}"
@@ -1034,7 +1019,7 @@ EOF
 # to the Internal Gateway's batch-llm-route (which has its own AuthPolicy).
 
 apply_batch_auth_policy() {
-    step "Creating batch-route AuthPolicy (authentication only)..."
+    step "Creating batch-route AuthPolicy (authn + wasm identity)..."
     kubectl apply -f - <<EOF
 apiVersion: kuadrant.io/v1
 kind: AuthPolicy
@@ -1052,6 +1037,20 @@ spec:
         kubernetesTokenReview:
           audiences:
           - https://kubernetes.default.svc
+        metrics: false
+        priority: 0
+    response:
+      success:
+        filters:
+          identity:
+            json:
+              properties:
+                userid:
+                  expression: auth.identity.user.username
+                user:
+                  expression: auth.identity.user
+            metrics: false
+            priority: 0
 EOF
     log "Batch AuthPolicy applied."
 }
@@ -1269,14 +1268,7 @@ cmd_install() {
     install_lws_operator
     create_inference_external_gateway
 
-    # TODO
-    # Pin RHCL to 1.3.x to work around wasm plugin incompatibility with Service Mesh 3.x.
-    # RHCL 1.4.x wasm plugin fails with 'allow_on_headers_stop_iteration' unknown field
-    # and causes OOM in gateway pods. Uses Manual approval to prevent auto-upgrade.
-    # Tracked by: CONNLINK-1130, https://access.redhat.com/solutions/7144055
-    # install_connectivity_link
-    install_connectivity_link_v1_3
-
+    install_connectivity_link
     install_rhoai_operator
     apply_dsci_and_dsc
 
@@ -1284,9 +1276,11 @@ cmd_install() {
     if [ "${ENABLE_FLOW_CONTROL}" = "true" ]; then
         create_inference_objectives
     fi
+    apply_inference_auth_policy
     apply_llm_token_rate_limit
 
     create_batch_internal_gateway
+    patch_gateway_memory "${BATCH_INTERNAL_GATEWAY_NAME}" "${BATCH_INTERNAL_GATEWAY_NAMESPACE}" "${BATCH_INTERNAL_GATEWAY_NAME}-proxy-config"
     create_batch_llm_httproute
     apply_batch_llm_auth_policy
 

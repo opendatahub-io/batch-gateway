@@ -779,7 +779,6 @@ do_deploy_batch_gateway_dsc() {
         local minio_endpoint="http://${BATCH_MINIO_RELEASE}.${BATCH_NAMESPACE}.svc.cluster.local:9000"
         file_storage_yaml="    s3:
       region: ${MINIO_REGION}
-      bucket: ${MINIO_BUCKET}
       endpoint: ${minio_endpoint}
       accessKeyId: ${MINIO_ROOT_USER}
       prefix: ${MINIO_BUCKET}
@@ -1247,23 +1246,21 @@ JSONL
     # ── 7. Batch Request Rate Limit ──────────────────────────────
     test_group_header "Batch Request Rate Limit"
     next_test "Batch API rate limiting"
-    local rl_success=0 rl_limited=0
+    local rl_success=0
     for i in $(seq 1 25); do
         http_code=$(curl -sk -o /dev/null -w '%{http_code}' -H "${authorized_header}" "${batch_url}/v1/batches")
         if [ "$http_code" = "429" ]; then
-            rl_limited=$((rl_limited + 1))
             echo "  Request $i: 429 Rate Limited"
+            pass_test "Rate limiting triggered after $rl_success requests"
+            break
         else
             rl_success=$((rl_success + 1))
             [ "$i" -le 3 ] && echo "  Request $i: $http_code"
         fi
+        if [ "$i" -eq 25 ]; then
+            fail_test "No 429 received after 25 requests"
+        fi
     done
-    echo "  Result: $rl_success passed, $rl_limited rate-limited"
-    if [ "$rl_limited" -ge 1 ]; then
-        pass_test "Rate limiting is working"
-    else
-        fail_test "No 429 received after 25 requests"
-    fi
     echo ""
     echo "  Waiting 60s for rate limit counters to reset..."
     sleep 60
