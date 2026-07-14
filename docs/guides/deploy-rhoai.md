@@ -285,6 +285,51 @@ oc rollout status deployment/openshift-ai-inference-openshift-default -n openshi
 
 </details>
 
+<details>
+<summary>Increase Gateway proxy memory for RHCL 1.4</summary>
+
+RHCL 1.4's wasm plugin requires more than the default 1Gi memory to compile, causing gateway pods to OOMKill. Use Gateway API `infrastructure.parametersRef` to override the proxy memory limit. This approach survives istiod reconciliation (unlike direct deployment patches).
+
+```bash
+oc apply -f - <<'EOF'
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: openshift-ai-inference-proxy-config
+  namespace: openshift-ingress
+data:
+  deployment: |
+    spec:
+      template:
+        spec:
+          containers:
+          - name: istio-proxy
+            resources:
+              limits:
+                memory: 2Gi
+              requests:
+                memory: 256Mi
+EOF
+
+oc patch gateway openshift-ai-inference -n openshift-ingress --type=merge -p '{
+  "spec": {
+    "infrastructure": {
+      "parametersRef": {
+        "group": "",
+        "kind": "ConfigMap",
+        "name": "openshift-ai-inference-proxy-config"
+      }
+    }
+  }
+}'
+
+# Wait for the updated deployment to roll out
+sleep 10
+oc rollout status deployment/openshift-ai-inference-openshift-default -n openshift-ingress --timeout=120s
+```
+
+</details>
+
 ### 3.4 Install RHCL
 
 Follow [Red Hat Connectivity Link docs](https://docs.redhat.com/en/documentation/red_hat_connectivity_link) to install RHCL
@@ -500,12 +545,10 @@ kind: LLMInferenceService
 metadata:
   name: ${ISVC_NAME}
   namespace: ${LLM_NS}
-  annotations:
-    # Enables Gateway-level AuthPolicy (SubjectAccessReview on LLMInferenceService)
-    security.opendatahub.io/enable-auth: "true"
+  annotations: {}
 spec:
   model:
-    uri: hf://sshleifer/tiny-gpt2
+    uri: hf://facebook/opt-125m
     name: ${MODEL_NAME}
   replicas: 2
   router:
@@ -585,7 +628,7 @@ Wait for the LLMInferenceService to be ready:
 oc wait llminferenceservice/${ISVC_NAME} -n ${LLM_NS} \
     --for=condition=Ready --timeout=600s
 ```
-> **Key annotation**: `security.opendatahub.io/enable-auth: "true"` enables the Gateway-level AuthPolicy that uses SubjectAccessReview to check if the user has RBAC permission to `get` the specific `LLMInferenceService` resource.
+> **Auth annotation**: `security.opendatahub.io/enable-auth` is intentionally omitted. When set to `"true"`, `odh-model-controller` auto-generates a Gateway-level AuthPolicy that lacks `response.success.filters.identity`, which RHCL 1.4's wasm shim needs for rate limit counters. By omitting the annotation, we create our own HTTPRoute-level AuthPolicy with the required identity filter (see [3.8](#38-configure-authpolicy-for-inference-route)). The batch-route AuthPolicy also includes this identity filter for the same reason.
 
 > **Flow control config**: The `scheduler.config.inline` EndpointPickerConfig enables the `flowControl` feature gate with two priority bands: interactive (priority 100, round-robin fairness, FCFS ordering) and batch (priority -1, sheddable, SLO-deadline ordering). The `saturationDetector` monitors backend queue depth and KV-cache utilization to trigger head-of-line blocking when the system is saturated. See [1.6 Flow Control](#16-flow-control) for details.
 </details>
@@ -665,7 +708,88 @@ EOF
 
 </details>
 
-### 3.8 Configure TokenRateLimitPolicy for LLMInferenceService
+### 3.8 Configure AuthPolicy for inference route
+
+RHCL 1.4 switched from Istio WasmPlugin CR to EnvoyFilter for wasm injection. This breaks the automatic passing of Authorino's auth identity data into the wasm shim's CEL context. Without explicit configuration, rate limit counters using `auth.identity.user.username` fail silently with `NoSuchKey("identity")`.
+
+Create an HTTPRoute-level AuthPolicy with `response.success.filters.identity` to populate the wasm shim CEL context. This AuthPolicy also handles authentication (kubernetesTokenReview) and authorization (SubjectAccessReview on the LLMInferenceService).
+
+<details>
+<summary>Create inference AuthPolicy</summary>
+
+```bash
+oc apply -f - <<EOF
+apiVersion: kuadrant.io/v1
+kind: AuthPolicy
+metadata:
+  name: ${ISVC_NAME}-kserve-route-auth
+  namespace: ${LLM_NS}
+spec:
+  targetRef:
+    group: gateway.networking.k8s.io
+    kind: HTTPRoute
+    name: ${ISVC_NAME}-kserve-route
+  rules:
+    authentication:
+      kubernetes-user:
+        kubernetesTokenReview:
+          audiences:
+          - https://kubernetes.default.svc
+        metrics: false
+        priority: 0
+    authorization:
+      inference-access:
+        kubernetesSubjectAccessReview:
+          user:
+            expression: auth.identity.user.username
+          resourceAttributes:
+            group:
+              value: serving.kserve.io
+            resource:
+              value: llminferenceservices
+            verb:
+              value: get
+            namespace:
+              expression: request.path.split("/")[1]
+            name:
+              expression: request.path.split("/")[2]
+        metrics: false
+        priority: 1
+        when:
+        - predicate: '!(request.path == "/v1/files" || request.path.startsWith("/v1/files/") || request.path == "/v1/batches" || request.path.startsWith("/v1/batches/"))'
+    response:
+      success:
+        filters:
+          identity:
+            json:
+              properties:
+                userid:
+                  expression: auth.identity.user.username
+                user:
+                  expression: auth.identity.user
+            metrics: false
+            priority: 0
+        headers:
+          x-maas-user:
+            plain:
+              expression: auth.identity.user.username
+            metrics: false
+            priority: 0
+            when:
+            - predicate: request.path == '/v1/files' || request.path.startsWith('/v1/files/') || request.path == '/v1/batches' || request.path.startsWith('/v1/batches/')
+          x-maas-groups:
+            plain:
+              expression: auth.identity.user.groups.join(',')
+            metrics: false
+            priority: 0
+            when:
+            - predicate: request.path == '/v1/files' || request.path.startsWith('/v1/files/') || request.path == '/v1/batches' || request.path.startsWith('/v1/batches/')
+EOF
+```
+
+</details>
+
+### 3.9 Configure TokenRateLimitPolicy for LLMInferenceService
 
 Configure per-user token rate limiting for inference requests. See [Red Hat Connectivity Link docs](https://docs.redhat.com/en/documentation/red_hat_connectivity_link) for details. The following is an example configuration.
 
@@ -704,7 +828,7 @@ oc wait tokenratelimitpolicy/inference-token-limit \
 ```
 </details>
 
-### 3.9 Install Batch Gateway
+### 3.10 Install Batch Gateway
 
 The batch processor routes inference requests through a separate, ClusterIP-only Internal Gateway to bypass the TokenRateLimitPolicy on the external Gateway while still enforcing model-level authorization (AuthPolicy).
 
@@ -748,6 +872,39 @@ oc rollout status deployment/batch-internal-gateway-openshift-default -n openshi
 
 # Wait for Gateway to be programmed
 oc wait --for=condition=Programmed --timeout=300s -n openshift-ingress gateway/batch-internal-gateway
+
+# Increase proxy memory for RHCL 1.4 wasm plugin (same as external Gateway)
+oc apply -f - <<'EOF'
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: batch-internal-gateway-proxy-config
+  namespace: openshift-ingress
+data:
+  deployment: |
+    spec:
+      template:
+        spec:
+          containers:
+          - name: istio-proxy
+            resources:
+              limits:
+                memory: 2Gi
+              requests:
+                memory: 256Mi
+EOF
+
+oc patch gateway batch-internal-gateway -n openshift-ingress --type=merge -p '{
+  "spec": {
+    "infrastructure": {
+      "parametersRef": {
+        "group": "",
+        "kind": "ConfigMap",
+        "name": "batch-internal-gateway-proxy-config"
+      }
+    }
+  }
+}'
 ```
 
 > **Key annotation**: `networking.istio.io/service-type: ClusterIP` forces the Gateway's Service to be ClusterIP instead of LoadBalancer, ensuring it is not externally accessible.
@@ -1036,7 +1193,7 @@ oc wait llmbatchgateway/batch-gateway -n ${BATCH_NS} \
 
 > - **`processor.globalInferenceGateway.url`**: Points to the Internal Gateway's model endpoint. The Internal Gateway enforces AuthPolicy (model access check) but not TokenRateLimitPolicy.
 > - **`processor.config.inferenceObjective`**: The `InferenceObjective` CRD name sent as the `x-gateway-inference-objective` header. EPP uses this to assign the request to the batch priority band (priority -1, sheddable).
-> - **`tls.certManager`**: Enables TLS for the batch API server using cert-manager. In this demo the DestinationRule (see [3.10](#310-configure-httproute-and-policies-for-batch-gateway)) uses `insecureSkipVerify: true` because we use a self-signed certificate; in production, configure a trusted CA.
+> - **`tls.certManager`**: Enables TLS for the batch API server using cert-manager. In this demo the DestinationRule (see [3.11](#311-configure-httproute-and-policies-for-batch-gateway)) uses `insecureSkipVerify: true` because we use a self-signed certificate; in production, configure a trusted CA.
 > - **Images**: The operator pins component images (apiserver, processor, gc) from its deployment configuration. You do not set image references in the CR.
 > - **File storage**: This example uses S3-compatible storage (MinIO). To use a PVC instead, replace `fileStorage.s3` with:
 >   ```yaml
@@ -1049,7 +1206,7 @@ oc wait llmbatchgateway/batch-gateway -n ${BATCH_NS} \
 
 </details>
 
-### 3.10 Configure HTTPRoute and Policies for Batch Gateway
+### 3.11 Configure HTTPRoute and Policies for Batch Gateway
 
 Set the variable used throughout this section (re-set if starting a new shell):
 ```bash
@@ -1131,6 +1288,20 @@ spec:
         kubernetesTokenReview:
           audiences:
           - https://kubernetes.default.svc
+        metrics: false
+        priority: 0
+    response:
+      success:
+        filters:
+          identity:
+            json:
+              properties:
+                userid:
+                  expression: auth.identity.user.username
+                user:
+                  expression: auth.identity.user
+            metrics: false
+            priority: 0
 EOF
 
 ```

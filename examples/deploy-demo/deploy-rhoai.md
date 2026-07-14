@@ -142,7 +142,7 @@ Use that only on **ephemeral or dedicated** demo clusters. See [issue #309](http
 | `BATCH_INTERNAL_GATEWAY_NAME` | `batch-internal-gateway` | Internal Gateway resource name |
 | `BATCH_INTERNAL_GATEWAY_NAMESPACE` | `${GATEWAY_NAMESPACE}` | Internal Gateway namespace |
 | `MODEL_NAME` | `facebook/opt-125m` | Model name for routing |
-| `MODEL_URI` | `hf://sshleifer/tiny-gpt2` | Model URI for LLMInferenceService |
+| `MODEL_URI` | `hf://facebook/opt-125m` | Model URI for LLMInferenceService |
 | `MODEL_REPLICAS` | `1` | Number of model replicas |
 | `SIM_IMAGE` | `ghcr.io/llm-d/llm-d-inference-sim:v0.7.1` | Simulator container image |
 | `ENABLE_FLOW_CONTROL` | `true` | Enable GIE priority-based flow control |
