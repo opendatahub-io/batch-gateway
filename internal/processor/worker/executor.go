@@ -35,10 +35,16 @@ import (
 	"github.com/go-logr/logr"
 	"github.com/google/uuid"
 
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
+	"go.opentelemetry.io/otel/trace"
+
 	"github.com/llm-d/llm-d-batch-gateway/internal/processor/metrics"
 	"github.com/llm-d/llm-d-batch-gateway/internal/shared/openai"
 	batch_types "github.com/llm-d/llm-d-batch-gateway/internal/shared/types"
 	"github.com/llm-d/llm-d-batch-gateway/internal/util/logging"
+	uotel "github.com/llm-d/llm-d-batch-gateway/internal/util/otel"
 	httpclient "github.com/llm-d/llm-d-batch-gateway/pkg/clients/http"
 	"github.com/llm-d/llm-d-batch-gateway/pkg/clients/inference"
 )
@@ -180,6 +186,10 @@ func (ep *executionProgress) counts() *openai.BatchRequestCounts {
 // SLO expiry or SIGTERM. Its sole purpose is to let the drain phase distinguish user cancel from
 // SLO expiry.
 func (p *Processor) executeJob(ctx, sloCtx, userCancelCtx, requestAbortCtx context.Context, params *jobExecutionParams) (*openai.BatchRequestCounts, error) {
+	// requestAbortCtx is derived from sloCtx (not ctx), so it doesn't carry
+	// the execute-job span. Graft it so process-model spans nest correctly.
+	requestAbortCtx = trace.ContextWithSpan(requestAbortCtx, trace.SpanFromContext(ctx))
+
 	logger := logr.FromContextOrDiscard(ctx)
 	logger.V(logging.INFO).Info("Starting execution: executing job")
 
@@ -192,6 +202,11 @@ func (p *Processor) executeJob(ctx, sloCtx, userCancelCtx, requestAbortCtx conte
 	if err != nil {
 		return nil, fmt.Errorf("failed to read model map: %w", err)
 	}
+
+	uotel.SetAttr(ctx,
+		attribute.Int(uotel.AttrModelCount, len(modelMap.SafeToModel)),
+		attribute.Int64(uotel.AttrInputLineCount, modelMap.LineCount),
+	)
 
 	// Early SLO check: if the deadline already fired before execution begins (e.g. SLO expired
 	// during ingestion), skip dispatch entirely. No output file is written since no requests
@@ -279,10 +294,13 @@ func (p *Processor) executeJob(ctx, sloCtx, userCancelCtx, requestAbortCtx conte
 		// This ensures the first real error reaches errCh before any context.Canceled
 		// from other models whose contexts were cancelled by requestAbortFn.
 		go func(safeModelID, modelID string) {
+			modelCtx, modelSpan := uotel.StartSpan(requestAbortCtx, "process-model",
+				trace.WithAttributes(semconv.GenAiRequestModel(modelID)),
+			)
 			var err error
 			if p.asyncInference != nil {
 				err = p.processModelAsync(
-					requestAbortCtx,
+					modelCtx,
 					ctx,
 					sloCtx,
 					userCancelCtx,
@@ -295,7 +313,7 @@ func (p *Processor) executeJob(ctx, sloCtx, userCancelCtx, requestAbortCtx conte
 				)
 			} else {
 				err = p.processModel(
-					requestAbortCtx,
+					modelCtx,
 					ctx,
 					sloCtx,
 					userCancelCtx,
@@ -307,6 +325,11 @@ func (p *Processor) executeJob(ctx, sloCtx, userCancelCtx, requestAbortCtx conte
 					tenantID,
 				)
 			}
+			if err != nil && !errors.Is(err, errExpired) && !errors.Is(err, errCancelled) && !errors.Is(err, errShutdown) {
+				modelSpan.RecordError(err)
+				modelSpan.SetStatus(codes.Error, "process-model failed")
+			}
+			modelSpan.End()
 			// Abort all sibling models when any model hits a fatal I/O error
 			// (e.g. output file write failure). modelErr is only set for local
 			// I/O failures — not inference errors, which are recorded normally
@@ -422,6 +445,7 @@ func (p *Processor) processModel(
 	if err != nil {
 		return fmt.Errorf("model setup failed: read plan for model %s: %w", modelID, err)
 	}
+	uotel.SetAttr(requestAbortCtx, attribute.Int(uotel.AttrRequestCount, len(entries)))
 
 	logger.V(logging.INFO).Info("Processing requests for a model", "numEntries", len(entries))
 
@@ -563,6 +587,7 @@ func (p *Processor) processModelAsync(
 	if err != nil {
 		return fmt.Errorf("model setup failed: read plan for model %s: %w", modelID, err)
 	}
+	uotel.SetAttr(requestAbortCtx, attribute.Int(uotel.AttrRequestCount, len(entries)))
 
 	logger.V(logging.INFO).Info("Processing requests for model (async)", "numEntries", len(entries))
 
