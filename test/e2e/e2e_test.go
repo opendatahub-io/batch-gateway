@@ -31,6 +31,7 @@ var (
 	testApiserverObsURL   = getEnvOrDefault("TEST_APISERVER_OBS_URL", "http://localhost:8081")
 	testProcessorObsURL   = getEnvOrDefault("TEST_PROCESSOR_OBS_URL", "")
 	testJaegerURL         = getEnvOrDefault("TEST_JAEGER_URL", "http://localhost:16686")
+	testAPIKey            = getEnvOrDefault("TEST_API_KEY", "unused")
 	testTenantHeader      = getEnvOrDefault("TEST_TENANT_HEADER", "X-MaaS-Username")
 	testTenantID          = getEnvOrDefault("TEST_TENANT_ID", "default")
 	testNamespace         = getEnvOrDefault("TEST_NAMESPACE", "default")
@@ -85,6 +86,10 @@ var (
 	// verifications that require kubectl (e.g. log grepping) are skipped.
 	testKubectlAvailable bool
 
+	// testDispatcherDeployed is set once at TestE2E startup; when true,
+	// subtests incompatible with async dispatch mode are skipped.
+	testDispatcherDeployed bool
+
 	// testPassThroughHeaders maps header names (matching apiserver pass_through_headers
 	// configured by dev-deploy.sh) to the values the e2e client sends when asserting
 	// pass-through behavior.
@@ -102,9 +107,7 @@ var (
 )
 
 func TestE2E(t *testing.T) {
-	if detectDispatcherDeployed(t) {
-		t.Skip("skipping: processor is in async dispatch mode (dispatcher tests cover this configuration)")
-	}
+	testDispatcherDeployed = detectDispatcherDeployed(t)
 
 	if out, err := exec.Command("kubectl", "cluster-info").CombinedOutput(); err != nil {
 		t.Logf("kubectl not available, some checks will be skipped: %v\n%s", err, out)
@@ -116,7 +119,14 @@ func TestE2E(t *testing.T) {
 	testExchangeClientType = detectExchangeClientType(t)
 	t.Logf("DB client type: %s, exchange client type: %s", testDBClientType, testExchangeClientType)
 
-	waitForReady(t, testApiserverObsURL, 30*time.Second)
+	waitForServerUp(t, testApiserverURL, 30*time.Second)
+
+	if resp, err := http.Get(testApiserverObsURL + "/ready"); err == nil {
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			waitForReady(t, testApiserverObsURL, 30*time.Second)
+		}
+	}
 
 	t.Run("Files", testFiles)
 	t.Run("Batches", testBatches)
@@ -124,9 +134,9 @@ func TestE2E(t *testing.T) {
 	t.Run("MultiTenant", testMultiTenant)
 	t.Run("GarbageCollection", testGarbageCollection)
 	t.Run("Observability", testObservability)
-	t.Run("ProcessorGracefulShutdown", testProcessorGracefulShutdown)
-	t.Run("OrphanRecovery", testOrphanRecovery)
-	t.Run("FlowControl", testFlowControl)
-	t.Run("AIMD", testAIMD)
-	t.Run("HelmUpgrade", testHelmUpgrade)
+	skipIf(t, testDispatcherDeployed, "requires sync processor", "ProcessorGracefulShutdown", testProcessorGracefulShutdown)
+	skipIf(t, testDispatcherDeployed, "requires sync processor", "OrphanRecovery", testOrphanRecovery)
+	skipIf(t, testDispatcherDeployed, "requires sync processor", "FlowControl", testFlowControl)
+	skipIf(t, testDispatcherDeployed, "requires sync processor", "AIMD", testAIMD)
+	skipIf(t, testDispatcherDeployed, "requires sync processor", "HelmUpgrade", testHelmUpgrade)
 }
