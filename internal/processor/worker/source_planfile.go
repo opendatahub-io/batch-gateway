@@ -64,7 +64,11 @@ func NewPlanFileSource(cfg PlanFileSourceConfig) *PlanFileSource {
 	}
 }
 
-func (s *PlanFileSource) Produce(ctx context.Context, outgoingRequestCh chan<- pipeline.RequestItem) error {
+// Produce sends one item per plan entry to the channel. It always reads the
+// input line so each item retains the original custom_id: cancel / expire
+// drain still needs that identity in the error file even when inference is
+// skipped. Context cancellation is handled by the dispatcher drain path.
+func (s *PlanFileSource) Produce(_ context.Context, outgoingRequestCh chan<- pipeline.RequestItem) error {
 	defer close(outgoingRequestCh)
 
 	for safeModelID, modelID := range s.modelMap.SafeToModel {
@@ -89,7 +93,7 @@ func (s *PlanFileSource) Produce(ctx context.Context, outgoingRequestCh chan<- p
 func (s *PlanFileSource) readEntry(entry planEntry, modelID string) (*pipeline.RequestItem, error) {
 	buf := make([]byte, entry.Length)
 	if _, err := s.inputFile.ReadAt(buf, entry.Offset); err != nil {
-		return nil, fmt.Errorf("read input at offset %d: %w", entry.Offset, err)
+		return nil, fmt.Errorf("%w at offset %d: %w", errRequestInputRead, entry.Offset, err)
 	}
 
 	trimmed := bytes.TrimSuffix(buf, []byte{'\n'})

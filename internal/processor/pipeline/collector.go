@@ -31,11 +31,12 @@ func (o *outputLine) isSuccess() bool {
 // ResultCollector writes ResultItem values to JSONL and records progress.
 // Terminal actor — no out channel.
 type ResultCollector struct {
-	output  *bufio.Writer
-	errors  *bufio.Writer
-	pending *PendingRequests
-	tracker *ProgressTracker
-	logger  logr.Logger
+	output               *bufio.Writer
+	errors               *bufio.Writer
+	pending              *PendingRequests
+	tracker              *ProgressTracker
+	logger               logr.Logger
+	onPersistenceFailure func()
 }
 
 func NewResultCollector(outputFile, errorFile *os.File, pending *PendingRequests, tracker *ProgressTracker, logger logr.Logger) *ResultCollector {
@@ -47,9 +48,11 @@ func NewResultCollector(outputFile, errorFile *os.File, pending *PendingRequests
 
 // Drain reads results until resultCh is closed, then flushes.
 // Both dispatchers close the channel when done, so this always terminates.
-// On a write error, Drain continues reading (to avoid deadlocking the
-// dispatcher) but skips further writes. The error is returned after the
-// channel closes.
+// On a write error, Drain continues reading but skips further writes. This
+// is intentional: the dispatcher sends results to resultCh and blocks if
+// nobody reads; returning early would deadlock the pipeline. The error
+// is returned after the channel closes, causing executeJobAsync to route
+// the job to handleFailed (which uploads whatever partial output is on disk).
 func (c *ResultCollector) Drain(ctx context.Context, resultCh <-chan ResultItem) error {
 	var firstErr error
 	for msg := range resultCh {
@@ -67,6 +70,9 @@ func (c *ResultCollector) Drain(ctx context.Context, resultCh <-chan ResultItem)
 		if err := c.Receive(msg); err != nil {
 			firstErr = err
 			c.logger.Error(err, "Persistence failure, skipping further writes")
+			if c.onPersistenceFailure != nil {
+				c.onPersistenceFailure()
+			}
 		}
 	}
 	if flushErr := c.flushFiles(); flushErr != nil {
@@ -75,7 +81,10 @@ func (c *ResultCollector) Drain(ctx context.Context, resultCh <-chan ResultItem)
 	if firstErr != nil {
 		return firstErr
 	}
-	return ctx.Err()
+	if ctx.Err() != nil {
+		c.logger.Info("Context cancelled after drain completed", "err", ctx.Err())
+	}
+	return nil
 }
 
 func (c *ResultCollector) Receive(msg ResultItem) error {
