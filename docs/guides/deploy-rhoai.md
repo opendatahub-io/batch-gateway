@@ -495,7 +495,7 @@ oc create namespace "${LLM_NS}" 2>/dev/null || true
 oc label namespace "${LLM_NS}" llm-d.ai/gateway-route=true --overwrite
 
 oc apply -f - <<EOF
-apiVersion: serving.kserve.io/v1alpha1
+apiVersion: serving.kserve.io/v1alpha2
 kind: LLMInferenceService
 metadata:
   name: ${ISVC_NAME}
