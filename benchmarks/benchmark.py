@@ -11,7 +11,7 @@ Supports 6 scenarios:
   2 - Ungated batch (aggressive concurrency, no AIMD)
   3 - AIMD only (processor-side adaptive concurrency)
   4 - AIMD + llm-d Router flow control (two-layer protection)
-  5 - Async processor (blocked on integration)
+  5 - Async processor (async dispatch via llm-d-async with endpoint-scrape gate)
 
 Usage:
     python3 benchmarks/benchmark.py \
@@ -1183,6 +1183,7 @@ def _generate_narrative(results, cfg):
     ungated = next((r for r in results if r.scenario == 2), None)
     aimd = next((r for r in results if r.scenario == 3), None)
     fc = next((r for r in results if r.scenario == 4), None)
+    async_proc = next((r for r in results if r.scenario == 5), None)
 
     lines = []
     baseline_burst = _aggregate_phases(baseline.phases, "burst") if baseline else None
@@ -1215,6 +1216,14 @@ def _generate_narrative(results, cfg):
             lines.append(f"AIMD + flow control (S4) achieved the best protection at "
                          f"{overhead:.0f}% above baseline ({fc_burst['ttft_p99']:.0f} ms) "
                          f"with proactive Router-side batch shedding.")
+
+    if async_proc:
+        async_burst = _aggregate_phases(async_proc.phases, "burst")
+        if async_burst and baseline_ttft:
+            overhead = ((async_burst["ttft_p99"] - baseline_ttft) / baseline_ttft) * 100
+            lines.append(f"Async dispatch (S5) limited interactive TTFT p99 impact to "
+                         f"{overhead:.0f}% above baseline ({async_burst['ttft_p99']:.0f} ms) "
+                         f"using async-processor with endpoint-scrape gating.")
 
     # Batch completion summary with per-job SLO status
     for r in results:
@@ -1932,10 +1941,6 @@ def run_scenario(cfg, scenario):
     name = SCENARIO_NAMES[scenario]
     namespace = namespace_for_scenario(scenario)
     log(f"━━━ Scenario {scenario}: {name} ━━━")
-
-    if scenario == 5:
-        log("  ERROR: Scenario 5 (async) is blocked on async-processor integration")
-        return ScenarioResult(scenario=scenario, name=name)
 
     # Verify namespace exists
     try:
