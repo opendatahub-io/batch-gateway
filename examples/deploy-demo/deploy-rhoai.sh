@@ -730,7 +730,7 @@ SCHEDULER_EOF
     fi
 
     kubectl apply -f - <<EOF
-apiVersion: serving.kserve.io/v1alpha1
+apiVersion: serving.kserve.io/v1alpha2
 kind: LLMInferenceService
 metadata:
   name: ${isvc_name}
