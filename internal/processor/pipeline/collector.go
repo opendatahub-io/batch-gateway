@@ -47,9 +47,11 @@ func NewResultCollector(outputFile, errorFile *os.File, pending *PendingRequests
 
 // Drain reads results until resultCh is closed, then flushes.
 // Both dispatchers close the channel when done, so this always terminates.
-// On a write error, Drain continues reading (to avoid deadlocking the
-// dispatcher) but skips further writes. The error is returned after the
-// channel closes.
+// On a write error, Drain continues reading but skips further writes. This
+// is intentional: the dispatcher sends results to resultCh and blocks if
+// nobody reads; returning early would deadlock the pipeline. The error
+// is returned after the channel closes, causing executeJobAsync to route
+// the job to handleFailed (which uploads whatever partial output is on disk).
 func (c *ResultCollector) Drain(ctx context.Context, resultCh <-chan ResultItem) error {
 	var firstErr error
 	for msg := range resultCh {
@@ -75,7 +77,10 @@ func (c *ResultCollector) Drain(ctx context.Context, resultCh <-chan ResultItem)
 	if firstErr != nil {
 		return firstErr
 	}
-	return ctx.Err()
+	if ctx.Err() != nil {
+		c.logger.Info("Context cancelled after drain completed", "err", ctx.Err())
+	}
+	return nil
 }
 
 func (c *ResultCollector) Receive(msg ResultItem) error {

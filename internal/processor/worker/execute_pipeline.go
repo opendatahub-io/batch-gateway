@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/go-logr/logr"
+	"github.com/llm-d/llm-d-batch-gateway/pkg/clients/inference"
 
 	"github.com/llm-d/llm-d-batch-gateway/internal/processor/pipeline"
 	"github.com/llm-d/llm-d-batch-gateway/internal/shared/openai"
@@ -79,17 +80,10 @@ func (p *Processor) executeJobAsync(ctx, sloCtx, userCancelCtx, requestAbortCtx 
 
 	// The dispatcher forwards requests for processing.
 	pending := pipeline.NewPendingRequests(modelMap.LineCount)
-
-	// Broadcasters propagate asynchronous responses to subscribers.
-	broadcasters := p.broadcasters.forModels(modelMap)
-
-	// The async dispatcher submits requests to the async queue and
-	// subscribes the result channel to the per-model broadcasters.
-	dispatcher := pipeline.NewAsyncDispatcher(
-		p.asyncInference,
-		broadcasters,
-		pending,
-		logger)
+	dispatcher, err := p.buildRequestDispatcher(modelMap, pending, logger)
+	if err != nil {
+		return nil, fmt.Errorf("build dispatcher: %w", err)
+	}
 
 	// Collects the result and logs them.
 	resultCollector := pipeline.NewResultCollector(
@@ -112,7 +106,6 @@ func (p *Processor) executeJobAsync(ctx, sloCtx, userCancelCtx, requestAbortCtx 
 	// Finally, start and wait for completion.
 	counts, execErr := executor.Execute(requestAbortCtx)
 
-	// Handle cancellations before errors — a cancel may have caused the error.
 	switch {
 	case sloCtx.Err() == context.DeadlineExceeded:
 		return counts, errExpired
@@ -125,6 +118,35 @@ func (p *Processor) executeJobAsync(ctx, sloCtx, userCancelCtx, requestAbortCtx 
 	}
 
 	return counts, nil
+}
+
+func (p *Processor) buildRequestDispatcher(modelMap *modelMapFile, pending *pipeline.PendingRequests, logger logr.Logger) (pipeline.RequestDispatcher, error) {
+	switch {
+	case p.asyncInference != nil:
+		broadcasters := p.broadcasters.forModels(modelMap)
+		async := pipeline.NewAsyncDispatcher(p.asyncInference, broadcasters, pending, logger)
+		return pipeline.NewPreDispatcher(async), nil
+	case p.cfg.Concurrency.AIMD.Enabled:
+		models := buildAIMDModels(modelMap, p.inference, p.endpointLimits)
+		direct := pipeline.NewDirectDispatcher(p.inference, logger)
+		aimd, err := pipeline.NewAIMDDispatcher(direct, models, p.cfg.Concurrency.Global, logger)
+		if err != nil {
+			return nil, err
+		}
+		return pipeline.NewPreDispatcher(aimd), nil
+	default:
+		// AIMD is used even when adaptive limits are disabled: with AIMD.Enabled=false,
+		// EndpointAIMD.AIMD is nil so recordAIMDSignal is a no-op, but the semaphores
+		// still enforce fixed concurrency limits (global + per-endpoint). Without this,
+		// DirectDispatcher would dispatch all requests as unbounded goroutines.
+		models := buildAIMDModels(modelMap, p.inference, p.endpointLimits)
+		direct := pipeline.NewDirectDispatcher(p.inference, logger)
+		aimd, err := pipeline.NewAIMDDispatcher(direct, models, p.cfg.Concurrency.Global, logger)
+		if err != nil {
+			return nil, err
+		}
+		return pipeline.NewPreDispatcher(aimd), nil
+	}
 }
 
 func logPassThroughHeaders(params *jobExecutionParams, logger logr.Logger) {
@@ -188,4 +210,24 @@ func (p *Processor) openDataFiles(params *jobExecutionParams) (*dataFiles, error
 	}
 
 	return &dataFiles{input: inputFile, output: outputFile, error: errorFile}, nil
+}
+
+func buildAIMDModels(modelMap *modelMapFile, resolver *inference.GatewayResolver, endpointLimits map[inference.InferenceClient]*endpointLimit) map[string]*pipeline.EndpointAIMD {
+	models := make(map[string]*pipeline.EndpointAIMD)
+	for _, modelID := range modelMap.SafeToModel {
+		client := resolver.ClientFor(modelID)
+		if client == nil {
+			continue
+		}
+		ep := endpointLimits[client]
+		if ep == nil {
+			continue
+		}
+		models[modelID] = &pipeline.EndpointAIMD{
+			Sem:   ep.sem,
+			AIMD:  ep.aimd,
+			Label: ep.label,
+		}
+	}
+	return models
 }

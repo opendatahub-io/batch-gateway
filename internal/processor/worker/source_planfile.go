@@ -64,6 +64,10 @@ func NewPlanFileSource(cfg PlanFileSourceConfig) *PlanFileSource {
 	}
 }
 
+// Produce sends one item per plan entry to the channel. After context
+// cancellation, it skips I/O (ReadAt + Unmarshal) but still sends a
+// minimal item so the dispatcher's drain loop can account for it.
+// This avoids both silent entry drops and unnecessary I/O during shutdown.
 func (s *PlanFileSource) Produce(ctx context.Context, outgoingRequestCh chan<- pipeline.RequestItem) error {
 	defer close(outgoingRequestCh)
 
@@ -75,6 +79,15 @@ func (s *PlanFileSource) Produce(ctx context.Context, outgoingRequestCh chan<- p
 		}
 
 		for _, entry := range entries {
+			if ctx.Err() != nil {
+				reqID := fmt.Sprintf("batch_req_%s", uuid.NewString())
+				outgoingRequestCh <- pipeline.RequestItem{
+					RequestID: reqID,
+					CustomID:  reqID,
+					ModelID:   modelID,
+				}
+				continue
+			}
 			item, err := s.readEntry(entry, modelID)
 			if err != nil {
 				return err
@@ -89,7 +102,7 @@ func (s *PlanFileSource) Produce(ctx context.Context, outgoingRequestCh chan<- p
 func (s *PlanFileSource) readEntry(entry planEntry, modelID string) (*pipeline.RequestItem, error) {
 	buf := make([]byte, entry.Length)
 	if _, err := s.inputFile.ReadAt(buf, entry.Offset); err != nil {
-		return nil, fmt.Errorf("read input at offset %d: %w", entry.Offset, err)
+		return nil, fmt.Errorf("%w at offset %d: %w", errRequestInputRead, entry.Offset, err)
 	}
 
 	trimmed := bytes.TrimSuffix(buf, []byte{'\n'})
