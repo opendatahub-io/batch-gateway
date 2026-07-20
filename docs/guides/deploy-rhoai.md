@@ -704,7 +704,7 @@ oc wait tokenratelimitpolicy/inference-token-limit \
 ```
 </details>
 
-### 3.9 Install Batch Gateway
+### 3.9 Batch Gateway Dependencies
 
 The batch processor routes inference requests through a separate, ClusterIP-only Internal Gateway to bypass the TokenRateLimitPolicy on the external Gateway while still enforcing model-level authorization (AuthPolicy).
 
@@ -863,7 +863,7 @@ EOF
 
 </details>
 
-The batch-gateway is deployed via the `LLMBatchGateway` CR, which is managed by the batch-gateway-operator (deployed automatically when `aigateway.batchGateway.managementState: Managed` is set in the DataScienceCluster).
+Deploy batch-gateway dependencies (Redis, PostgreSQL, MinIO) and create the application secret:
 
 <details>
 <summary>Create namespace and install dependencies</summary>
@@ -976,8 +976,18 @@ oc create secret generic batch-gateway-secrets \
 
 </details>
 
+### 3.10 Install Batch Gateway
+
+The batch-gateway is deployed via the `LLMBatchGateway` CR, which is managed by the batch-gateway-operator (deployed automatically when `aigateway.batchGateway.managementState: Managed` is set in the DataScienceCluster).
+
+Choose **one** of the two dispatch modes below (sync or async).
+
+#### 3.10.1 Option 1: Sync dispatch (default)
+
 <details>
-<summary>Create LLMBatchGateway CR</summary>
+<summary>Create LLMBatchGateway CR (sync)</summary>
+
+The processor sends inference requests directly to the Internal Gateway via HTTP.
 
 ```bash
 # Get model URL from the Internal Gateway service
@@ -1008,14 +1018,14 @@ spec:
     replicas: 1
   processor:
     replicas: 1
-    globalInferenceGateway:
-      url: ${MODEL_URL}
-      requestTimeout: 5m
-      maxRetries: 3
-      initialBackoff: 1s
-      maxBackoff: 60s
-    config:
-      inferenceObjective: batch-sheddable
+    modelGateways:
+      ${MODEL_NAME}:
+        url: ${MODEL_URL}
+        requestTimeout: 5m
+        maxRetries: 3
+        initialBackoff: 1s
+        maxBackoff: 60s
+        inferenceObjective: batch-sheddable
   gc:
     interval: 30m
   tls:
@@ -1034,9 +1044,9 @@ oc wait llmbatchgateway/batch-gateway -n ${BATCH_NS} \
     --for=condition=Ready --timeout=300s
 ```
 
-> - **`processor.globalInferenceGateway.url`**: Points to the Internal Gateway's model endpoint. The Internal Gateway enforces AuthPolicy (model access check) but not TokenRateLimitPolicy.
-> - **`processor.config.inferenceObjective`**: The `InferenceObjective` CRD name sent as the `x-gateway-inference-objective` header. EPP uses this to assign the request to the batch priority band (priority -1, sheddable).
-> - **`tls.certManager`**: Enables TLS for the batch API server using cert-manager. In this demo the DestinationRule (see [3.10](#310-configure-httproute-and-policies-for-batch-gateway)) uses `insecureSkipVerify: true` because we use a self-signed certificate; in production, configure a trusted CA.
+> - **`modelGateways.<model>.url`**: Points to the Internal Gateway's model endpoint. The Internal Gateway enforces AuthPolicy (model access check) but not TokenRateLimitPolicy.
+> - **`modelGateways.<model>.inferenceObjective`**: The `InferenceObjective` CRD name sent as the `x-gateway-inference-objective` header. EPP uses this to assign the request to the batch priority band (priority -1, sheddable).
+> - **`tls.certManager`**: Enables TLS for the batch API server using cert-manager. In this demo the DestinationRule (see [3.11](#311-configure-httproute-and-policies-for-batch-gateway)) uses `insecureSkipVerify: true` because we use a self-signed certificate; in production, configure a trusted CA.
 > - **Images**: The operator pins component images (apiserver, processor, gc) from its deployment configuration. You do not set image references in the CR.
 > - **File storage**: This example uses S3-compatible storage (MinIO). To use a PVC instead, replace `fileStorage.s3` with:
 >   ```yaml
@@ -1049,7 +1059,230 @@ oc wait llmbatchgateway/batch-gateway -n ${BATCH_NS} \
 
 </details>
 
-### 3.10 Configure HTTPRoute and Policies for Batch Gateway
+#### 3.10.2 Option 2: Async dispatch
+
+Uses [llm-d-async](https://github.com/llm-d/llm-d-async). The async-processor uses a dispatch gate to control when requests are sent to the model server. This example uses the `prometheus-budget` gate, which requires Prometheus scraping EPP and vLLM metrics. See [llm-d-async dispatch gates](https://github.com/llm-d/llm-d-async#per-queue-dispatch-gates) for other gate types.
+
+> - **`dispatchMode: async`** + **`inferencePoolName`**: The processor sends requests to Redis queues instead of making direct HTTP calls. This replaces `modelGateways.<model>.url`/`requestTimeout`/`maxRetries`/etc.
+> - **`asyncConfig`**: The operator deploys an async-processor component automatically. The `asyncConfig` block configures Redis queues, worker pools, Prometheus URL, and dispatch gates.
+> - **`igwBaseURL`**: The async-processor sends inference requests through the Internal Gateway (same path as sync). Pass-through headers (including Authorization) are forwarded, so AuthPolicy works.
+> - **`gate_type: prometheus-budget`**: Computes a dispatch budget from EPP flow control metrics (primary) with vLLM metrics fallback. Requires `prometheusURL` and `gate_params.pool`.
+
+<details>
+<summary>Deploy Prometheus (required for prometheus-budget gate)</summary>
+
+Deploy a minimal Prometheus instance scraping EPP and vLLM metrics. On RHOAI, the EPP endpoint requires SA token auth and vLLM pods serve metrics over HTTPS.
+
+```bash
+# Discover the InferencePool name
+POOL_NAME=$(oc get inferencepool -n ${LLM_NS} -o json | \
+    jq -r --arg owner "${ISVC_NAME}" \
+    '.items[] | select(.metadata.ownerReferences[]?.name == $owner) | .metadata.name' | head -1)
+
+oc apply -n "${LLM_NS}" -f - <<EOF
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-config
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: 5s
+    scrape_configs:
+    - job_name: 'epp'
+      metrics_path: /metrics
+      authorization:
+        credentials_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+      static_configs:
+      - targets: ['${ISVC_NAME}-epp-service.${LLM_NS}.svc.cluster.local:9090']
+    - job_name: 'vllm'
+      scheme: https
+      tls_config:
+        insecure_skip_verify: true
+      metrics_path: /metrics
+      kubernetes_sd_configs:
+      - role: pod
+        namespaces:
+          names: ['${LLM_NS}']
+      relabel_configs:
+      - source_labels: [__meta_kubernetes_pod_label_app_kubernetes_io_component]
+        action: keep
+        regex: 'llminferenceservice-workload'
+      - source_labels: [__meta_kubernetes_pod_ip]
+        target_label: __address__
+        replacement: '\${1}:8000'
+      metric_relabel_configs:
+      - target_label: inference_pool
+        replacement: '${POOL_NAME}'
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prometheus
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: prometheus
+  template:
+    metadata:
+      labels:
+        app: prometheus
+    spec:
+      serviceAccountName: prometheus
+      containers:
+      - name: prometheus
+        image: prom/prometheus:v3.5.0
+        args:
+        - --config.file=/etc/prometheus/prometheus.yml
+        - --storage.tsdb.retention.time=1h
+        - --storage.tsdb.path=/tmp/prometheus
+        ports:
+        - containerPort: 9090
+        volumeMounts:
+        - name: config
+          mountPath: /etc/prometheus
+      volumes:
+      - name: config
+        configMap:
+          name: prometheus-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: prometheus
+spec:
+  selector:
+    app: prometheus
+  ports:
+  - port: 9090
+    targetPort: 9090
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: prometheus
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: prometheus
+rules:
+- apiGroups: [""]
+  resources: [pods]
+  verbs: [get, list, watch]
+- nonResourceURLs: [/metrics]
+  verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: prometheus
+subjects:
+- kind: ServiceAccount
+  name: prometheus
+  namespace: ${LLM_NS}
+roleRef:
+  kind: ClusterRole
+  name: prometheus
+  apiGroup: rbac.authorization.k8s.io
+EOF
+
+oc rollout status deployment/prometheus -n ${LLM_NS} --timeout=120s
+```
+
+> **RHOAI-specific scrape config**: EPP requires SA token auth (`authorization.credentials_file`). vLLM pods serve metrics over HTTPS with self-signed certs (`insecure_skip_verify: true`). The `metric_relabel_configs` inject the `inference_pool` label that vLLM does not emit natively.
+
+</details>
+
+<details>
+<summary>Create LLMBatchGateway CR (async)</summary>
+
+```bash
+INTERNAL_GW_SVC=$(oc get svc -n openshift-ingress \
+    -l "gateway.networking.k8s.io/gateway-name=batch-internal-gateway" \
+    -o jsonpath='{.items[0].metadata.name}')
+MODEL_URL="http://${INTERNAL_GW_SVC}.openshift-ingress.svc.cluster.local/${LLM_NS}/${ISVC_NAME}"
+
+oc apply -f - <<EOF
+apiVersion: batch.llm-d.ai/v1alpha1
+kind: LLMBatchGateway
+metadata:
+  name: batch-gateway
+  namespace: ${BATCH_NS}
+spec:
+  secretRef:
+    name: batch-gateway-secrets
+  dbBackend: postgresql
+  fileStorage:
+    s3:
+      region: us-east-1
+      endpoint: http://minio.${BATCH_NS}.svc.cluster.local:9000
+      accessKeyId: ${MINIO_USER}
+      prefix: ${MINIO_BUCKET}
+      usePathStyle: true
+      autoCreateBucket: true
+  apiServer:
+    replicas: 1
+  processor:
+    replicas: 1
+    dispatchMode: async
+    modelGateways:
+      ${MODEL_NAME}:
+        inferencePoolName: ${POOL_NAME}
+        inferenceObjective: batch-sheddable
+    asyncConfig:
+      replicas: 1
+      concurrency: 1
+      drainTimeout: 2m
+      resultPollTimeout: 30s
+      prometheusURL: http://prometheus.${LLM_NS}.svc.cluster.local:9090
+      prometheusCacheTTL: "0s"
+      redis:
+        requestPathURL: /v1/chat/completions
+        pollIntervalMs: 500
+        batchSize: 10
+        queuesConfig:
+        - name: "llm-d-async:requests:${POOL_NAME}"
+          requestPathURL: /v1/chat/completions
+          igwBaseURL: ${MODEL_URL}
+          gateType: prometheus-budget
+          gateParams:
+            pool: "${POOL_NAME}"
+            namespace: "${LLM_NS}"
+            max_concurrency: "100"
+            baseline: "0.05"
+            fallback: "1.0"
+          workerPoolID: default-workers
+      workerPools:
+      - name: default-workers
+        workers: 4
+        gateType: local-max-concurrency
+        gateParams:
+          limit: "2"
+  gc:
+    interval: 30m
+  tls:
+    enabled: true
+    certManager:
+      issuerName: selfsigned-issuer
+      issuerKind: ClusterIssuer
+      dnsNames:
+      - batch-gateway-apiserver
+      - batch-gateway-apiserver.${BATCH_NS}.svc.cluster.local
+      - localhost
+EOF
+
+oc wait llmbatchgateway/batch-gateway -n ${BATCH_NS} \
+    --for=condition=Ready --timeout=300s
+```
+
+> - The `asyncConfig` block is operator-managed: the operator deploys an `async-processor` Deployment automatically based on this configuration. You do not deploy the async-processor separately (unlike the Helm-based K8s path).
+> - **`workerPools`**: Each worker pool has its own gate. The `local-max-concurrency` gate on `default-workers` limits concurrent in-flight requests per worker, while the `prometheus-budget` gate on the queue controls overall dispatch rate based on cluster capacity.
+
+</details>
+
+### 3.11 Configure HTTPRoute and Policies for Batch Gateway
 
 Set the variable used throughout this section (re-set if starting a new shell):
 ```bash
