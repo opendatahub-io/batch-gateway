@@ -146,6 +146,7 @@ metadata:
 spec:
   managementState: Managed
 EOF
+
     log "LWS operator installed."
 }
 
@@ -685,11 +686,11 @@ deploy_llm_inference_service() {
     wait_for_crd "llminferenceservices.serving.kserve.io"
 
     # Build scheduler config: with or without flow control
-    local scheduler_yaml
+    # TODO(RHOAIENG-78216): remove epp template override once upstream fixes --model-server-metrics-scheme flag
+    local scheduler_config_yaml
     if [ "${ENABLE_FLOW_CONTROL}" = "true" ]; then
         log "Flow control enabled: EPP will use EndpointPickerConfig with flowControl feature gate"
-        scheduler_yaml=$(cat <<'SCHEDULER_EOF'
-    scheduler:
+        scheduler_config_yaml=$(cat <<'EOF'
       config:
         inline:
           apiVersion: inference.networking.x-k8s.io/v1alpha1
@@ -697,6 +698,9 @@ deploy_llm_inference_service() {
           featureGates:
             - "flowControl"
           plugins:
+            - type: metrics-data-source
+              parameters:
+                scheme: https
             - type: round-robin-fairness-policy
             - type: global-strict-fairness-policy
             - type: slo-deadline-ordering-policy
@@ -723,10 +727,20 @@ deploy_llm_inference_service() {
               maxBytes: 536870912
               fairnessPolicyRef: global-strict-fairness-policy
               orderingPolicyRef: fcfs-ordering-policy
-SCHEDULER_EOF
+EOF
         )
     else
-        scheduler_yaml="    scheduler: {}"
+        scheduler_config_yaml=$(cat <<'EOF'
+      config:
+        inline:
+          apiVersion: inference.networking.x-k8s.io/v1alpha1
+          kind: EndpointPickerConfig
+          plugins:
+            - type: metrics-data-source
+              parameters:
+                scheme: https
+EOF
+        )
     fi
 
     kubectl apply -f - <<EOF
@@ -745,13 +759,39 @@ spec:
   replicas: ${MODEL_REPLICAS}
   router:
     route: {}
-    #gateway:
-    #  refs:
-    #    - name: ${GATEWAY_NAME}
-    #      namespace: ${GATEWAY_NAMESPACE}
-    # No gateway.refs needed: KServe uses the default gateway configured in
+    gateway:
+      refs:
+        - name: ${GATEWAY_NAME}
+          namespace: ${GATEWAY_NAMESPACE}
+    # if there is no gateway.refs defined: KServe uses the default gateway configured in
     # inferenceservice-config ConfigMap (kserveIngressGateway: openshift-ingress/openshift-ai-inference).
-${scheduler_yaml}
+    scheduler:
+      template:
+        containers:
+        - name: main
+          command:
+          - /app/epp
+          - --pool-name
+          - "{{ ChildName .ObjectMeta.Name \`-inference-pool\` }}"
+          - --pool-namespace
+          - "{{ .ObjectMeta.Namespace }}"
+          - --zap-encoder
+          - json
+          - --grpc-port
+          - "9002"
+          - --grpc-health-port
+          - "9003"
+          - --enable-cert-reload=true
+          - --secure-serving=true
+          - --cert-path=/var/run/kserve/tls
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+${scheduler_config_yaml}
   template:
     containers:
       - name: main
@@ -765,6 +805,8 @@ ${scheduler_yaml}
         - ${MODEL_NAME}
         - --mode
         - random
+        - --fake-metrics
+        - '{"kv-cache-usage": 0, "waiting-requests": 0, "running-requests": 0}'
         - --ssl-certfile
         - /var/run/kserve/tls/tls.crt
         - --ssl-keyfile
@@ -855,7 +897,7 @@ create_inference_objectives() {
 
     step "Creating InferenceObjective CRDs..."
     kubectl apply -f - <<EOF
-apiVersion: inference.networking.x-k8s.io/v1alpha2
+apiVersion: llm-d.ai/v1alpha2
 kind: InferenceObjective
 metadata:
   name: ${INTERACTIVE_FLOW_CONTROL_OBJECTIVE}
@@ -866,7 +908,7 @@ spec:
     group: inference.networking.k8s.io
     name: ${pool_name}
 ---
-apiVersion: inference.networking.x-k8s.io/v1alpha2
+apiVersion: llm-d.ai/v1alpha2
 kind: InferenceObjective
 metadata:
   name: ${BATCH_FLOW_CONTROL_OBJECTIVE}
@@ -1077,7 +1119,133 @@ EOF
     log "RateLimitPolicy applied (20 req/min per user)."
 }
 
-# ── 6i. Flow control verification ────────────────────────────────────────────
+# ── 6i. Prometheus for async dispatch gate ─────────────────────────────────────
+
+install_prometheus_for_dispatcher() {
+    local pool_name="$1"
+    local isvc_name="$2"
+    local prom_name="prometheus"
+
+    if kubectl get deployment "${prom_name}" -n "${LLM_NAMESPACE}" &>/dev/null; then
+        log "Prometheus already exists in ${LLM_NAMESPACE}. Skipping."
+        return
+    fi
+
+    step "Installing Prometheus for async dispatch gate (prometheus-budget)..."
+    kubectl apply -n "${LLM_NAMESPACE}" -f - <<EOF
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ${prom_name}-config
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: 5s
+    scrape_configs:
+    - job_name: 'epp'
+      metrics_path: /metrics
+      authorization:
+        credentials_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+      static_configs:
+      - targets: ['${isvc_name}-epp-service.${LLM_NAMESPACE}.svc.cluster.local:9090']
+    - job_name: 'vllm'
+      scheme: https
+      tls_config:
+        insecure_skip_verify: true
+      metrics_path: /metrics
+      kubernetes_sd_configs:
+      - role: pod
+        namespaces:
+          names: ['${LLM_NAMESPACE}']
+      relabel_configs:
+      - source_labels: [__meta_kubernetes_pod_label_app_kubernetes_io_component]
+        action: keep
+        regex: 'llminferenceservice-workload'
+      - source_labels: [__meta_kubernetes_pod_ip]
+        target_label: __address__
+        replacement: '\${1}:8000'
+      metric_relabel_configs:
+      - target_label: inference_pool
+        replacement: '${pool_name}'
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ${prom_name}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ${prom_name}
+  template:
+    metadata:
+      labels:
+        app: ${prom_name}
+    spec:
+      serviceAccountName: ${prom_name}
+      containers:
+      - name: prometheus
+        image: prom/prometheus:v3.5.0
+        args:
+        - --config.file=/etc/prometheus/prometheus.yml
+        - --storage.tsdb.retention.time=1h
+        - --storage.tsdb.path=/tmp/prometheus
+        ports:
+        - containerPort: 9090
+        volumeMounts:
+        - name: config
+          mountPath: /etc/prometheus
+      volumes:
+      - name: config
+        configMap:
+          name: ${prom_name}-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ${prom_name}
+spec:
+  selector:
+    app: ${prom_name}
+  ports:
+  - port: 9090
+    targetPort: 9090
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ${prom_name}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: ${prom_name}
+rules:
+- apiGroups: [""]
+  resources: [pods]
+  verbs: [get, list, watch]
+- nonResourceURLs: [/metrics]
+  verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: ${prom_name}
+subjects:
+- kind: ServiceAccount
+  name: ${prom_name}
+  namespace: ${LLM_NAMESPACE}
+roleRef:
+  kind: ClusterRole
+  name: ${prom_name}
+  apiGroup: rbac.authorization.k8s.io
+EOF
+
+    wait_for_deployment "${prom_name}" "${LLM_NAMESPACE}" 120s
+    log "Prometheus installed (scraping EPP + vLLM metrics)."
+}
+
+# ── 6j. Flow control verification ────────────────────────────────────────────
 
 verify_flow_control_config() {
     banner "Verifying Flow Control configuration"
@@ -1085,7 +1253,6 @@ verify_flow_control_config() {
     local isvc_name="${ISVC_NAME}"
     local errors=0
 
-    # 1. EPP scheduler pod config
     step "Checking EPP scheduler pod config..."
     local epp_pod
     epp_pod=$(kubectl get pod -n "${LLM_NAMESPACE}" \
@@ -1106,7 +1273,6 @@ verify_flow_control_config() {
         fi
     fi
 
-    # 2. InferenceObjective CRDs
     step "Checking InferenceObjective CRDs..."
     for obj in "${INTERACTIVE_FLOW_CONTROL_OBJECTIVE}" "${BATCH_FLOW_CONTROL_OBJECTIVE}"; do
         if kubectl get inferenceobjective "${obj}" -n "${LLM_NAMESPACE}" &>/dev/null; then
@@ -1117,7 +1283,6 @@ verify_flow_control_config() {
         fi
     done
 
-    # 3. Batch processor inferenceObjective config
     step "Checking batch processor config..."
     if kubectl get configmap "${BATCH_INSTANCE_NAME}-processor-config" -n "${BATCH_NAMESPACE}" \
         -o jsonpath='{.data}' 2>/dev/null | grep "inference_objective" | grep -q "${BATCH_FLOW_CONTROL_OBJECTIVE}"; then
@@ -1141,7 +1306,6 @@ verify_flow_control_runtime() {
 
     step "Fetching EPP flow control metrics..."
 
-    # Try to find a metrics-reader SA token secret (name varies across RHOAI versions).
     local metrics_token=""
     local metrics_secret
     metrics_secret=$(kubectl get secret -n "${LLM_NAMESPACE}" -o json \
@@ -1185,7 +1349,6 @@ verify_flow_control_runtime() {
 
     echo "${metrics_body}" | grep 'inference_extension_flow_control_request_queue_duration_seconds_count'
 
-    # 1. Interactive requests dispatched (priority 0)
     step "Checking flow control metrics for interactive requests (priority 0)..."
     local interactive_count
     interactive_count=$(echo "${metrics_body}" | grep 'inference_extension_flow_control_request_queue_duration_seconds_count' \
@@ -1197,7 +1360,6 @@ verify_flow_control_runtime() {
         errors=$((errors + 1))
     fi
 
-    # 2. Batch requests dispatched (priority -1)
     step "Checking flow control metrics for batch requests (priority -1)..."
     local batch_count
     batch_count=$(echo "${metrics_body}" | grep 'inference_extension_flow_control_request_queue_duration_seconds_count' \
@@ -1209,7 +1371,6 @@ verify_flow_control_runtime() {
         errors=$((errors + 1))
     fi
 
-    # 3. Pool saturation metric exists
     step "Checking pool saturation metric..."
     if [[ "${metrics_body}" == *"inference_extension_flow_control_pool_saturation"* ]]; then
         local saturation
@@ -1217,8 +1378,8 @@ verify_flow_control_runtime() {
             | grep -oE '[0-9.]+$' | head -1)
         log "Pool saturation: ${saturation}"
     else
-        # saturation metric may not be exposed in EPP
         warn "Pool saturation metric not found."
+        errors=$((errors + 1))
     fi
 
     if [ "${errors}" -gt 0 ]; then
@@ -1227,11 +1388,93 @@ verify_flow_control_runtime() {
     log "Flow control runtime verification passed."
 }
 
+# ── 6k. Async dispatch verification ───────────────────────────────────────────
+
+verify_dispatcher_config() {
+    banner "Verifying Async Dispatch Configuration"
+
+    local errors=0
+
+    step "Checking LLMBatchGateway dispatch mode..."
+    local dispatch_mode
+    dispatch_mode=$(kubectl get llmbatchgateway "${BATCH_INSTANCE_NAME}" -n "${BATCH_NAMESPACE}" \
+        -o jsonpath='{.spec.processor.dispatchMode}' 2>/dev/null || echo "")
+    if [ "${dispatch_mode}" = "async" ]; then
+        log "LLMBatchGateway dispatchMode: async"
+    else
+        warn "LLMBatchGateway dispatchMode is '${dispatch_mode}', expected 'async'"
+        errors=$((errors + 1))
+    fi
+
+    step "Checking LLMBatchGateway async-processor status..."
+    local async_ready
+    async_ready=$(kubectl get llmbatchgateway "${BATCH_INSTANCE_NAME}" -n "${BATCH_NAMESPACE}" \
+        -o jsonpath='{.status.componentStatus.asyncProcessor.readyReplicas}' 2>/dev/null || echo "0")
+    if [ "${async_ready}" -gt 0 ] 2>/dev/null; then
+        log "Async-processor ready replicas: ${async_ready}"
+    else
+        warn "Async-processor has 0 ready replicas"
+        errors=$((errors + 1))
+    fi
+
+    step "Checking async-processor deployment..."
+    if kubectl get deployment "${BATCH_INSTANCE_NAME}-async-processor" -n "${BATCH_NAMESPACE}" &>/dev/null; then
+        local ready
+        ready=$(kubectl get deployment "${BATCH_INSTANCE_NAME}-async-processor" -n "${BATCH_NAMESPACE}" \
+            -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0")
+        if [ "${ready}" -gt 0 ] 2>/dev/null; then
+            log "Async-processor deployment ready (${ready} replicas)"
+        else
+            warn "Async-processor deployment exists but not ready"
+            errors=$((errors + 1))
+        fi
+    else
+        warn "Async-processor deployment '${BATCH_INSTANCE_NAME}-async-processor' not found"
+        errors=$((errors + 1))
+    fi
+
+    step "Checking batch-processor configmap..."
+    local config_yaml
+    config_yaml=$(kubectl get configmap "${BATCH_INSTANCE_NAME}-processor-config" -n "${BATCH_NAMESPACE}" \
+        -o jsonpath='{.data.config\.yaml}' 2>/dev/null || echo "")
+
+    local dispatch_mode_config
+    dispatch_mode_config=$(echo "${config_yaml}" | yq '.dispatch_mode // "sync"')
+    if [ "${dispatch_mode_config}" = "async" ]; then
+        log "Processor configmap has dispatch_mode: async"
+    else
+        warn "Processor configmap does not contain dispatch_mode: async"
+        errors=$((errors + 1))
+    fi
+
+    local pool_name
+    pool_name=$(echo "${config_yaml}" | yq ".model_gateways.\"${MODEL_NAME}\".inference_pool_name // \"\"")
+    if [ -n "${pool_name}" ]; then
+        log "Processor inference_pool_name: ${pool_name}"
+    else
+        warn "Processor missing inference_pool_name for model '${MODEL_NAME}'"
+        errors=$((errors + 1))
+    fi
+
+    if [ "${errors}" -gt 0 ]; then
+        die "Async dispatch config verification failed with ${errors} error(s)."
+    fi
+    log "Async dispatch configuration verified."
+}
+
+
 # ── 7. Batch Gateway ─────────────────────────────────────────────────────────
 
 deploy_batch_gateway_rhoai() {
     banner "Installing Batch Gateway"
-    do_deploy_batch_gateway_dsc "${ISVC_NAME}" "Authorization"
+    if [ "${ENABLE_DISPATCHER}" = "true" ]; then
+        local pool_name
+        pool_name=$(discover_inference_pool)
+        install_prometheus_for_dispatcher "${pool_name}" "${ISVC_NAME}"
+        do_deploy_batch_gateway_dsc "${ISVC_NAME}" "Authorization" "${pool_name}"
+    else
+        do_deploy_batch_gateway_dsc "${ISVC_NAME}" "Authorization"
+    fi
 }
 
 check_prerequisites() {
@@ -1288,6 +1531,9 @@ cmd_install() {
     create_batch_llm_httproute
     apply_batch_llm_auth_policy
     deploy_batch_gateway_rhoai
+    if [ "${ENABLE_DISPATCHER}" = "true" ]; then
+        verify_dispatcher_config
+    fi
     apply_batch_auth_policy
     apply_batch_request_rate_limit
 
@@ -1302,6 +1548,7 @@ cmd_install() {
     [ -n "${CUSTOM_CATALOG}" ] && log "  Catalog:  ${CUSTOM_CATALOG} (custom)"
     log "  Model: ${MODEL_NAME} (simulator, ${MODEL_REPLICAS} replicas, no GPU)"
     log "  Flow Control: ${ENABLE_FLOW_CONTROL}"
+    log "  Async Dispatch: ${ENABLE_DISPATCHER}"
     log "  Batch Gateway: ${BATCH_INSTANCE_NAME} (${BATCH_NAMESPACE}, LLMBatchGateway CR)"
     log ""
     log "Run '$0 test' to verify."
@@ -1380,6 +1627,12 @@ EOF
         "${inference_payload}" \
         || test_failures=$?
 
+    if [ "${ENABLE_DISPATCHER}" = "true" ]; then
+        local pool_name
+        pool_name=$(discover_inference_pool)
+        verify_dispatcher_runtime "${BATCH_INSTANCE_NAME}-async-processor" "${pool_name}"
+    fi
+
     if [ "${ENABLE_FLOW_CONTROL}" = "true" ]; then
         verify_flow_control_runtime
     fi
@@ -1416,6 +1669,11 @@ cmd_uninstall() {
     # DestinationRule (in GATEWAY_NAMESPACE, not deleted with batch namespace)
     kubectl delete destinationrule "${BATCH_INSTANCE_NAME}-backend-tls" -n "${GATEWAY_NAMESPACE}" 2>/dev/null || true
 
+    # Prometheus (for async dispatch gate)
+    step "Removing Prometheus resources..."
+    kubectl delete deployment,svc,configmap,sa prometheus -n "${LLM_NAMESPACE}" 2>/dev/null || true
+    kubectl delete clusterrole,clusterrolebinding prometheus 2>/dev/null || true
+
     # InferenceObjective CRDs (flow control)
     step "Removing InferenceObjective resources..."
     kubectl delete inferenceobjective --all -n "${LLM_NAMESPACE}" 2>/dev/null || true
@@ -1442,6 +1700,17 @@ cmd_uninstall() {
         # DSC + DSCI
         step "Removing DataScienceCluster and DSCInitialization..."
         kubectl delete datasciencecluster --all --timeout=180s 2>/dev/null || true
+        # Workaround: kserve finalizer deadlocks because the validating webhook
+        # denies deletion of well-known LLMInferenceServiceConfig resources.
+        # Remove the webhook, delete the configs, then strip the finalizer.
+        if kubectl get kserve default-kserve -o jsonpath='{.metadata.deletionTimestamp}' 2>/dev/null | grep -q .; then
+            warn "Kserve stuck in Deleting — removing webhook + finalizer to unblock..."
+            kubectl delete validatingwebhookconfiguration llminferenceserviceconfig.serving.kserve.io 2>/dev/null || true
+            kubectl delete llminferenceserviceconfig --all -n redhat-ods-applications 2>/dev/null || true
+            sleep 5
+            kubectl patch kserve default-kserve --type=json \
+                -p='[{"op":"remove","path":"/metadata/finalizers"}]' 2>/dev/null || true
+        fi
         kubectl delete dscinitializations --all --timeout=180s 2>/dev/null || true
 
         # RHOAI/ODH operator
@@ -1533,6 +1802,7 @@ usage() {
     echo "  BATCH_STORAGE_TYPE     File storage: fs or s3 (default: s3)"
     echo "  ENABLE_FLOW_CONTROL   Enable GIE flow control (default: true)"
     echo "  BATCH_FLOW_CONTROL_OBJECTIVE InferenceObjective name for batch (default: batch-sheddable)"
+    echo "  ENABLE_DISPATCHER      Deploy llm-d-async for async dispatch (default: false)"
     echo "  UNINSTALL_ALL            Set to 1 to remove RHOAI operators, Kuadrant, cert-manager, etc. (ephemeral clusters only)"
     exit "${1:-0}"
 }
