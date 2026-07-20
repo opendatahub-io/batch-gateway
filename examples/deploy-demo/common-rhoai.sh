@@ -4,19 +4,28 @@
 
 # ── DSC-based Batch Gateway Deployment ──────────────────────────────────
 #
-# do_deploy_batch_gateway_dsc isvc_name [pass_through_headers]
+# do_deploy_batch_gateway_dsc isvc_name [pass_through_headers] [pool_name]
 #
 # Deploys batch-gateway via the LLMBatchGateway CR (operator-managed).
 # Installs dependencies (Redis, PostgreSQL, MinIO/PVC), creates the CR,
 # waits for it to be ready, and sets up HTTPRoute + DestinationRule.
 #
+# When ENABLE_DISPATCHER=true, the processor is configured for async dispatch
+# via llm-d-async. The operator deploys an async-processor component automatically.
+#
 # Args:
 #   isvc_name             Model / InferenceService name (used in the model URL path)
 #   pass_through_headers  Comma-separated list of HTTP headers to forward (optional, empty = none)
+#   pool_name             InferencePool name (required when ENABLE_DISPATCHER=true)
 
 do_deploy_batch_gateway_dsc() {
     local isvc_name="$1"
     local pass_through_headers="${2:-}"
+    local pool_name="${3:-}"
+
+    if [ "${ENABLE_DISPATCHER}" = "true" ] && [ -z "${pool_name}" ]; then
+        die "Pool name (3rd argument) is required when ENABLE_DISPATCHER=true"
+    fi
 
     local operator_type="${OPERATOR_TYPE:-rhoai}"
     local apps_namespace
@@ -53,16 +62,86 @@ do_deploy_batch_gateway_dsc() {
     local model_url="http://${internal_gw_svc}.${BATCH_INTERNAL_GATEWAY_NAMESPACE}.svc.cluster.local/${LLM_NAMESPACE}/${isvc_name}"
     log "Model URL (via Internal Gateway): ${model_url}"
 
-    local processor_inference_objective_yaml=""
+    local inference_objective_yaml=""
     if [ "${ENABLE_FLOW_CONTROL}" = "true" ]; then
-        processor_inference_objective_yaml="      inferenceObjective: ${BATCH_FLOW_CONTROL_OBJECTIVE}"
+        inference_objective_yaml="inferenceObjective: ${BATCH_FLOW_CONTROL_OBJECTIVE}"
         log "Flow control: processor will send x-gateway-inference-objective: ${BATCH_FLOW_CONTROL_OBJECTIVE}"
+    fi
+
+    local processor_yaml
+    if [ "${ENABLE_DISPATCHER}" = "true" ]; then
+        local prometheus_url="http://prometheus.${LLM_NAMESPACE}.svc.cluster.local:9090"
+        log "Async dispatch enabled: pool=${pool_name}, igwBaseURL=${model_url}, prometheus=${prometheus_url}"
+        processor_yaml="\
+  processor:
+    replicas: 1
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        cpu: \"1\"
+        memory: 1Gi
+    dispatchMode: async
+    modelGateways:
+      ${MODEL_NAME}:
+        inferencePoolName: ${pool_name}
+        ${inference_objective_yaml}
+    asyncConfig:
+      replicas: 1
+      concurrency: 1
+      drainTimeout: 2m
+      resultPollTimeout: 30s
+      prometheusURL: ${prometheus_url}
+      prometheusCacheTTL: \"0s\"
+      redis:
+        requestPathURL: /v1/chat/completions
+        pollIntervalMs: 500
+        batchSize: 10
+        queuesConfig:
+        - name: \"llm-d-async:requests:${pool_name}\"
+          requestPathURL: /v1/chat/completions
+          igwBaseURL: ${model_url}
+          gateType: prometheus-budget
+          gateParams:
+            pool: \"${pool_name}\"
+            namespace: \"${LLM_NAMESPACE}\"
+            max_concurrency: \"100\"
+            baseline: \"0.05\"
+            fallback: \"1.0\"
+          workerPoolID: default-workers
+      workerPools:
+      - name: default-workers
+        workers: 4
+        gateType: local-max-concurrency
+        gateParams:
+          limit: \"2\""
+    else
+        processor_yaml="\
+  processor:
+    replicas: 1
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        cpu: \"1\"
+        memory: 1Gi
+    modelGateways:
+      ${MODEL_NAME}:
+        url: ${model_url}
+        requestTimeout: ${GW_REQUEST_TIMEOUT}
+        maxRetries: ${GW_MAX_RETRIES}
+        initialBackoff: ${GW_INITIAL_BACKOFF}
+        maxBackoff: ${GW_MAX_BACKOFF}
+        ${inference_objective_yaml}"
     fi
 
     local file_storage_yaml
     if [ "${BATCH_STORAGE_TYPE}" = "s3" ]; then
         local minio_endpoint="http://${BATCH_MINIO_RELEASE}.${BATCH_NAMESPACE}.svc.cluster.local:9000"
-        file_storage_yaml="    s3:
+        file_storage_yaml="\
+    s3:
       region: ${MINIO_REGION}
       bucket: ${MINIO_BUCKET}
       endpoint: ${minio_endpoint}
@@ -71,7 +150,8 @@ do_deploy_batch_gateway_dsc() {
       usePathStyle: true
       autoCreateBucket: true"
     else
-        file_storage_yaml="    fs:
+        file_storage_yaml="\
+    fs:
       basePath: /tmp/batch-gateway
       claimName: ${BATCH_FILES_PVC_NAME}"
     fi
@@ -84,7 +164,8 @@ do_deploy_batch_gateway_dsc() {
             header_items="${header_items}
         - ${h}"
         done
-        apiserver_batch_api_yaml="    config:
+        apiserver_batch_api_yaml="\
+    config:
       batchAPI:
         passThroughHeaders:${header_items}"
     fi
@@ -105,22 +186,7 @@ ${file_storage_yaml}
   apiServer:
     replicas: 1
 ${apiserver_batch_api_yaml}
-  processor:
-    replicas: 1
-    resources:
-      requests:
-        cpu: 100m
-        memory: 256Mi
-      limits:
-        cpu: "1"
-        memory: 1Gi
-    globalInferenceGateway:
-      url: ${model_url}
-      requestTimeout: ${GW_REQUEST_TIMEOUT}
-      maxRetries: ${GW_MAX_RETRIES}
-      initialBackoff: ${GW_INITIAL_BACKOFF}
-      maxBackoff: ${GW_MAX_BACKOFF}
-${processor_inference_objective_yaml}
+${processor_yaml}
   gc:
     interval: 30m
   tls:
@@ -143,10 +209,9 @@ EOF
     kubectl wait aigateway/default-aigateway --for=condition=Ready --timeout=300s
     log "AIGateway is ready."
 
-    # TODO: Change to die once https://github.com/opendatahub-io/ai-gateway-operator/issues/47 is fixed.
     step "Waiting for DataScienceCluster to be ready..."
     kubectl wait dsc/default-dsc --for=condition=Ready --timeout=60s \
-        || warn "DataScienceCluster is not Ready (known issue: github.com/opendatahub-io/ai-gateway-operator/issues/47)"
+        || die "DataScienceCluster is not Ready after enabling aigateway."
 
     create_batch_httproute
     create_batch_destinationrule
