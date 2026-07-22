@@ -16,7 +16,7 @@ require (
 	github.com/jackc/pgx/v5 v5.10.0
 	github.com/llm-d/llm-d-async/api v0.7.4
 	github.com/llm-d/llm-d-async/producer v0.7.4
-	github.com/pashagolub/pgxmock/v4 v4.9.0
+	github.com/pashagolub/pgxmock/v5 v5.1.0
 	github.com/prometheus/client_golang v1.24.0
 	github.com/quasilyte/go-ruleguard/dsl v0.3.23
 	github.com/redis/go-redis/extra/redisotel/v9 v9.21.0

@@ -94,8 +94,8 @@ github.com/llm-d/llm-d-async/producer v0.7.4 h1:dmMNtkorVykYX5UXRYY7qC7q8IesGtbH
 github.com/llm-d/llm-d-async/producer v0.7.4/go.mod h1:nHxbBM/mVL7bTu2ZVZ+OMz/Up9m2PhpBmeLfoq899+0=
 github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 h1:C3w9PqII01/Oq1c1nUAm88MOHcQC9l5mIlSMApZMrHA=
 github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822/go.mod h1:+n7T8mK8HuQTcFwEeznm/DIxMOiR9yIdICNftLE1DvQ=
-github.com/pashagolub/pgxmock/v4 v4.9.0 h1:itlO8nrVRnzkdMBXLs8pWUyyB2PC3Gku0WGIj/gGl7I=
-github.com/pashagolub/pgxmock/v4 v4.9.0/go.mod h1:9L57pC193h2aKRHVyiiE817avasIPZnPwPlw3JczWvM=
+github.com/pashagolub/pgxmock/v5 v5.1.0 h1:NZ4pl82b335sEGIbD/+tk2fVIgVs3yNWr1R42ukpUvU=
+github.com/pashagolub/pgxmock/v5 v5.1.0/go.mod h1:8IJct22b7+EuqecVmYb9aKiENJLLqTsbjFHXH/znAEg=
 github.com/pmezard/go-difflib v1.0.0 h1:4DBwDE0NGyQoBHbLQYPwSUPoCMWR5BEzIk/f1lZbAQM=
 github.com/pmezard/go-difflib v1.0.0/go.mod h1:iKH77koFhYxTK1pcRnkKkqfTogsbg7gZNVY4sRDYZ/4=
 github.com/prometheus/client_golang v1.24.0 h1:5XStIklKuAtJSNpdD3s8XJj/Yv78IQmE1kbNk87JrAI=
