@@ -127,7 +127,7 @@ kubectl patch gateway inference-gateway -n redhat-ods-applications --type='json'
 
 </details>
 
-### 3.1 Install Kuadrant
+### 3.1 Install Kuadrant (Optional)
 
 Kuadrant provides AuthPolicy (authentication + authorization) and RateLimitPolicy for gateway traffic. See [Kuadrant documentation](https://docs.kuadrant.io/) for details.
 
@@ -406,7 +406,7 @@ EOF
 
 </details>
 
-### 3.4 Configure AuthPolicy and TokenRateLimitPolicy for inference-gateway
+### 3.4 Configure AuthPolicy and TokenRateLimitPolicy for inference-gateway (Optional — requires Kuadrant)
 
 Apply authentication, authorization, and token rate limiting for direct inference requests via the inference-gateway.
 
@@ -654,7 +654,9 @@ EOF
 </details>
 
 <details>
-<summary>Apply AuthPolicy for batch-llm-route</summary>
+<summary>Apply AuthPolicy for batch-llm-route (Optional — requires Kuadrant)</summary>
+
+> **Requires Kuadrant**: Skip this block if Kuadrant is not installed.
 
 ```bash
 kubectl apply -f - <<EOF
@@ -930,7 +932,7 @@ BATCH_NS=batch-api
 RHAIIS_NS=redhat-ods-applications
 ```
 
-Create the batch route, authentication policy, and rate limit:
+Create the batch route, and optionally the authentication policy and rate limit (requires Kuadrant):
 
 <details>
 <summary>Create HTTPRoute for Batch API Server</summary>
@@ -982,7 +984,7 @@ EOF
 </details>
 
 <details>
-<summary>Create AuthPolicy for Batch API Server</summary>
+<summary>Create AuthPolicy for Batch API Server (Optional — requires Kuadrant)</summary>
 
 ```bash
 # Batch AuthPolicy (authentication only — model-level authorization
@@ -1018,7 +1020,7 @@ EOF
 </details>
 
 <details>
-<summary>Create RateLimitPolicy for Batch API Server</summary>
+<summary>Create RateLimitPolicy for Batch API Server (Optional — requires Kuadrant)</summary>
 
 ```bash
 # Batch RateLimitPolicy (20 requests/min per user)
@@ -1133,7 +1135,7 @@ UNAUTH_TOKEN=$(kubectl create token test-unauthorized-sa -n ${LLM_NS} \
     --audience=https://kubernetes.default.svc --duration=10m)
 ```
 
-### 4.2 LLM Authentication
+### 4.2 LLM Authentication (Requires Kuadrant)
 
 ```bash
 # Unauthenticated -> 401
@@ -1150,7 +1152,7 @@ curl -sk -o /dev/null -w "%{http_code}\n" \
     -d '{"model":"'${MODEL_NAME}'","messages":[{"role":"user","content":"Hello"}],"max_tokens":10}'
 ```
 
-### 4.3 LLM Authorization
+### 4.3 LLM Authorization (Requires Kuadrant)
 
 ```bash
 # Unauthorized SA -> 403
@@ -1168,7 +1170,7 @@ curl -sk -o /dev/null -w "%{http_code}\n" \
     -d '{"model":"'${MODEL_NAME}'","messages":[{"role":"user","content":"Hello"}],"max_tokens":10}'
 ```
 
-### 4.4 LLM Token Rate Limit
+### 4.4 LLM Token Rate Limit (Requires Kuadrant)
 
 ```bash
 # Send requests until 429 (token rate limit)
@@ -1187,7 +1189,7 @@ done
 sleep 60
 ```
 
-### 4.5 Batch Authentication
+### 4.5 Batch Authentication (Requires Kuadrant)
 
 ```bash
 # Unauthenticated -> 401
@@ -1198,7 +1200,7 @@ curl -sk -o /dev/null -w "%{http_code}\n" \
     -H "Authorization: Bearer ${AUTH_TOKEN}" ${GW_URL}/v1/batches
 ```
 
-### 4.6 Batch Authorization (batch-llm-route enforcement)
+### 4.6 Batch Authorization (batch-llm-route enforcement) (Requires Kuadrant)
 
 ```bash
 # Unauthorized user creates a batch — batch is accepted (batch route has no authz),
@@ -1265,7 +1267,7 @@ curl -sk ${GW_URL}/v1/files/${OUTPUT_FILE_ID}/content \
     -H "Authorization: Bearer ${AUTH_TOKEN}"
 ```
 
-### 4.8 Batch Request Rate Limit
+### 4.8 Batch Request Rate Limit (Requires Kuadrant)
 
 ```bash
 # Send 25 rapid requests — expect 429 after 20 (rate limit: 20 req/min)
