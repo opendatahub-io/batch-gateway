@@ -20,7 +20,7 @@ This guide demonstrates how to deploy batch-gateway on external Kubernetes servi
 4. The Internal Gateway matches `/{ns}/{isvc-name}/v1/*` → **batch-llm-route** (HTTPRoute)
     - **AuthPolicy** on the batch-llm-route performs authentication and authorization (SubjectAccessReview — checks if the original user can `get llminferenceservices/<name>`) — if the user lacks permission, the request is rejected with 403
     - **No TokenRateLimitPolicy** — batch inference requests are exempt from per-user token rate limits
-5. Request is routed directly to the **vLLM model server** (workload Service, port 8000 with TLS). The Internal Gateway does not use InferencePool/EPP routing because it lacks the ext_proc extension — only the inference-gateway (provisioned by RHAIIS) has InferencePool support. The response is returned to the Processor, which adds the response to the batch job's output file
+5. Request is routed to **InferencePool** → **EPP** (endpoint picker) → **vLLM** model server. EPP uses **flow control** to prioritize interactive requests over batch requests (see [1.5 Flow Control](#15-flow-control)). The response is returned to the Processor, which adds the response to the batch job's output file
 
 ### 1.2 Authentication
 
@@ -64,8 +64,6 @@ This is configured through three components:
 3. **Batch processor `inferenceObjective` config** sets which `InferenceObjective` name is sent in the header on each inference request.
 
 For full details on flow control configuration, see the [Flow Control Setup Guide](flow-control-setup.md).
-
-> **XKS limitation**: On RHAIIS/XKS, the batch-internal-gateway routes directly to the workload service (bypassing InferencePool/EPP) because only the `inference-gateway` has the ext_proc extension needed for InferencePool support. This means EPP flow control prioritization does not apply to batch requests. Batch and interactive requests are served equally by the model server. If flow control is critical, consider routing batch traffic through the `inference-gateway` instead (with appropriate policy exemptions).
 
 ## 2. Prerequisites
 
@@ -254,7 +252,7 @@ metadata:
     security.opendatahub.io/enable-auth: "true"
 spec:
   model:
-    uri: hf://sshleifer/tiny-gpt2
+    uri: hf://facebook/opt-125m
     name: ${MODEL_NAME}
   replicas: 2
   router:
@@ -546,7 +544,7 @@ kubectl get crd | grep llmbatchgateway               # LLMBatchGateway CRD regis
 
 ```bash
 # Create a parametersRef ConfigMap to mount the RHAIIS CA bundle on the gateway's Envoy.
-# This is needed because the workload service uses TLS and the DestinationRule references
+# This is needed because model workloads use TLS and the DestinationRule references
 # /var/run/secrets/rhai/ca.crt for certificate validation.
 kubectl apply -f - <<EOF
 apiVersion: v1
@@ -607,7 +605,7 @@ kubectl wait --for=condition=Programmed --timeout=300s \
 
 > **parametersRef**: The ConfigMap mounts the RHAIIS CA bundle (`rhai-ca-bundle`) into the gateway's Envoy proxy at `/var/run/secrets/rhai/ca.crt`. This is required because model workload services use TLS and the existing DestinationRule references this CA path for certificate validation.
 
-> **HTTP only**: The Internal Gateway uses HTTP (port 80) with no TLS listener. Since traffic is cluster-internal (processor → Internal Gateway → workload service), TLS is handled by the Istio DestinationRule (originating TLS to the backend).
+> **HTTP only**: The Internal Gateway uses HTTP (port 80) with no TLS listener. Since traffic is cluster-internal (processor → Internal Gateway → InferencePool), TLS to the model workload is handled by the Istio DestinationRule (originating TLS to the backend using the RHAIIS CA bundle).
 
 </details>
 
@@ -615,10 +613,10 @@ kubectl wait --for=condition=Programmed --timeout=300s \
 <summary>Create batch-llm-route (HTTPRoute on Internal Gateway)</summary>
 
 ```bash
-# Discover the workload service owned by the LLMInferenceService
-WORKLOAD_SVC=$(kubectl get svc -n ${LLM_NS} \
-    -l "app.kubernetes.io/name=${ISVC_NAME},app.kubernetes.io/component=llminferenceservice-workload" \
-    -o jsonpath='{.items[0].metadata.name}')
+# Discover the InferencePool owned by the LLMInferenceService
+POOL_NAME=$(kubectl get inferencepool -n ${LLM_NS} -o json | \
+    jq -r --arg owner "${ISVC_NAME}" \
+    '.items[] | select(.metadata.ownerReferences[]?.name == $owner) | .metadata.name' | head -1)
 
 kubectl apply -f - <<EOF
 apiVersion: gateway.networking.k8s.io/v1
@@ -634,22 +632,37 @@ spec:
   - matches:
     - path:
         type: PathPrefix
-        value: /${LLM_NS}/${ISVC_NAME}
+        value: /${LLM_NS}/${ISVC_NAME}/v1/completions
     filters:
     - type: URLRewrite
       urlRewrite:
         path:
           type: ReplacePrefixMatch
-          replacePrefixMatch: /
+          replacePrefixMatch: /v1/completions
     backendRefs:
-    - name: ${WORKLOAD_SVC}
-      port: 8000
+    - group: inference.networking.x-k8s.io
+      kind: InferencePool
+      name: ${POOL_NAME}
+  - matches:
+    - path:
+        type: PathPrefix
+        value: /${LLM_NS}/${ISVC_NAME}/v1/chat/completions
+    filters:
+    - type: URLRewrite
+      urlRewrite:
+        path:
+          type: ReplacePrefixMatch
+          replacePrefixMatch: /v1/chat/completions
+    backendRefs:
+    - group: inference.networking.x-k8s.io
+      kind: InferencePool
+      name: ${POOL_NAME}
 EOF
 ```
 
-> **Direct-to-workload routing**: The batch-llm-route targets the model server's workload Service directly (port 8000, TLS) rather than an InferencePool. This is because the batch-internal-gateway does not have the ext_proc extension configured for InferencePool support — only the `inference-gateway` (provisioned by RHAIIS) has this. The Istio DestinationRule created by the LLMInferenceService controller handles TLS origination to the workload using the RHAIIS CA bundle.
+> **Same path pattern**: The batch-llm-route uses the same `/{namespace}/{isvc-name}/v1/*` path pattern as the auto-generated LLM route on the external Gateway. This allows the processor to use the same URL format.
 
-> **URL rewrite**: The single rule matches the `/{namespace}/{isvc-name}` prefix and replaces it with `/`, preserving the API path suffix (e.g. `/v1/chat/completions`, `/v1/completions`).
+> **URL rewrite**: Each rule strips the `/{namespace}/{isvc-name}` prefix before forwarding to the InferencePool, matching the rewrite behavior of the auto-generated LLM route. Istio injects the `ext_proc` filter when it sees InferencePool backendRefs, so EPP flow control applies to batch traffic the same way as interactive traffic.
 
 </details>
 
