@@ -178,8 +178,6 @@ cd ~/redhat/rhaii-on-xks
 make deploy-rhcl
 ```
 
-> **Known issue (RHCL only)**: The Kuadrant wasm plugin in RHCL 1.4.0 fails to call Limitador correctly, so rate limiting never triggers 429. This does not affect vanilla Kuadrant Helm installs (AKS path above). A fix is expected in a future RHCL release.
-
 </details>
 
 ### 3.2 Deploy model with LLMInferenceService
@@ -1457,6 +1455,5 @@ kubectl apply --server-side -f \
 | Curl returns 000 (timeout) | External IP not routable from workstation | Port-forward: `kubectl port-forward svc/inference-gateway-istio -n redhat-ods-applications 8443:443` |
 | TokenRateLimitPolicy not Enforced | No HTTPRoutes attached to target gateway | Create HTTPRoute first, policy enforces automatically |
 | RateLimitPolicy `Enforced=True` but no 429 | Wasm-shim cannot resolve `auth.identity` for rate limit counters (check gateway logs for `NoSuchKey("identity")`); ratelimit `failureMode: allow` passes traffic through | Add `response.success.filters.identity` to the AuthPolicy (see [§3.4](#34-configure-authpolicy-and-tokenratelimitpolicy-for-inference-gateway)) and use `auth.identity.username` (not `auth.identity.user.username`) in RateLimitPolicy/TokenRateLimitPolicy counters |
-| Kuadrant operator CrashLoopBackOff | Missing `monitoring.coreos.com` RBAC (CKS) | Apply ClusterRole fix (see step 3.1 CKS alternative) |
 | EPP pods CrashLoopBackOff | Missing `llm-d.ai` RBAC (CKS) | Apply Role/RoleBinding fix (see after step 3.6) |
 | CRD field manager conflict | Pre-existing CRDs on shared cluster | `kubectl apply --server-side --force-conflicts` |
