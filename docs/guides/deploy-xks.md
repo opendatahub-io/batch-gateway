@@ -178,36 +178,6 @@ cd ~/redhat/rhaii-on-xks
 make deploy-rhcl
 ```
 
-> **CKS gotcha**: The Kuadrant operator RBAC is missing `monitoring.coreos.com` permissions and will CrashLoopBackOff. Fix:
-
-```bash
-kubectl apply -f - <<'EOF'
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRole
-metadata:
-  name: kuadrant-monitoring-fix
-rules:
-- apiGroups: ["monitoring.coreos.com"]
-  resources: ["podmonitors", "servicemonitors"]
-  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRoleBinding
-metadata:
-  name: kuadrant-monitoring-fix
-subjects:
-- kind: ServiceAccount
-  name: kuadrant-operator-controller-manager
-  namespace: kuadrant-operators
-roleRef:
-  kind: ClusterRole
-  name: kuadrant-monitoring-fix
-  apiGroup: rbac.authorization.k8s.io
-EOF
-
-kubectl delete pod -l control-plane=controller-manager -n kuadrant-operators
-```
-
 > **Known issue (RHCL only)**: The Kuadrant wasm plugin in RHCL 1.4.0 fails to call Limitador correctly, so rate limiting never triggers 429. This does not affect vanilla Kuadrant Helm installs (AKS path above). A fix is expected in a future RHCL release.
 
 </details>
