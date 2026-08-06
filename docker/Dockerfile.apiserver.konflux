@@ -1,4 +1,4 @@
-FROM registry.access.redhat.com/ubi9/go-toolset:1.26.5@sha256:f99dd81b20e5971ef9f63a51ac27cf0aa591ff9921d021490548b67fd9b17144 as builder
+FROM registry.access.redhat.com/ubi9/go-toolset:1.26.5@sha256:5d26ff5606bd6590930e7cfc202b510e3fe2c7a7a1720860f444ab49c45128cb as builder
 ARG TARGETOS=linux
 ARG TARGETARCH
 ARG CGO_ENABLED=1
@@ -24,7 +24,7 @@ COPY pkg/ pkg/
 RUN mkdir -p bin && \
     CGO_ENABLED=${CGO_ENABLED} GOOS=${TARGETOS} GOARCH=${TARGETARCH} GOEXPERIMENT=strictfipsruntime go build -a -o bin/batch-gateway-apiserver ./cmd/apiserver
 
-FROM registry.access.redhat.com/ubi9/ubi-minimal:9.7@sha256:d91be7cea9f03a757d69ad7fcdfcd7849dba820110e7980d5e2a1f46ed06ea3b
+FROM registry.access.redhat.com/ubi9/ubi-minimal:9.7@sha256:dd334afa72444fa46238fcf9e6bd399245adf746378735348cf84b9dfdca38f1
 WORKDIR /
 COPY --from=builder /opt/app-root/src/bin/batch-gateway-apiserver /app/batch-gateway-apiserver
 USER 1001:1001
