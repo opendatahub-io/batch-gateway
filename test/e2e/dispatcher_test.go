@@ -15,13 +15,16 @@
 package e2e_test
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"os/exec"
+	"regexp"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -88,25 +91,21 @@ func newDispatcherProducer(t *testing.T, rdb *redis.Client, poolName string) *pr
 	return p
 }
 
-// detectDispatcherDeployed checks whether at least one async-processor
-// deployment exists in the test namespace.
+// detectDispatcherDeployed checks whether at least one llm-d Async deployment
+// exists in the test namespace.
 func detectDispatcherDeployed(t *testing.T) bool {
 	t.Helper()
 
 	out, err := exec.Command("kubectl", "get", "deployments",
 		"-n", testNamespace,
+		"-l", "app.kubernetes.io/name in (async-processor,llm-d-async)",
 		"-o", "name",
 	).CombinedOutput()
 	if err != nil {
 		t.Logf("kubectl get deployments failed: %v", err)
 		return false
 	}
-	for _, line := range strings.Split(string(out), "\n") {
-		if strings.Contains(line, "async-processor") {
-			return true
-		}
-	}
-	return false
+	return strings.TrimSpace(string(out)) != ""
 }
 
 func TestDispatcher(t *testing.T) {
@@ -138,6 +137,9 @@ func TestDispatcher(t *testing.T) {
 	})
 	t.Run("MultiRequestBatch", func(t *testing.T) {
 		testDispatcherMultiRequestBatch(t, rdb)
+	})
+	t.Run("MultiReplicaBatch", func(t *testing.T) {
+		testDispatcherMultiReplicaBatch(t)
 	})
 	t.Run("HTTPErrorStatusPreserved", func(t *testing.T) {
 		testDispatcherHTTPErrorStatusPreserved(t, rdb)
@@ -176,7 +178,8 @@ func testDispatcherHTTPErrorStatusPreserved(t *testing.T, rdb *redis.Client) {
 	batchID := mustCreateBatch(t, fileID)
 	t.Logf("Created batch %s; waiting for request in %s", batchID, injectReqQueue)
 
-	reqID := waitAndStealQueuedRequestID(t, rdb, injectReqQueue, 30*time.Second)
+	reqID, resultQueue := waitAndStealQueuedRequest(t, rdb, injectReqQueue, 30*time.Second)
+	defer rdb.Del(ctx, resultQueue)
 	t.Logf("Got request %s; injecting StatusCode=403 result", reqID)
 
 	resultBytes, err := json.Marshal(asyncapi.ResultMessage{
@@ -187,7 +190,7 @@ func testDispatcherHTTPErrorStatusPreserved(t *testing.T, rdb *redis.Client) {
 	if err != nil {
 		t.Fatalf("marshal ResultMessage: %v", err)
 	}
-	if err := rdb.LPush(ctx, injectResultQueue, string(resultBytes)).Err(); err != nil {
+	if err := rdb.LPush(ctx, resultQueue, string(resultBytes)).Err(); err != nil {
 		t.Fatalf("LPUSH result: %v", err)
 	}
 
@@ -239,9 +242,10 @@ func testDispatcherHTTPErrorStatusPreserved(t *testing.T, rdb *redis.Client) {
 	t.Logf("Batch %s preserved HTTP 403 in output (no parse_error)", batchID)
 }
 
-// waitAndStealQueuedRequestID waits until a request appears in the Redis sorted
-// set queue, removes it, and returns the request ID from the InternalRequest envelope.
-func waitAndStealQueuedRequestID(t *testing.T, rdb *redis.Client, queue string, timeout time.Duration) string {
+// waitAndStealQueuedRequest waits until a request appears in the Redis sorted
+// set queue, removes it, and returns its request ID and result queue from the
+// InternalRequest envelope.
+func waitAndStealQueuedRequest(t *testing.T, rdb *redis.Client, queue string, timeout time.Duration) (string, string) {
 	t.Helper()
 
 	ctx := context.Background()
@@ -277,10 +281,13 @@ func waitAndStealQueuedRequestID(t *testing.T, rdb *redis.Client, queue string, 
 		if reqID == "" {
 			t.Fatalf("empty request ID in queued message: %s", member)
 		}
-		return reqID
+		if ir.ResultQueueName == "" {
+			t.Fatalf("empty result queue in queued message: %s", member)
+		}
+		return reqID, ir.ResultQueueName
 	}
 	t.Fatalf("no request appeared in %s within %v", queue, timeout)
-	return ""
+	return "", ""
 }
 
 func testDispatcherBatchRoundTrip(t *testing.T, rdb *redis.Client) {
@@ -337,6 +344,111 @@ func testDispatcherMultiRequestBatch(t *testing.T, rdb *redis.Client) {
 	}
 
 	t.Logf("All 3 requests completed via dispatcher")
+}
+
+// testDispatcherMultiReplicaBatch verifies that two healthy Batch Processor
+// replicas do not consume and discard one another's async results.
+func testDispatcherMultiReplicaBatch(t *testing.T) {
+	selector := fmt.Sprintf("app.kubernetes.io/instance=%s,app.kubernetes.io/component=processor", testHelmRelease)
+	var workloads []string
+	var discoveryErrors []string
+	for _, kind := range []string{"deployment", "statefulset"} {
+		out, err := exec.Command("kubectl", "get", kind,
+			"-n", testNamespace,
+			"-l", selector,
+			"-o", `jsonpath={range .items[*]}{.metadata.name}{"\n"}{end}`,
+		).CombinedOutput()
+		if err != nil {
+			discoveryErrors = append(discoveryErrors, fmt.Sprintf("%s: %v: %s", kind, err, strings.TrimSpace(string(out))))
+			continue
+		}
+		for _, name := range strings.Fields(string(out)) {
+			workloads = append(workloads, kind+"/"+name)
+		}
+	}
+	if len(workloads) != 1 {
+		t.Fatalf("find one Processor workload with selector %q: found %v; discovery errors: %v", selector, workloads, discoveryErrors)
+	}
+	workload := workloads[0]
+	replicasOut, err := exec.Command("kubectl", "get", workload,
+		"-n", testNamespace, "-o", "jsonpath={.spec.replicas}").CombinedOutput()
+	if err != nil {
+		t.Fatalf("get Processor replica count for %s: %v\n%s", workload, err, replicasOut)
+	}
+	originalReplicas, err := strconv.Atoi(strings.TrimSpace(string(replicasOut)))
+	if err != nil {
+		t.Fatalf("parse Processor replica count %q: %v", replicasOut, err)
+	}
+
+	scaleProcessor := func(replicas int) error {
+		out, scaleErr := exec.Command("kubectl", "scale", workload,
+			"-n", testNamespace, fmt.Sprintf("--replicas=%d", replicas)).CombinedOutput()
+		if scaleErr != nil {
+			return fmt.Errorf("scale Processor to %d replicas: %w\n%s", replicas, scaleErr, out)
+		}
+		out, scaleErr = exec.Command("kubectl", "rollout", "status", workload,
+			"-n", testNamespace, "--timeout=180s").CombinedOutput()
+		if scaleErr != nil {
+			return fmt.Errorf("wait for %d Processor replicas: %w\n%s", replicas, scaleErr, out)
+		}
+		return nil
+	}
+
+	if originalReplicas != 2 {
+		t.Cleanup(func() {
+			if err := scaleProcessor(originalReplicas); err != nil {
+				t.Errorf("cleanup: %v", err)
+			}
+		})
+		if err := scaleProcessor(2); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	const (
+		batchCount       = 2
+		requestsPerBatch = 32
+	)
+	batchIDs := make([]string, 0, batchCount)
+	for batchIndex := 0; batchIndex < batchCount; batchIndex++ {
+		lines := make([]string, 0, requestsPerBatch)
+		for requestIndex := 0; requestIndex < requestsPerBatch; requestIndex++ {
+			lines = append(lines, fmt.Sprintf(
+				`{"custom_id":"multi-replica-%d-%d","method":"POST","url":"/v1/chat/completions","body":{"model":"%s","max_tokens":1,"messages":[{"role":"user","content":"batch %d request %d"}]}}`,
+				batchIndex, requestIndex, testModel, batchIndex, requestIndex))
+		}
+
+		fileID := mustCreateFile(t,
+			fmt.Sprintf("dispatcher-multi-replica-%d-%s.jsonl", batchIndex, testRunID),
+			strings.Join(lines, "\n"))
+		batchIDs = append(batchIDs, mustCreateBatch(t, fileID))
+	}
+
+	completionDeadline := time.Now().Add(3 * time.Minute)
+	for _, batchID := range batchIDs {
+		remaining := time.Until(completionDeadline)
+		if remaining <= 0 {
+			t.Fatalf("batches did not complete within the shared timeout")
+		}
+		batch, results := waitForBatchStatus(t, batchID, remaining, openai.BatchStatusCompleted)
+
+		if batch.RequestCounts.Total != requestsPerBatch {
+			t.Errorf("batch %s: total requests = %d, want %d", batchID, batch.RequestCounts.Total, requestsPerBatch)
+		}
+		if batch.RequestCounts.Completed != requestsPerBatch {
+			t.Errorf("batch %s: completed requests = %d, want %d", batchID, batch.RequestCounts.Completed, requestsPerBatch)
+		}
+		if batch.RequestCounts.Failed != 0 {
+			t.Errorf("batch %s: failed requests = %d, want 0", batchID, batch.RequestCounts.Failed)
+		}
+		if results == nil {
+			t.Fatalf("batch %s: expected non-nil results", batchID)
+		}
+		if results.OutputLines != requestsPerBatch {
+			t.Errorf("batch %s: output lines = %d, want %d", batchID, results.OutputLines, requestsPerBatch)
+		}
+		validateBatchResults(t, batch, *results)
+	}
 }
 
 func testDispatcherRedisGate(t *testing.T, rdb *redis.Client) {
@@ -417,9 +529,8 @@ func testDispatcherEndpointScrapeGate(t *testing.T, rdb *redis.Client) {
 
 	// Saturate the sim — gate should close
 	// (endpoint-scrape gate: vllm:num_requests_waiting / max_count_per_pod >= 1 → budget 0)
-	setSimWaitingRequests(t, 10)
-	defer setSimWaitingRequests(t, 0)
-	t.Log("Sim saturated (waiting-requests=10, gate should close)")
+	release := saturateSim(t)
+	t.Log("Sim saturated (gate should close)")
 
 	// Give the scrape gate time to poll the new metric value
 	time.Sleep(3 * time.Second)
@@ -447,8 +558,8 @@ func testDispatcherEndpointScrapeGate(t *testing.T, rdb *redis.Client) {
 	t.Logf("Confirmed: request stuck in queue (depth=%d, gate closed)", queueDepth)
 
 	// Clear saturation — gate should open
-	setSimWaitingRequests(t, 0)
-	t.Log("Sim idle (waiting-requests=0, gate should open)")
+	release()
+	t.Log("Sim idle (gate should open)")
 
 	// Wait for the scrape gate to pick up the updated metrics and dispatcher to drain
 	deadline := time.After(30 * time.Second)
@@ -481,25 +592,87 @@ func testDispatcherEndpointScrapeGate(t *testing.T, rdb *redis.Client) {
 	}
 }
 
-func setSimWaitingRequests(t *testing.T, count int) {
+// saturateSim makes vllm:num_requests_waiting on the primary simulator real
+// and large: it chokes the engine through the vllm-vcr control API (one
+// running request, 30s decode step) and parks parkedRequests direct
+// completions on it from the in-cluster curl pod, then waits until the
+// simulator's /metrics reports at least gateWaitingThreshold waiting. The
+// returned function (idempotent, also registered as cleanup) restores the
+// engine, which lets the parked requests finish within a second, and waits
+// for the waiting gauge to read zero.
+func saturateSim(t *testing.T) func() {
 	t.Helper()
-	body, err := json.Marshal(map[string]any{"waiting-requests": count})
-	if err != nil {
-		t.Fatalf("Failed to marshal fake_metrics body: %v", err)
+
+	const parkedRequests = 10
+	patchEngineConfig(t, testSimService, `{"max_num_seqs": 1, "time_to_first_token": 0, "inter_token_latency": 30000}`)
+
+	ensureE2ECurlPod(t)
+	url := fmt.Sprintf("http://%s.%s.svc.cluster.local:8000/v1/completions", testSimService, testNamespace)
+	body := fmt.Sprintf(`{"model":%q,"prompt":"park","max_tokens":5}`, testModel)
+	script := fmt.Sprintf(`for i in $(seq 1 %d); do curl -sS -o /dev/null -m 600 -X POST %s -H 'content-type: application/json' -d %s & done; wait`, parkedRequests, shQuote(url), shQuote(body))
+	ctx, cancel := context.WithCancel(t.Context())
+	cmd := exec.CommandContext(ctx, "kubectl", "exec", "-n", testNamespace, e2eCurlPod, "--", "sh", "-c", script)
+	if err := cmd.Start(); err != nil {
+		cancel()
+		t.Fatalf("failed to park requests on %s: %v", testSimService, err)
 	}
-	req, err := http.NewRequest(http.MethodPost, testSimURL+"/fake_metrics", bytes.NewReader(body))
-	if err != nil {
-		t.Fatalf("Failed to build fake_metrics request: %v", err)
+
+	waitForSimWaiting(t, func(n int) bool { return n >= gateWaitingThreshold }, 60*time.Second)
+	t.Logf("sim saturated: %d requests parked on a choked engine", parkedRequests)
+
+	var once sync.Once
+	release := func() {
+		once.Do(func() {
+			if err := tryPatchEngineConfig(t, testSimService, `{"max_num_seqs": 128, "time_to_first_token": 50, "inter_token_latency": 100}`); err != nil {
+				t.Errorf("release engine: %v", err)
+			}
+			waitForSimWaiting(t, func(n int) bool { return n == 0 }, 60*time.Second)
+			cancel()
+			_ = cmd.Wait()
+			t.Log("sim idle: engine released, parked requests drained")
+		})
 	}
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatalf("Failed to set fake_metrics: %v", err)
+	t.Cleanup(release)
+	return release
+}
+
+// gateWaitingThreshold is the waiting-queue depth at which both dispatcher
+// gates close: max_count_per_pod in helm-values-scrape.yaml and the
+// denominator of the query in helm-values-prometheus.yaml.
+const gateWaitingThreshold = 5
+
+var simWaitingPattern = regexp.MustCompile(`(?m)^vllm:num_requests_waiting\{[^}]*\}\s+([0-9.e+-]+)$`)
+
+// waitForSimWaiting polls the simulator's /metrics until
+// vllm:num_requests_waiting satisfies ok.
+func waitForSimWaiting(t *testing.T, ok func(int) bool, timeout time.Duration) {
+	t.Helper()
+
+	deadline := time.Now().Add(timeout)
+	last := -1
+	for time.Now().Before(deadline) {
+		resp, err := http.Get(testSimURL + "/metrics")
+		if err != nil {
+			t.Fatalf("GET %s/metrics: %v", testSimURL, err)
+		}
+		raw, readErr := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if readErr != nil {
+			t.Fatalf("read %s/metrics: %v", testSimURL, readErr)
+		}
+		if match := simWaitingPattern.FindStringSubmatch(string(raw)); match != nil {
+			v, parseErr := strconv.ParseFloat(match[1], 64)
+			if parseErr != nil {
+				t.Fatalf("parse vllm:num_requests_waiting %q: %v", match[1], parseErr)
+			}
+			last = int(v)
+			if ok(last) {
+				return
+			}
+		}
+		time.Sleep(500 * time.Millisecond)
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
-		t.Fatalf("fake_metrics returned %d", resp.StatusCode)
-	}
+	t.Fatalf("vllm:num_requests_waiting did not reach the wanted value within %v (last=%d)", timeout, last)
 }
 
 func testDispatcherPrometheusGate(t *testing.T, rdb *redis.Client) {
@@ -509,9 +682,8 @@ func testDispatcherPrometheusGate(t *testing.T, rdb *redis.Client) {
 
 	// Saturate the sim — gate should close
 	// (query: 1 - clamp_max(vllm:num_requests_waiting / 5, 1) → 0 when waiting ≥ 5)
-	setSimWaitingRequests(t, 10)
-	defer setSimWaitingRequests(t, 0)
-	t.Log("Sim saturated (waiting-requests=10, gate should close)")
+	release := saturateSim(t)
+	t.Log("Sim saturated (gate should close)")
 
 	// Give Prometheus time to scrape the new metric value
 	time.Sleep(10 * time.Second)
@@ -539,8 +711,8 @@ func testDispatcherPrometheusGate(t *testing.T, rdb *redis.Client) {
 	t.Logf("Confirmed: request stuck in queue (depth=%d, gate closed)", queueDepth)
 
 	// Clear saturation — gate should open
-	setSimWaitingRequests(t, 0)
-	t.Log("Sim idle (waiting-requests=0, gate should open)")
+	release()
+	t.Log("Sim idle (gate should open)")
 
 	// Wait for Prometheus to scrape the updated metric and dispatcher to react
 	deadline := time.After(60 * time.Second)
