@@ -24,7 +24,7 @@ COPY pkg/ pkg/
 RUN mkdir -p bin && \
     CGO_ENABLED=${CGO_ENABLED} GOOS=${TARGETOS} GOARCH=${TARGETARCH} GOEXPERIMENT=strictfipsruntime go build -a -o bin/batch-gateway-processor ./cmd/batch-processor
 
-FROM registry.access.redhat.com/ubi9/ubi-minimal:9.8-1788939036@sha256:d235f607e1d6d833f031db107dc42206e4dd4d5aa9142c43d3771fb7f9bea76a
+FROM registry.redhat.io/ubi9/ubi-minimal-pqc@sha256:8a842ac769de709143e4edeace516f2008dfdc431b64670ad3353fa323b44736
 WORKDIR /
 COPY --from=builder /opt/app-root/src/bin/batch-gateway-processor /app/batch-gateway-processor
 USER 1001:1001
