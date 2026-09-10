@@ -104,9 +104,11 @@ func TestBuildAIMDModels(t *testing.T) {
 				ep := models[key]
 				if ep == nil {
 					t.Fatalf("buildAIMDModels() missing key %q (per-endpoint limiting would be silently disabled)", key)
+					return
 				}
 				if ep.Sem == nil {
 					t.Fatalf("buildAIMDModels()[%q].Sem is nil", key)
+					return
 				}
 			}
 		})

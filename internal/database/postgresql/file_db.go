@@ -103,10 +103,11 @@ func (c *PostgresFileDBClient) DBGet(
 
 	items = make([]*api.FileItem, len(indexes))
 	for i := range indexes {
+		purpose, _ := extras[i][colPurpose].(string)
 		items[i] = &api.FileItem{
 			BaseIndexes:  *indexes[i],
 			BaseContents: *contents[i],
-			Purpose:      extras[i][colPurpose],
+			Purpose:      purpose,
 		}
 	}
 
@@ -118,7 +119,7 @@ func (c *PostgresFileDBClient) DBUpdate(ctx context.Context, item *api.FileItem,
 		err = fmt.Errorf("item is nil")
 		return
 	}
-	if err = c.update(ctx, &item.BaseIndexes, &item.BaseContents, expectedStatus); err != nil {
+	if err = c.update(ctx, &item.BaseIndexes, &item.BaseContents, expectedStatus, nil, nil); err != nil {
 		return
 	}
 	return
