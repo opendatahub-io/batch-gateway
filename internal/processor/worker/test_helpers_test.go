@@ -170,6 +170,35 @@ func (d *dbStoreErrFileClient) DBStore(_ context.Context, _ *db.FileItem) error 
 // Spy wrappers
 // ---------------------------------------------------------------------------
 
+// mockClaimOwned mirrors PostgresBatchQueueClient.PQClaimOwned on the mock DB:
+// every non-terminal job owned by processorID gets its epoch and recovery
+// counter bumped and is returned as a task.
+func mockClaimOwned(batchDB db.BatchDBClient, processorID string) func(context.Context) ([]*db.BatchJobPriority, error) {
+	return func(ctx context.Context) ([]*db.BatchJobPriority, error) {
+		items, _, _, err := batchDB.DBGet(ctx, &db.BatchQuery{ProcessorID: processorID, NonTerminal: true}, true, 0, 1000)
+		if err != nil {
+			return nil, err
+		}
+		var tasks []*db.BatchJobPriority
+		for _, item := range items {
+			if item.ProcessorID != processorID {
+				continue
+			}
+			var info openai.BatchStatusInfo
+			if err := json.Unmarshal(item.Status, &info); err != nil || info.Status.IsTerminal() {
+				continue
+			}
+			item.Epoch++
+			item.RecoveryAttempts++
+			if err := batchDB.DBUpdate(ctx, item, nil); err != nil {
+				return nil, err
+			}
+			tasks = append(tasks, &db.BatchJobPriority{ID: item.ID, SLO: time.UnixMicro(item.Priority), Epoch: item.Epoch, RecoveryAttempts: item.RecoveryAttempts})
+		}
+		return tasks, nil
+	}
+}
+
 type spyPQ struct {
 	inner          db.BatchPriorityQueueClient
 	mu             sync.Mutex
@@ -207,6 +236,9 @@ func (s *spyPQ) PQDelete(ctx context.Context, jobPriority *db.BatchJobPriority) 
 }
 func (s *spyPQ) GetContext(parentCtx context.Context, timeLimit time.Duration) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(parentCtx, timeLimit)
+}
+func (s *spyPQ) PQClaimOwned(ctx context.Context) ([]*db.BatchJobPriority, error) {
+	return s.inner.PQClaimOwned(ctx)
 }
 func (s *spyPQ) PQGetIDs(ctx context.Context) (map[string]bool, error) {
 	return s.inner.PQGetIDs(ctx)
@@ -313,9 +345,6 @@ func (f *failOnStatusDB) Close() error { return f.inner.Close() }
 
 func mustNewProcessor(t *testing.T, cfg *config.ProcessorConfig, clients *clientset.Clientset) *Processor {
 	t.Helper()
-	if clients.InFlight == nil {
-		clients.InFlight = mockdb.NewMockInFlightClient()
-	}
 	p, err := NewProcessor(cfg, clients, "test-processor", testLogger(t))
 	if err != nil {
 		t.Fatalf("NewProcessor: %v", err)
@@ -344,7 +373,6 @@ func validProcessorClients(t testing.TB) *clientset.Clientset {
 		Queue:     mockdb.NewMockBatchPriorityQueueClient(),
 		Status:    mockdb.NewMockBatchStatusClient(),
 		Event:     mockdb.NewMockBatchEventChannelClient(),
-		InFlight:  mockdb.NewMockInFlightClient(),
 		Inference: inference.NewSingleClientResolver(&fakeInferenceClient{}),
 	}
 }
@@ -373,7 +401,6 @@ func newTestProcessorEnv(t *testing.T, cfg *config.ProcessorConfig, inferClient 
 		Queue:     pqClient,
 		Status:    statusClient,
 		Event:     mockdb.NewMockBatchEventChannelClient(),
-		InFlight:  mockdb.NewMockInFlightClient(),
 		Inference: inference.NewSingleClientResolver(inferClient),
 	}, "test-processor", testLogger(t))
 	if err != nil {
@@ -721,30 +748,4 @@ func uniqueTestFolder(t *testing.T, base string) string {
 	t.Helper()
 	testName := strings.ReplaceAll(t.Name(), "/", "_")
 	return filepath.Join(base, testName, fmt.Sprintf("%d", time.Now().UnixNano()))
-}
-
-type countingInFlightClient struct {
-	inner    *mockdb.MockInFlightClient
-	setCount atomic.Int32
-}
-
-func newCountingInFlightClient() *countingInFlightClient {
-	return &countingInFlightClient{inner: mockdb.NewMockInFlightClient()}
-}
-
-func (c *countingInFlightClient) InFlightSet(ctx context.Context, jobID, processorID string) error {
-	c.setCount.Add(1)
-	return c.inner.InFlightSet(ctx, jobID, processorID)
-}
-
-func (c *countingInFlightClient) InFlightDelete(ctx context.Context, jobID string) error {
-	return c.inner.InFlightDelete(ctx, jobID)
-}
-
-func (c *countingInFlightClient) InFlightGetAll(ctx context.Context) (map[string]*db.InFlightEntry, error) {
-	return c.inner.InFlightGetAll(ctx)
-}
-
-func (c *countingInFlightClient) Close() error {
-	return c.inner.Close()
 }

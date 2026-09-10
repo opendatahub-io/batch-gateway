@@ -53,6 +53,8 @@ func (p *pqSpy) PQDelete(ctx context.Context, jobPriority *db.BatchJobPriority) 
 	return p.inner.PQDelete(ctx, jobPriority)
 }
 
+func (p *pqSpy) PQClaimOwned(context.Context) ([]*db.BatchJobPriority, error) { return nil, nil }
+
 func (p *pqSpy) GetContext(parentCtx context.Context, timeLimit time.Duration) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(parentCtx, timeLimit)
 }

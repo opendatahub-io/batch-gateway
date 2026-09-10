@@ -142,8 +142,15 @@ func internModelID(modelID string, used map[string]int) string {
 		return base
 	}
 
-	used[base]++
-	return fmt.Sprintf("%s_%d", base, used[base])
+	for {
+		used[base]++
+		candidate := fmt.Sprintf("%s_%d", base, used[base])
+		if used[candidate] == 0 {
+			// Reserve the final name too: another model may sanitize to it.
+			used[candidate] = 1
+			return candidate
+		}
+	}
 }
 
 // Finalize sorts each model's entries by PrefixHash and writes them to disk.

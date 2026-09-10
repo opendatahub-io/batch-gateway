@@ -73,6 +73,13 @@ func (p *Poller) enqueueOne(ctx context.Context, task *db.BatchJobPriority) erro
 	return p.pq.PQEnqueue(ctx, task)
 }
 
+// claimOwned takes ownership of every non-terminal job already assigned to
+// this processor for startup recovery, bumping the fencing epoch and recovery
+// attempt counter.
+func (p *Poller) claimOwned(ctx context.Context) ([]*db.BatchJobPriority, error) {
+	return p.pq.PQClaimOwned(ctx)
+}
+
 func (p *Poller) fetchJobItemByID(ctx context.Context, jobID string) (*db.BatchItem, error) {
 	jobs, _, _, err := p.db.DBGet(ctx,
 		&db.BatchQuery{

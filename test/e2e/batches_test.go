@@ -489,7 +489,7 @@ func doTestBatchPagination(t *testing.T) {
 	assertSliceEqual(t, createdIDs, allIDs)
 }
 
-// doTestBatchExpiration creates a batch with slow requests and a very short
+// doTestBatchExpiration creates a batch with slow requests and a short
 // completion_window so the SLO fires before any requests are dispatched. A
 // blocker batch saturates the processor first, so the expiration batch's
 // requests all remain undispatched and are drained as batch_expired.
@@ -497,8 +497,11 @@ func doTestBatchPagination(t *testing.T) {
 // and an error file with the expired entries.
 //
 // With dev-deploy sim-model defaults (~50ms TTFT + ~100ms inter-token), each
-// slow request (max_tokens=200) takes ~20s. A 5s completion_window guarantees
-// the SLO fires while the blocker still holds all dispatch slots.
+// slow request (max_tokens=200) takes ~20s. The 10s completion_window is
+// longer than the processor poll interval (5s) so the batch is always
+// dequeued before its SLO fires; the SLO then fires in-flight while the
+// blocker still holds all dispatch slots, and the undelivered requests are
+// drained as batch_expired.
 func doTestBatchExpiration(t *testing.T) {
 	t.Helper()
 
@@ -532,7 +535,7 @@ func doTestBatchExpiration(t *testing.T) {
 
 	// Step 2: Create the expiration batch with a short completion_window.
 	// Since the processor is saturated by the blocker, none of these requests
-	// can be dispatched before the 5s SLO fires.
+	// can be dispatched before the 10s SLO fires.
 	const numRequests = 15
 	var lines []string
 	for i := 1; i <= numRequests; i++ {
@@ -542,18 +545,18 @@ func doTestBatchExpiration(t *testing.T) {
 	fileID := mustCreateFile(t, fmt.Sprintf("test-batch-expiration-%s.jsonl", testRunID), strings.Join(lines, "\n"))
 
 	// BatchNewParamsCompletionWindow is a string type; the batch-gateway API
-	// accepts Go duration strings like "5s" in addition to the standard "24h".
+	// accepts Go duration strings like "10s" in addition to the standard "24h".
 	batch, err := client.Batches.New(ctx, openai.BatchNewParams{
 		InputFileID:      fileID,
 		Endpoint:         openai.BatchNewParamsEndpointV1ChatCompletions,
-		CompletionWindow: openai.BatchNewParamsCompletionWindow("5s"),
+		CompletionWindow: openai.BatchNewParamsCompletionWindow("10s"),
 		Metadata:         testBatchMetadata,
 	})
 	if err != nil {
 		t.Fatalf("create batch with short completion_window failed: %v", err)
 	}
 	batchID := batch.ID
-	t.Logf("created expiration batch %s with completion_window=5s (blocker=%s)", batchID, blockerBatchID)
+	t.Logf("created expiration batch %s with completion_window=10s (blocker=%s)", batchID, blockerBatchID)
 
 	// Wait for the batch to reach expired status.
 	finalBatch, _ := waitForBatchStatus(t, batchID, 2*time.Minute, openai.BatchStatusExpired)

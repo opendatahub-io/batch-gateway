@@ -72,6 +72,7 @@ func TestPreDispatcher(t *testing.T) {
 		}
 		if parseErrResult == nil {
 			t.Fatal("no result for parse-error request")
+			return
 		}
 		if parseErrResult.Error == nil || parseErrResult.Error.Code != "parse_error" {
 			t.Errorf("expected parse_error, got %+v", parseErrResult.Error)

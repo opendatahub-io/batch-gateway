@@ -31,12 +31,29 @@ var _ api.BatchPriorityQueueClient = (*MockBatchPriorityQueueClient)(nil)
 type MockBatchPriorityQueueClient struct {
 	mu    sync.Mutex
 	queue []*api.BatchJobPriority
+
+	// OnDelete is called by PQDelete to perform the job's DB transition. It
+	// mirrors the Postgres PQDelete behavior of atomically transitioning the
+	// job to cancelled in the DB. For jobs that are not in the in-memory
+	// slice it is also the queue check, since Postgres models the queue as
+	// DB rows rather than a separate queue structure.
+	OnDelete func(ctx context.Context, id string) error
+
+	// OnClaimOwned backs PQClaimOwned; nil means no owned jobs.
+	OnClaimOwned func(ctx context.Context) ([]*api.BatchJobPriority, error)
 }
 
 func NewMockBatchPriorityQueueClient() *MockBatchPriorityQueueClient {
 	return &MockBatchPriorityQueueClient{
 		queue: make([]*api.BatchJobPriority, 0),
 	}
+}
+
+func (m *MockBatchPriorityQueueClient) PQClaimOwned(ctx context.Context) ([]*api.BatchJobPriority, error) {
+	if m.OnClaimOwned == nil {
+		return nil, nil
+	}
+	return m.OnClaimOwned(ctx)
 }
 
 func (m *MockBatchPriorityQueueClient) PQEnqueue(ctx context.Context, jobPriority *api.BatchJobPriority) error {
@@ -103,17 +120,31 @@ func (m *MockBatchPriorityQueueClient) PQDequeue(ctx context.Context, timeout ti
 
 func (m *MockBatchPriorityQueueClient) PQDelete(ctx context.Context, jobPriority *api.BatchJobPriority) (nDeleted int, err error) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
-
+	inQueue := false
 	for i, jp := range m.queue {
 		if jp.ID == jobPriority.ID {
 			// Remove the item
 			m.queue = append(m.queue[:i], m.queue[i+1:]...)
-			return 1, nil
+			inQueue = true
+			break
 		}
 	}
+	hasHook := m.OnDelete != nil
+	m.mu.Unlock()
 
-	return 0, nil
+	if !inQueue && !hasHook {
+		return 0, nil
+	}
+
+	// Postgres models the queue as DB rows, so a job that is not in the
+	// in-memory slice may still be queued: let the DB transition hook decide.
+	if hasHook {
+		if err := m.OnDelete(ctx, jobPriority.ID); err != nil {
+			return 0, err
+		}
+		return 1, nil
+	}
+	return 1, nil
 }
 
 func (m *MockBatchPriorityQueueClient) PQGetIDs(ctx context.Context) (map[string]bool, error) {
