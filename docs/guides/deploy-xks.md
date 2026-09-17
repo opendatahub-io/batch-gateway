@@ -16,11 +16,11 @@ This guide demonstrates how to deploy batch-gateway on external Kubernetes servi
     - **AuthPolicy** on the batch-route performs authentication only (kubernetesTokenReview, no authorization check) — unauthenticated requests are rejected with 401
     - **RateLimitPolicy** on the batch-route enforces per-user request rate limiting (e.g. 20 req/min), keyed by Kubernetes username (user or ServiceAccount) from TokenReview — excess requests are rejected with 429
     - Authenticated request is forwarded to **batch-gateway apiserver**, which stores the batch job
-3. **Processor** dequeues the batch job and sends inference requests through a separate **Internal Gateway** (`batch-internal-gateway`) — a ClusterIP-only Gateway that is not externally accessible — with the user's original token
+3. **Processor** dequeues the batch job. In async mode it submits inference requests to the Redis request queue, and the `llm-d-async` processor dispatches them through a separate **Internal Gateway** (`batch-internal-gateway`) — a ClusterIP-only Gateway that is not externally accessible — with the user's original token. In sync mode it sends requests directly through the Internal Gateway.
 4. The Internal Gateway matches `/{ns}/{isvc-name}/v1/*` → **batch-llm-route** (HTTPRoute)
     - **AuthPolicy** on the batch-llm-route performs authentication and authorization (SubjectAccessReview — checks if the original user can `get llminferenceservices/<name>`) — if the user lacks permission, the request is rejected with 403
     - **No TokenRateLimitPolicy** — batch inference requests are exempt from per-user token rate limits
-5. Request is routed to **InferencePool** → **EPP** (endpoint picker) → **vLLM** model server. EPP uses **flow control** to prioritize interactive requests over batch requests (see [1.5 Flow Control](#15-flow-control)). The response is returned to the Processor, which adds the response to the batch job's output file
+5. Request is routed to **InferencePool** → **EPP** (endpoint picker) → **vLLM** model server. EPP and, for async mode, the async dispatch gate use **flow control** to prioritize interactive requests over batch requests (see [1.5 Flow Control](#15-flow-control)). The response is returned directly or through the Redis result queue, depending on the dispatch mode, and the Processor adds it to the batch job's output file
 
 ### 1.2 Authentication
 
@@ -831,7 +831,7 @@ kubectl create secret generic batch-gateway-secrets \
 </details>
 
 <details>
-<summary>Create LLMBatchGateway CR</summary>
+<summary>Create LLMBatchGateway CR (sync compatibility example)</summary>
 
 ```bash
 # Get model URL from the Internal Gateway service
@@ -866,6 +866,9 @@ spec:
         - Authorization
   processor:
     replicas: 1
+    # Keep this existing-style example explicitly synchronous. New resources
+    # default to async; sync customers must set this field before upgrading.
+    dispatchMode: sync
     globalInferenceGateway:
       url: ${MODEL_URL}
       requestTimeout: 5m
@@ -891,6 +894,7 @@ kubectl wait llmbatchgateway/batch-gateway -n ${BATCH_NS} \
     --for=condition=Ready --timeout=300s
 ```
 
+> - **`processor.dispatchMode: sync`**: Preserves the original direct-HTTP behavior for this compatibility example. Existing sync customers should add this field before upgrading the operator CRD.
 > - **`processor.globalInferenceGateway.url`**: Points to the Internal Gateway's model endpoint. The Internal Gateway enforces AuthPolicy (model access check) but not TokenRateLimitPolicy.
 > - **`processor.globalInferenceGateway.inferenceObjective`**: The `InferenceObjective` CRD name sent as the `x-gateway-inference-objective` header. EPP uses this to assign the request to the batch priority band (priority -1, sheddable).
 > - **`tls.certManager`**: Enables TLS for the batch API server using cert-manager. In this demo the DestinationRule (see [3.6](#36-configure-httproute-and-policies-for-batch-gateway)) uses `insecureSkipVerify: true` because we use a self-signed certificate; in production, configure a trusted CA.
@@ -904,6 +908,114 @@ kubectl wait llmbatchgateway/batch-gateway -n ${BATCH_NS} \
 >   The PVC must have `ReadWriteMany` access mode (requires NFS, CephFS, or similar).
 
 </details>
+
+#### 3.5.1 Option 2: Async dispatch
+
+The operator can deploy `llm-d-async` alongside the batch-gateway processor. In async mode, the batch processor writes requests to Redis and the async processor releases them to the Internal Gateway according to the configured dispatch gate.
+
+This example uses the `prometheus-budget` gate. Prometheus must be available in the model namespace and must scrape the EPP and model-server metrics. The model-server scrape adds the `inference_pool` label because the model server does not emit it natively.
+
+Set the model pool and Prometheus URL before creating the resource:
+
+```bash
+POOL_NAME=$(kubectl get inferencepool -n ${LLM_NS} -o json | \
+    jq -r --arg owner "${ISVC_NAME}" \
+    '.items[] | select(.metadata.ownerReferences[]?.name == $owner) | .metadata.name' | head -1)
+PROMETHEUS_URL="http://prometheus.${LLM_NS}.svc.cluster.local:9090"
+```
+
+For a minimal Prometheus deployment and scrape configuration, see the Prometheus section in the [RHOAI async deployment example](deploy-rhoai.md#3102-option-2-async-dispatch). On AKS, managed Prometheus or `kube-prometheus-stack` can provide the same service; on CoreWeave, install the Prometheus Operator CRDs and a Prometheus implementation if they are not already present.
+
+Create an async `LLMBatchGateway` resource:
+
+```bash
+kubectl apply -f - <<EOF
+apiVersion: batch.llm-d.ai/v1alpha1
+kind: LLMBatchGateway
+metadata:
+  name: batch-gateway-async
+  namespace: ${BATCH_NS}
+spec:
+  secretRef:
+    name: batch-gateway-secrets
+  dbBackend: postgresql
+  fileStorage:
+    s3:
+      region: us-east-1
+      endpoint: http://minio.${BATCH_NS}.svc.cluster.local:9000
+      accessKeyId: ${MINIO_USER}
+      bucket: ${MINIO_BUCKET}
+      usePathStyle: true
+      autoCreateBucket: true
+  apiServer:
+    replicas: 1
+    config:
+      batchAPI:
+        passThroughHeaders:
+        - Authorization
+  processor:
+    replicas: 1
+    dispatchMode: async
+    modelGateways:
+      "${MODEL_NAME}":
+        inferencePoolName: "${POOL_NAME}"
+        inferenceObjective: batch-sheddable
+    asyncConfig:
+      replicas: 1
+      concurrency: 8
+      drainTimeout: 2m
+      resultPollTimeout: 30s
+      prometheusURL: "${PROMETHEUS_URL}"
+      prometheusCacheTTL: "0s"
+      redis:
+        requestPathURL: /v1/chat/completions
+        pollIntervalMs: 500
+        batchSize: 10
+        queuesConfig:
+        - name: "llm-d-async:requests:${POOL_NAME}"
+          workerPoolID: default-workers
+          requestPathURL: /v1/chat/completions
+          igwBaseURL: "${MODEL_URL}"
+          gateType: prometheus-budget
+          gateParams:
+            pool: "${POOL_NAME}"
+            namespace: "${LLM_NS}"
+            max_concurrency: "100"
+            baseline: "0.05"
+            fallback: "1.0"
+      workerPools:
+      - name: default-workers
+        workers: 4
+        gateType: local-max-concurrency
+        gateParams:
+          limit: "2"
+  gc:
+    interval: 30m
+  tls:
+    enabled: true
+    certManager:
+      issuerName: opendatahub-selfsigned-issuer
+      issuerKind: ClusterIssuer
+      dnsNames:
+      - batch-gateway-apiserver
+      - batch-gateway-apiserver.${BATCH_NS}.svc.cluster.local
+      - localhost
+EOF
+
+kubectl wait llmbatchgateway/batch-gateway-async -n ${BATCH_NS} \
+    --for=condition=Ready --timeout=300s
+```
+
+Async-specific configuration:
+
+- `dispatchMode: async` selects Redis-backed dispatch.
+- `modelGateways.<model>.inferencePoolName` identifies the target InferencePool.
+- `asyncConfig.redis.queuesConfig` must name the request queue consumed by the async processor.
+- `igwBaseURL` points to the ClusterIP-only Internal Gateway.
+- `prometheus-budget` controls dispatch based on available inference capacity.
+- `workerPools` limits async processor concurrency.
+
+The operator deploys the async processor automatically. Do not install a second async processor manually for this `LLMBatchGateway` resource.
 
 ### 3.6 Configure HTTPRoute and Policies for Batch Gateway
 
