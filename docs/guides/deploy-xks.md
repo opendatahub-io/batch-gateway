@@ -933,7 +933,7 @@ kubectl apply -f - <<EOF
 apiVersion: batch.llm-d.ai/v1alpha1
 kind: LLMBatchGateway
 metadata:
-  name: batch-gateway-async
+  name: batch-gateway
   namespace: ${BATCH_NS}
 spec:
   secretRef:
@@ -1002,7 +1002,7 @@ spec:
       - localhost
 EOF
 
-kubectl wait llmbatchgateway/batch-gateway-async -n ${BATCH_NS} \
+kubectl wait llmbatchgateway/batch-gateway -n ${BATCH_NS} \
     --for=condition=Ready --timeout=300s
 ```
 
