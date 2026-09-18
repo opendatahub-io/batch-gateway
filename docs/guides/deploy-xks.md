@@ -915,16 +915,22 @@ The operator can deploy `llm-d-async` alongside the batch-gateway processor. In 
 
 This example uses the `prometheus-budget` gate. Prometheus must be available in the model namespace and must scrape the EPP and model-server metrics. The model-server scrape adds the `inference_pool` label because the model server does not emit it natively.
 
-Set the model pool and Prometheus URL before creating the resource:
+Set the model pool and Prometheus endpoint before creating the resource. The
+endpoint must be reachable from the async processor and expose the EPP and
+model-server metrics required by the `prometheus-budget` gate:
 
 ```bash
 POOL_NAME=$(kubectl get inferencepool -n ${LLM_NS} -o json | \
     jq -r --arg owner "${ISVC_NAME}" \
     '.items[] | select(.metadata.ownerReferences[]?.name == $owner) | .metadata.name' | head -1)
-PROMETHEUS_URL="http://prometheus.${LLM_NS}.svc.cluster.local:9090"
+INTERNAL_GW_SVC=$(kubectl get svc -n ${RHAIIS_NS} \
+    -l "gateway.networking.k8s.io/gateway-name=batch-internal-gateway" \
+    -o jsonpath='{.items[0].metadata.name}')
+MODEL_URL="http://${INTERNAL_GW_SVC}.${RHAIIS_NS}.svc.cluster.local/${LLM_NS}/${ISVC_NAME}"
+: "${PROMETHEUS_URL:?Set PROMETHEUS_URL to your Prometheus query endpoint}"
 ```
 
-For a minimal Prometheus deployment and scrape configuration, see the Prometheus section in the [RHOAI async deployment example](deploy-rhoai.md#3102-option-2-async-dispatch). On AKS, managed Prometheus or `kube-prometheus-stack` can provide the same service; on CoreWeave, install the Prometheus Operator CRDs and a Prometheus implementation if they are not already present.
+For a minimal Prometheus deployment and scrape configuration, see the Prometheus section in the [RHOAI async deployment example](deploy-rhoai.md#3102-option-2-async-dispatch). For AKS and CoreWeave, use the actual endpoint created by the selected Prometheus installation and configure its required authentication and CA trust. Managed Prometheus may require an authenticated in-cluster proxy or equivalent endpoint. The `LLMBatchGateway` example accepts the query URL; provider-specific authentication and CA configuration must be provided by the Prometheus deployment or proxy.
 
 Create an async `LLMBatchGateway` resource:
 
