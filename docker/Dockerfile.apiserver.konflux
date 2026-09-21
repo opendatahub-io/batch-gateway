@@ -24,7 +24,7 @@ COPY pkg/ pkg/
 RUN mkdir -p bin && \
     CGO_ENABLED=${CGO_ENABLED} GOOS=${TARGETOS} GOARCH=${TARGETARCH} GOEXPERIMENT=strictfipsruntime go build -a -o bin/batch-gateway-apiserver ./cmd/apiserver
 
-FROM registry.redhat.io/ubi9/ubi-minimal-pqc@sha256:fac0bde5012de6a8475bb5dc18db968cdc90b12d9dc2ffaddb4a4975d0b8a04f
+FROM registry.redhat.io/ubi9/ubi-minimal-pqc@sha256:2991303dcd404cf3d252b725e51735163f100ca8dd6cd227cffdf77e5bdd0c3e
 WORKDIR /
 COPY --from=builder /opt/app-root/src/bin/batch-gateway-apiserver /app/batch-gateway-apiserver
 USER 1001:1001
