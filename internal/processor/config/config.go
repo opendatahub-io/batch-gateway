@@ -25,6 +25,7 @@ import (
 	"time"
 
 	sharedcfg "github.com/llm-d/llm-d-batch-gateway/internal/shared/config"
+	"github.com/llm-d/llm-d-batch-gateway/internal/shared/openai"
 	ucom "github.com/llm-d/llm-d-batch-gateway/internal/util/com"
 	"github.com/llm-d/llm-d-batch-gateway/internal/util/ptr"
 	"github.com/llm-d/llm-d-batch-gateway/internal/util/retry"
@@ -154,6 +155,9 @@ type AsyncDispatchConfig struct {
 }
 
 type ProcessorConfig struct {
+	// ExtraEndpoints adds deployment-specific inference paths to the default OpenAI endpoint allowlist.
+	ExtraEndpoints []string `yaml:"extra_endpoints"`
+
 	// TaskWaitTime is the timeout parameter used when dequeueing from the priority queue
 	// This should be shorter than PollInterval
 	TaskWaitTime time.Duration `yaml:"task_wait_time"`
@@ -232,8 +236,8 @@ type ProcessorConfig struct {
 	// 0 means no expiration (keep until explicitly deleted).
 	DefaultOutputExpirationSeconds int64 `yaml:"default_output_expiration_seconds"`
 
-	// ProgressTTLSeconds is the TTL for temporary progress updates in the status store (Redis).
-	ProgressTTLSeconds int `yaml:"progress_ttl_seconds"`
+	// ProgressUpdateInterval is the throttling interval between intermediate progress updates to the DB.
+	ProgressUpdateInterval time.Duration `yaml:"progress_update_interval"`
 
 	// SendFairnessHeader controls whether the processor sends
 	// x-gateway-inference-fairness-id on inference requests.
@@ -398,7 +402,7 @@ func NewConfig() *ProcessorConfig {
 			},
 		},
 		DefaultOutputExpirationSeconds: 90 * 24 * 60 * 60, // 90 days
-		ProgressTTLSeconds:             24 * 60 * 60,      // 24 hours
+		ProgressUpdateInterval:         15 * time.Second,  // 15 seconds
 
 		DispatchMode: DispatchModeSync,
 		AsyncDispatchConfig: AsyncDispatchConfig{
@@ -451,9 +455,8 @@ func (c *ProcessorConfig) Validate() error {
 	if err := c.FileClientCfg.Retry.Validate(); err != nil {
 		return fmt.Errorf("file_client.retry: %w", err)
 	}
-
-	if c.ProgressTTLSeconds <= 0 {
-		return fmt.Errorf("progress_ttl_seconds must be > 0")
+	if _, err := openai.NewEndpointAllowlist(c.ExtraEndpoints); err != nil {
+		return fmt.Errorf("extra_endpoints: %w", err)
 	}
 
 	switch c.RouteKeyMethod {
