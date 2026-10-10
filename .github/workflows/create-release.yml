@@ -152,7 +152,7 @@ jobs:
       - name: Install Helm
         uses: azure/setup-helm@v5
         with:
-          version: '3.22.0'
+          version: '4.3.0'
 
       - name: Install yq
         uses: frenck/action-setup-yq@v1.0.2
