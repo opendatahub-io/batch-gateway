@@ -17,7 +17,7 @@ require (
 	github.com/llm-d/llm-d-async/api v0.9.1
 	github.com/llm-d/llm-d-async/producer v0.9.1
 	github.com/pashagolub/pgxmock/v5 v5.2.0
-	github.com/prometheus/client_golang v1.24.1
+	github.com/prometheus/client_golang v1.25.0
 	github.com/quasilyte/go-ruleguard/dsl v0.3.23
 	github.com/redis/go-redis/v9 v9.22.0
 	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.71.0
