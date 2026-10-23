@@ -789,7 +789,7 @@ spec:
           type: ReplacePrefixMatch
           replacePrefixMatch: /v1/completions
     backendRefs:
-    - group: inference.networking.x-k8s.io
+    - group: inference.networking.k8s.io
       kind: InferencePool
       name: ${POOL_NAME}
   - matches:
@@ -803,7 +803,7 @@ spec:
           type: ReplacePrefixMatch
           replacePrefixMatch: /v1/chat/completions
     backendRefs:
-    - group: inference.networking.x-k8s.io
+    - group: inference.networking.k8s.io
       kind: InferencePool
       name: ${POOL_NAME}
 EOF
@@ -812,6 +812,8 @@ EOF
 > **Same path pattern**: The batch-llm-route uses the same `/{namespace}/{isvc-name}/v1/*` path pattern as the auto-generated LLM route on the external Gateway. This allows the processor to use the same URL format.
 
 > **URL rewrite**: Each rule strips the `/{namespace}/{isvc-name}` prefix before forwarding to the InferencePool, matching the rewrite behavior of the auto-generated LLM route.
+
+> **InferencePool API group**: `InferencePool` was promoted to the `inference.networking.k8s.io` group (v1) by the Gateway API Inference Extension. Routes referencing the pre-promotion `inference.networking.x-k8s.io` group are accepted by the Gateway but never resolve — the route reports `ResolvedRefs=False` ("referencing unsupported backendRef") and inference requests fail — on current Gateway implementations. Use `inference.networking.k8s.io` unless your cluster predates the promotion.
 
 </details>
 
@@ -1074,11 +1076,6 @@ Uses [llm-d-async](https://github.com/llm-d/llm-d-async). The async-processor us
 Deploy a minimal Prometheus instance scraping EPP and vLLM metrics. On RHOAI, the EPP endpoint requires SA token auth and vLLM pods serve metrics over HTTPS.
 
 ```bash
-# Discover the InferencePool name
-POOL_NAME=$(oc get inferencepool -n ${LLM_NS} -o json | \
-    jq -r --arg owner "${ISVC_NAME}" \
-    '.items[] | select(.metadata.ownerReferences[]?.name == $owner) | .metadata.name' | head -1)
-
 oc apply -n "${LLM_NS}" -f - <<EOF
 apiVersion: v1
 kind: ConfigMap
@@ -1095,6 +1092,8 @@ data:
         credentials_file: /var/run/secrets/kubernetes.io/serviceaccount/token
       static_configs:
       - targets: ['${ISVC_NAME}-epp-service.${LLM_NS}.svc.cluster.local:9090']
+        labels:
+          namespace: ${LLM_NS}
     - job_name: 'vllm'
       scheme: https
       tls_config:
@@ -1111,9 +1110,12 @@ data:
       - source_labels: [__meta_kubernetes_pod_ip]
         target_label: __address__
         replacement: '\${1}:8000'
-      metric_relabel_configs:
-      - target_label: inference_pool
-        replacement: '${POOL_NAME}'
+      - source_labels: [__meta_kubernetes_namespace]
+        target_label: namespace
+      - source_labels: [__meta_kubernetes_pod_label_app_kubernetes_io_name]
+        regex: '(.+)'
+        target_label: inference_pool
+        replacement: '\${1}-inference-pool'
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -1191,7 +1193,7 @@ EOF
 oc rollout status deployment/prometheus -n ${LLM_NS} --timeout=120s
 ```
 
-> **RHOAI-specific scrape config**: EPP requires SA token auth (`authorization.credentials_file`). vLLM pods serve metrics over HTTPS with self-signed certs (`insecure_skip_verify: true`). The `metric_relabel_configs` inject the `inference_pool` label that vLLM does not emit natively.
+> **RHOAI-specific scrape config**: EPP requires SA token auth (`authorization.credentials_file`). vLLM pods serve metrics over HTTPS with self-signed certs (`insecure_skip_verify: true`). The `inference_pool` label is derived per pod from the `app.kubernetes.io/name` label (`<name>-inference-pool`, the standard pool naming) — vLLM does not emit the label natively, and deriving it per pod keeps it correct when multiple models are deployed in the namespace; a static replacement only works for a single-model deployment. Both jobs also attach the `namespace` label: the `prometheus-budget` gate builds its metric queries from `gate_params.namespace` and filters every source on it, and neither static targets nor pod-discovered targets carry the label automatically — without it, all gate metric sources fail to match and the gate silently dispatches on its fallback value.
 
 </details>
 
@@ -1203,6 +1205,11 @@ INTERNAL_GW_SVC=$(oc get svc -n openshift-ingress \
     -l "gateway.networking.k8s.io/gateway-name=batch-internal-gateway" \
     -o jsonpath='{.items[0].metadata.name}')
 MODEL_URL="http://${INTERNAL_GW_SVC}.openshift-ingress.svc.cluster.local/${LLM_NS}/${ISVC_NAME}"
+
+# Discover the InferencePool name
+POOL_NAME=$(oc get inferencepool -n ${LLM_NS} -o json | \
+    jq -r --arg owner "${ISVC_NAME}" \
+    '.items[] | select(.metadata.ownerReferences[]?.name == $owner) | .metadata.name' | head -1)
 
 oc apply -f - <<EOF
 apiVersion: batch.llm-d.ai/v1alpha1
@@ -1278,6 +1285,7 @@ oc wait llmbatchgateway/batch-gateway -n ${BATCH_NS} \
 ```
 
 > - The `asyncConfig` block is operator-managed: the operator deploys an `async-processor` Deployment automatically based on this configuration. You do not deploy the async-processor separately (unlike the Helm-based K8s path).
+> - **`modelGateways` keys**: A key must exactly match the `model` field in batch request bodies — the processor rejects requests for unregistered models at ingestion. It must also be a name the model server accepts: the simulated model used above takes any name, but a real vLLM deployment requires the served model ID (for example `meta-llama/Llama-3.1-8B-Instruct`), which can differ from the `LLMInferenceService` name used in gateway URL paths. Requests naming anything else pass routing but fail with a 404 from the model server.
 > - **`workerPools`**: Each worker pool has its own gate. The `local-max-concurrency` gate on `default-workers` limits concurrent in-flight requests per worker, while the `prometheus-budget` gate on the queue controls overall dispatch rate based on cluster capacity.
 
 </details>
@@ -1507,6 +1515,8 @@ done
 # Wait 60s for rate limit counters to reset
 sleep 60
 ```
+
+> **Note**: This test only produces a 429 when the TokenRateLimitPolicy from [3.8 Configure TokenRateLimitPolicy for LLMInferenceService](#38-configure-tokenratelimitpolicy-for-llminferenceservice) has been applied. On clusters with the Models as a Service (MaaS) component enabled, the pre-existing MaaS TokenRateLimitPolicies only apply to subscription-key traffic — plain Kubernetes SA-token users are not rate limited through the `openshift-ai-inference` Gateway, so without the section 3.8 policy this test completes without ever hitting 429.
 
 ### 4.5 Batch Authentication
 
