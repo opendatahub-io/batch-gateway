@@ -699,7 +699,7 @@ spec:
       when:
       - predicate: request.path.endsWith("/v1/chat/completions")
       counters:
-      - expression: auth.identity.user.username
+      - expression: auth.identity.username
 EOF
 
 # wait for policy to be enforced
@@ -708,6 +708,26 @@ oc wait tokenratelimitpolicy/inference-token-limit \
     -n openshift-ingress --timeout=180s
 ```
 </details>
+
+> **Known limitation — per-user token rate limiting requires the MaaS component.**
+> Kuadrant rate-limit counters resolve `auth.identity.*` against Authorino
+> *dynamic metadata*, which exists only if an AuthPolicy exports it with a
+> `response.success.filters.identity` filter (see the note under the batch
+> `RateLimitPolicy` above). With `aigateway.modelsAsAService: Managed`, the MaaS
+> reconcilers add that filter and drive `TokenRateLimitPolicy` from subscription-scoped
+> identity fields. With MaaS `Removed`, as configured above, RHOAI generates
+> `AuthPolicy openshift-ingress/openshift-ai-inference-authn` from a template that
+> injects response headers only (`x-user-id`, `x-maas-user`, `x-gateway-inference-objective`,
+> and similar), never dynamic metadata. It cannot be added from a user policy either: a
+> second AuthPolicy targeting the same Gateway replaces the managed policy's `response`
+> section (losing RHOAI's header injection), and a route-level AuthPolicy replaces the
+> Gateway-level authentication entirely. The descriptor therefore never builds, the wasm
+> shim logs `Failed to evaluate message builder: CelError::Resolve { NoSuchKey("identity") }`,
+> and because the Kuadrant ratelimit services run with `failureMode: allow` the check
+> fails open and no 429 is ever returned. Enable the MaaS component for per-user token
+> rate limiting today; alternatively this needs an RHOAI template fix to export the
+> identity in the non-MaaS policy, plus a Kuadrant fix for the token-reporting `string()`
+> CEL error in the ratelimit-report path.
 
 ### 3.9 Batch Gateway Dependencies
 
@@ -1368,6 +1388,14 @@ spec:
         kubernetesTokenReview:
           audiences:
           - https://kubernetes.default.svc
+    response:
+      success:
+        filters:
+          identity:
+            json:
+              properties:
+                username:
+                  selector: auth.identity.user.username
 EOF
 
 ```
@@ -1396,11 +1424,21 @@ spec:
       - limit: 20
         window: 1m
       counters:
-      - expression: auth.identity.user.username
+      - expression: auth.identity.username
 EOF
 ```
 
 </details>
+
+> **Note on the counter expression:** Kuadrant rate-limit counters evaluate against
+> the Authorino *dynamic metadata* returned by the auth service, not against the
+> authorization JSON. `auth.identity.user.username` never resolves there: the
+> `kubernetes-user` authentication rule is a *named* rule (its identity lives at
+> `auth.kubernetes-user.identity.*`, which CEL dotted paths cannot express because
+> of the dash), and the identity is not exported to dynamic metadata at all unless
+> an AuthPolicy adds a `response.success.filters.identity` dynamic-metadata filter.
+> The `identity` filter added to `batch-route-auth` above exports the username as
+> `auth.identity.username`, which the counter above references.
 
 ## 4. Test
 
@@ -1512,7 +1550,7 @@ done
 sleep 60
 ```
 
-> **Note**: This test only produces a 429 when the TokenRateLimitPolicy from [3.8 Configure TokenRateLimitPolicy for LLMInferenceService](#38-configure-tokenratelimitpolicy-for-llminferenceservice) has been applied. On clusters with the Models as a Service (MaaS) component enabled, the pre-existing MaaS TokenRateLimitPolicies only apply to subscription-key traffic — plain Kubernetes SA-token users are not rate limited through the `openshift-ai-inference` Gateway, so without the section 3.8 policy this test completes without ever hitting 429.
+> **Note**: This test only produces a 429 when the TokenRateLimitPolicy from [3.8 Configure TokenRateLimitPolicy for LLMInferenceService](#38-configure-tokenratelimitpolicy-for-llminferenceservice) has been applied **and** the RHOAI-managed gateway AuthPolicy exports the authenticated identity to Authorino dynamic metadata — see the known limitation in section 3.8. Until that upstream fix lands, this test completes without ever hitting 429 on RHOAI-managed gateways. On clusters with the Models as a Service (MaaS) component enabled, the pre-existing MaaS TokenRateLimitPolicies only apply to subscription-key traffic — plain Kubernetes SA-token users are not rate limited through the `openshift-ai-inference` Gateway, so without the section 3.8 policy this test also completes without ever hitting 429.
 
 ### 4.5 Batch Authentication
 
