@@ -1006,7 +1006,7 @@ Dispatching is driven by [llm-d-async](https://github.com/llm-d/llm-d-async): th
 <details>
 <summary>Deploy Prometheus (required for prometheus-budget gate)</summary>
 
-Deploy a minimal Prometheus instance scraping EPP and vLLM metrics. On RHOAI, the EPP endpoint requires SA token auth and vLLM pods serve metrics over HTTPS.
+Deploy a minimal Prometheus instance scraping EPP and vLLM metrics. On RHOAI, the EPP endpoint requires SA token auth and serves metrics over HTTPS using the KServe serving certificate, and vLLM pods also serve metrics over HTTPS.
 
 ```bash
 oc apply -n "${LLM_NS}" -f - <<EOF
@@ -1020,6 +1020,9 @@ data:
       scrape_interval: 5s
     scrape_configs:
     - job_name: 'epp'
+      scheme: https
+      tls_config:
+        insecure_skip_verify: true
       metrics_path: /metrics
       authorization:
         credentials_file: /var/run/secrets/kubernetes.io/serviceaccount/token
