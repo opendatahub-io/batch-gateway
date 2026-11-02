@@ -733,6 +733,8 @@ metadata:
   namespace: openshift-ingress
   annotations:
     networking.istio.io/service-type: ClusterIP
+    security.opendatahub.io/authorino-tls-bootstrap: "true"
+    opendatahub.io/managed: "false"
 spec:
   gatewayClassName: openshift-default
   listeners:
@@ -755,53 +757,7 @@ oc rollout status deployment/batch-internal-gateway-openshift-default -n openshi
 oc wait --for=condition=Programmed --timeout=300s -n openshift-ingress gateway/batch-internal-gateway
 ```
 
-Because section 3.4 enables TLS on Authorino, the hand-created Internal Gateway also needs its `kuadrant-auth-service` Envoy cluster patched with an upstream TLS transport socket — without it, Envoy talks plaintext to Authorino's TLS port and every request through this gateway fails with `500 Internal Server Error` and batches stuck in `in_progress` while the async-processor retries forever. RHOAI's `odh-model-controller` only patches its own `openshift-ai-inference` Gateway this way, so apply the same patch here (the `priority: -1` ADD wins over Kuadrant's plaintext cluster):
-
-```bash
-oc apply -f - <<EOF
-apiVersion: networking.istio.io/v1alpha3
-kind: EnvoyFilter
-metadata:
-  name: batch-internal-gateway-authn-ssl
-  namespace: openshift-ingress
-spec:
-  configPatches:
-  - applyTo: CLUSTER
-    match:
-      cluster:
-        service: authorino-authorino-authorization.kuadrant-system.svc.cluster.local
-    patch:
-      operation: ADD
-      value:
-        connect_timeout: 1s
-        http2_protocol_options: {}
-        lb_policy: ROUND_ROBIN
-        load_assignment:
-          cluster_name: kuadrant-auth-service
-          endpoints:
-          - lb_endpoints:
-            - endpoint:
-                address:
-                  socket_address:
-                    address: authorino-authorino-authorization.kuadrant-system.svc.cluster.local
-                    port_value: 50051
-        name: kuadrant-auth-service
-        transport_socket:
-          name: envoy.transport_sockets.tls
-          typed_config:
-            '@type': type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
-            common_tls_context:
-              validation_context:
-                trusted_ca:
-                  filename: /var/run/secrets/kubernetes.io/serviceaccount/service-ca.crt
-        type: STRICT_DNS
-  priority: -1
-  targetRefs:
-  - group: gateway.networking.k8s.io
-    kind: Gateway
-    name: batch-internal-gateway
-EOF
-```
+> **Authorino TLS bootstrap**: Section 3.4 enables TLS on Authorino, so the `kuadrant-auth-service` Envoy cluster that Kuadrant generates for each Gateway must be patched with an upstream TLS transport socket. Without that patch, Envoy talks plaintext to Authorino's TLS port and every request through this Gateway fails with `500 Internal Server Error`, leaving batches stuck in `in_progress` while the async-processor retries forever. RHOAI's `odh-model-controller` reconciles this EnvoyFilter (named `batch-internal-gateway-authn-ssl`) for any Gateway annotated with `security.opendatahub.io/authorino-tls-bootstrap: "true"` — not only for its own `openshift-ai-inference` Gateway. The annotation above opts this Gateway in, so the controller keeps the filter current and garbage-collects it with the Gateway. The controller discovers the Kuadrant namespace itself, so no namespace override is needed here. `opendatahub.io/managed: "false"` keeps the controller from also creating a Gateway-level AuthPolicy: this Gateway's authorization is defined by the `batch-llm-route` AuthPolicy below, not at the Gateway.
 
 > **Key annotation**: `networking.istio.io/service-type: ClusterIP` forces the Gateway's Service to be ClusterIP instead of LoadBalancer, ensuring it is not externally accessible.
 
