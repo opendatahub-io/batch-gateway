@@ -737,13 +737,45 @@ do_deploy_batch_gateway_helm() {
 # inference endpoints. Preserves AuthPolicy (model access checks) but
 # bypasses TokenRateLimitPolicy applied on the external Gateway.
 # Requires BATCH_INTERNAL_GATEWAY_NAME, BATCH_INTERNAL_GATEWAY_NAMESPACE, and GATEWAY_CLASS_NAME.
+#
+# Set BATCH_INTERNAL_GATEWAY_AUTHORINO_TLS_BOOTSTRAP=true when Authorino serves
+# TLS (deploy-rhoai.sh does). odh-model-controller creates its Authorino
+# upstream-TLS EnvoyFilter only for Gateways carrying the
+# security.opendatahub.io/authorino-tls-bootstrap annotation; without it Envoy
+# calls Authorino's TLS port in plaintext and every request through this
+# Gateway fails with 500. opendatahub.io/managed=false suppresses the
+# controller's Gateway-level AuthPolicy, which would otherwise be created
+# alongside the filter; this Gateway's authorization lives on batch-llm-route.
 
 create_batch_internal_gateway() {
     [ -z "${GATEWAY_CLASS_NAME:-}" ] && die "GATEWAY_CLASS_NAME is required but not set."
     step "Creating Internal Gateway (ClusterIP) for batch processor..."
+    local authorino_tls_bootstrap="${BATCH_INTERNAL_GATEWAY_AUTHORINO_TLS_BOOTSTRAP:-false}"
     if kubectl get gateway "${BATCH_INTERNAL_GATEWAY_NAME}" -n "${BATCH_INTERNAL_GATEWAY_NAMESPACE}" &>/dev/null; then
         log "Internal Gateway already exists. Skipping."
+        if [ "${authorino_tls_bootstrap}" = "true" ]; then
+            # Gateways created by older versions of this script lack the annotation.
+            # Refuse to mark an unrelated Gateway unmanaged if a different object
+            # happens to use the configured name.
+            local existing_service_type
+            existing_service_type=$(kubectl get gateway "${BATCH_INTERNAL_GATEWAY_NAME}" \
+                -n "${BATCH_INTERNAL_GATEWAY_NAMESPACE}" \
+                -o jsonpath='{.metadata.annotations.networking\.istio\.io/service-type}' 2>/dev/null || true)
+            if [ "${existing_service_type}" != "ClusterIP" ]; then
+                die "Existing Gateway ${BATCH_INTERNAL_GATEWAY_NAME} is not the demo ClusterIP Gateway; refusing to add Authorino TLS bootstrap annotations. Rename or remove it before re-running."
+            else
+                kubectl annotate gateway "${BATCH_INTERNAL_GATEWAY_NAME}" -n "${BATCH_INTERNAL_GATEWAY_NAMESPACE}" \
+                    "security.opendatahub.io/authorino-tls-bootstrap=true" \
+                    "opendatahub.io/managed=false" --overwrite >/dev/null
+            fi
+        fi
     else
+        local annotations_yaml="    networking.istio.io/service-type: ClusterIP"
+        if [ "${authorino_tls_bootstrap}" = "true" ]; then
+            annotations_yaml="${annotations_yaml}
+    security.opendatahub.io/authorino-tls-bootstrap: \"true\"
+    opendatahub.io/managed: \"false\""
+        fi
         kubectl apply -f - <<EOF
 apiVersion: gateway.networking.k8s.io/v1
 kind: Gateway
@@ -751,7 +783,7 @@ metadata:
   name: ${BATCH_INTERNAL_GATEWAY_NAME}
   namespace: ${BATCH_INTERNAL_GATEWAY_NAMESPACE}
   annotations:
-    networking.istio.io/service-type: ClusterIP
+${annotations_yaml}
 spec:
   gatewayClassName: ${GATEWAY_CLASS_NAME}
   listeners:
@@ -842,10 +874,42 @@ check_batch_internal_gateway() {
         _ig_passed=$((_ig_passed + 1))
     fi
 
-    if [ "${_ig_failed}" -gt 0 ]; then
-        die "Internal Gateway isolation check failed (${_ig_failed} failures). Aborting tests."
+    if [ "${BATCH_INTERNAL_GATEWAY_AUTHORINO_TLS_BOOTSTRAP:-false}" = "true" ]; then
+        local ef="${gw_name}-authn-ssl"
+        local i
+        local owner=""
+        for ((i = 0; i < 30; i++)); do
+            owner=$(kubectl get envoyfilter "${ef}" -n "${gw_ns}" \
+                -o jsonpath='{.metadata.ownerReferences[?(@.kind=="Gateway")].name}' 2>/dev/null || true)
+            [ "${owner}" = "${gw_name}" ] && break
+            sleep 2
+        done
+        echo ""
+        echo "── Check: Authorino TLS EnvoyFilter is reconciled ──"
+        if [ "${owner}" != "${gw_name}" ]; then
+            warn "FAILED: EnvoyFilter ${ef} is missing or not owned by Gateway ${gw_name} (owner='${owner:-none}'); a stale hand-written filter does not prove controller reconciliation"
+            _ig_failed=$((_ig_failed + 1))
+        else
+            log "PASSED: EnvoyFilter ${ef} is owned by Gateway ${gw_name}"
+            _ig_passed=$((_ig_passed + 1))
+        fi
+
+        echo ""
+        echo "── Check: No controller Gateway AuthPolicy ──"
+        local auth_policy="${gw_name}-authn"
+        if kubectl get authpolicy "${auth_policy}" -n "${gw_ns}" &>/dev/null; then
+            warn "FAILED: Gateway-level AuthPolicy ${auth_policy} exists; opendatahub.io/managed=false did not suppress it"
+            _ig_failed=$((_ig_failed + 1))
+        else
+            log "PASSED: No Gateway-level AuthPolicy ${auth_policy}"
+            _ig_passed=$((_ig_passed + 1))
+        fi
     fi
-    log "Internal Gateway isolation verified (${_ig_passed}/${_ig_passed} checks passed)."
+
+    if [ "${_ig_failed}" -gt 0 ]; then
+        die "Internal Gateway check failed (${_ig_failed} failures). Aborting tests."
+    fi
+    log "Internal Gateway checks verified (${_ig_passed}/${_ig_passed} checks passed)."
 }
 
 # ── Test Framework ────────────────────────────────────────────────────────────
