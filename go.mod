@@ -13,7 +13,7 @@ require (
 	github.com/exaring/otelpgx v0.13.0
 	github.com/go-resty/resty/v2 v2.17.2
 	github.com/google/uuid v1.6.0
-	github.com/jackc/pgx/v5 v5.11.0
+	github.com/jackc/pgx/v5 v5.12.0
 	github.com/llm-d/llm-d-async/api v1.0.0
 	github.com/llm-d/llm-d-async/producer v1.0.0
 	github.com/llm-d/llm-d-async/producer-sql v0.0.0-20261021222928-3c134ef6d2ce
