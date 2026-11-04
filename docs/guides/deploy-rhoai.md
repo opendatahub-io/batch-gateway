@@ -437,7 +437,7 @@ oc rollout status deployment/rhods-operator -n redhat-ods-operator --timeout=120
 
 ```bash
 oc apply -f - <<'EOF'
-apiVersion: datasciencecluster.opendatahub.io/v2
+apiVersion: datasciencecluster.opendatahub.io/v3
 kind: DataScienceCluster
 metadata:
   name: default-dsc
@@ -446,16 +446,25 @@ spec:
     kserve:
       managementState: Managed
       rawDeploymentServiceConfig: Headed
-      modelsAsService:
-        managementState: Removed
     aigateway:
       managementState: Managed
+      modelsAsAService:
+        managementState: Removed
       batchGateway:
         managementState: Managed
     dashboard:
-      managementState: Removed
+      standard:
+        managementState: Removed
+      maasPortal:
+        managementState: Removed
 EOF
 ```
+
+> **Note**: RHOAI 3.6 serves `datasciencecluster.opendatahub.io/v3` as the storage version; v2 is still accepted but deprecated. Two field changes apply when writing the DSC by hand: `modelsAsService` moved from the `kserve` component to `aigateway` (RHOAI 3.5), and `dashboard` is structural in v3 — its `standard` and `maasPortal` children carry their own `managementState`. Confirm the installed operator serves v3 before applying:
+> ```bash
+> oc get crd datascienceclusters.datasciencecluster.opendatahub.io \
+>   -o jsonpath='{.spec.versions[?(@.served==true)].name}'   # must list v3
+> ```
 </details>
 
 <details>
