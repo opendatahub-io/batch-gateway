@@ -37,6 +37,12 @@ GATEWAY_NAME="${GATEWAY_NAME:-openshift-ai-inference}"
 GATEWAY_NAMESPACE="${GATEWAY_NAMESPACE:-openshift-ingress}"
 BATCH_INTERNAL_GATEWAY_NAME="${BATCH_INTERNAL_GATEWAY_NAME:-batch-internal-gateway}"
 BATCH_INTERNAL_GATEWAY_NAMESPACE="${BATCH_INTERNAL_GATEWAY_NAMESPACE:-${GATEWAY_NAMESPACE}}"
+# install_connectivity_link_* configures Authorino with TLS, so the Internal
+# Gateway needs odh-model-controller's Authorino upstream-TLS EnvoyFilter (see
+# create_batch_internal_gateway in common.sh). The controller resolves the
+# Kuadrant namespace itself, so KUADRANT_NAMESPACE overrides keep working.
+# Always enabled here: disabling it would bring back the plaintext-to-TLS 500.
+BATCH_INTERNAL_GATEWAY_AUTHORINO_TLS_BOOTSTRAP="true"
 
 # LLMInferenceService configuration
 MODEL_NAME="${MODEL_NAME:-facebook/opt-125m}"

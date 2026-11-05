@@ -742,6 +742,8 @@ metadata:
   namespace: openshift-ingress
   annotations:
     networking.istio.io/service-type: ClusterIP
+    security.opendatahub.io/authorino-tls-bootstrap: "true"
+    opendatahub.io/managed: "false"
 spec:
   gatewayClassName: openshift-default
   listeners:
@@ -763,6 +765,8 @@ oc rollout status deployment/batch-internal-gateway-openshift-default -n openshi
 # Wait for Gateway to be programmed
 oc wait --for=condition=Programmed --timeout=300s -n openshift-ingress gateway/batch-internal-gateway
 ```
+
+> **Authorino TLS bootstrap**: Section 3.4 enables TLS on Authorino, so the `kuadrant-auth-service` Envoy cluster that Kuadrant generates for each Gateway must be patched with an upstream TLS transport socket. Without that patch, Envoy talks plaintext to Authorino's TLS port and every request through this Gateway fails with `500 Internal Server Error`, leaving batches stuck in `in_progress` while the async-processor retries forever. RHOAI's `odh-model-controller` reconciles this EnvoyFilter (named `batch-internal-gateway-authn-ssl`) for any Gateway annotated with `security.opendatahub.io/authorino-tls-bootstrap: "true"` — not only for its own `openshift-ai-inference` Gateway. The annotation above opts this Gateway in, so the controller keeps the filter current and garbage-collects it with the Gateway. The controller discovers the Kuadrant namespace itself, so no namespace override is needed here. `opendatahub.io/managed: "false"` keeps the controller from also creating a Gateway-level AuthPolicy: this Gateway's authorization is defined by the `batch-llm-route` AuthPolicy below, not at the Gateway.
 
 > **Key annotation**: `networking.istio.io/service-type: ClusterIP` forces the Gateway's Service to be ClusterIP instead of LoadBalancer, ensuring it is not externally accessible.
 
