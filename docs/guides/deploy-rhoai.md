@@ -17,7 +17,7 @@ This guide demonstrates how to deploy batch-gateway on OpenShift with RHOAI (Red
 | `kuadrant-system` | Kuadrant operator, Authorino, Limitador |
 | `redhat-ods-operator` | RHOAI operator |
 | `redhat-ods-applications` | RHOAI controllers (KServe, model controller) |
-| `batch-api` | batch-gateway (apiserver + processor), Redis, PostgreSQL |
+| `batch-api` | batch-gateway (apiserver + processor), PostgreSQL, MinIO |
 | `llm` | LLMInferenceService, model servers, InferencePool, EPP, InferenceObjective CRDs |
 
 ### 1.2 Data Flow
@@ -31,7 +31,7 @@ This guide demonstrates how to deploy batch-gateway on OpenShift with RHOAI (Red
     - **AuthPolicy** on the batch-route performs authentication only (kubernetesTokenReview, no authorization check) — unauthenticated requests are rejected with 401
     - **RateLimitPolicy** on the batch-route enforces per-user request rate limiting (e.g. 20 req/min), keyed by Kubernetes username (user or ServiceAccount) from TokenReview — excess requests are rejected with 429
     - Authenticated request is forwarded to **batch-gateway apiserver**, which stores the batch job
-3. **Processor** dequeues the batch job and sends inference requests through a separate **Internal Gateway** (`batch-internal-gateway`) — a ClusterIP-only Gateway that is not externally accessible — with the user's original token
+3. **Processor** dequeues the batch job and enqueues each inference request on the async dispatch queue (PostgreSQL); the **async-processor** sends them through a separate **Internal Gateway** (`batch-internal-gateway`) — a ClusterIP-only Gateway that is not externally accessible — with the user's original token
 4. The Internal Gateway matches `/{ns}/{isvc}/v1/*` → **batch-llm-route** (HTTPRoute)
     - **AuthPolicy** on the batch-llm-route performs authentication and authorization (SubjectAccessReview — checks if the original user can `get llminferenceservices/<name>`) — if the user lacks permission, the request is rejected with 403
     - **No TokenRateLimitPolicy** — batch inference requests are exempt from per-user token rate limits
@@ -49,33 +49,33 @@ Both the LLM route and the batch route use **kubernetesTokenReview** for authent
 Model access is controlled through Kubernetes RBAC. Users need `get` permission on the specific `LLMInferenceService` resource to access a model. This is granted by creating a Role and RoleBinding in the model's namespace (see [Enabling authentication and authorization for LLM inference service](https://docs.redhat.com/en/documentation/red_hat_openshift_ai_self-managed/3.5/html/deploy_models_using_distributed_inference_with_llm-d/enabling-authentication-and-authorization-for-llm-inference-service_distributed-inference) for details).
 
 - **LLM route**: SubjectAccessReview checks if user can `get llminferenceservices/<name>` — unauthorized requests are rejected with **403**
-- **Batch route**: No authorization check — authorization is enforced by the batch-llm-route on the Internal Gateway when the processor forwards inference requests with the user's original token
+- **Batch route**: No authorization check — authorization is enforced by the batch-llm-route on the Internal Gateway when the async-processor forwards inference requests with the user's original token
 
 ### 1.5 Security boundary: batch-route vs batch-llm-route
 
 For security and operations readers: **admission on the batch API is not the same as authorization for inference.**
 
 - **batch-route** proves the caller has a valid Kubernetes token and applies batch-side **RateLimitPolicy**. Invalid or missing credentials are rejected with **401**; excess batch API traffic is rejected with **429**. It does **not** evaluate whether the caller may use a specific `LLMInferenceService`.
-- **batch-llm-route** (on the Internal Gateway) runs **authentication and authorization** (SubjectAccessReview on `llminferenceservices` as above) on each inference request the processor sends. The Internal Gateway is ClusterIP-only — it has no external Route or Ingress, ensuring batch inference traffic stays cluster-internal. **No TokenRateLimitPolicy** is applied, so batch requests are exempt from per-user token rate limits. A user can create a batch job and still see **per-request failures** (often surfaced as failed lines or job errors) when the batch-llm-route returns **403** — this is **by design**, not a bypass of model access control.
+- **batch-llm-route** (on the Internal Gateway) runs **authentication and authorization** (SubjectAccessReview on `llminferenceservices` as above) on each inference request the async-processor sends. The Internal Gateway is ClusterIP-only — it has no external Route or Ingress, ensuring batch inference traffic stays cluster-internal. **No TokenRateLimitPolicy** is applied, so batch requests are exempt from per-user token rate limits. A user can create a batch job and still see **per-request failures** (often surfaced as failed lines or job errors) when the batch-llm-route returns **403** — this is **by design**, not a bypass of model access control.
 
 The `Authorization` header is included in `passThroughHeaders` by default. Without it, the Internal Gateway cannot attribute inference traffic to the original caller and model-level checks cannot run as intended.
 
 ### 1.6 Flow Control
 
-Flow control ensures interactive inference requests are always served before batch requests. The EPP (Endpoint Picker Plugin) uses GIE's flow control feature to assign requests to priority bands based on the `x-gateway-inference-objective` header:
+Flow control ensures interactive inference requests are always served before batch requests. The EPP (Endpoint Picker Plugin) uses GIE's flow control feature to assign requests to priority bands based on the `x-llm-d-inference-objective` header (`x-gateway-inference-objective` is a deprecated alias):
 
 | Priority Band | Priority | Workload | Behavior Under Saturation |
 |---------------|----------|----------|---------------------------|
 | Interactive | 100 | Interactive requests | Dispatched first |
 | Default | 0 | Requests without an objective header | Dispatched before batch |
-| Batch | -1 (sheddable) | Batch requests | Shed immediately; processor retries with backoff |
+| Batch | -1 (sheddable) | Batch requests | Queued: shed on TTL expiry or band capacity (429, or 503 with no endpoints). In flight: revoked with 429 when higher-priority work is blocked (`enableEviction`, recommended on). Retries come from the processor (sync) or llm-d-async (async) |
 
-When the backend is not saturated, both interactive and batch requests are dispatched freely. When saturation reaches 1.0, batch requests (priority -1) are shed at admission while interactive requests continue to be served.
+When the backend is not saturated, both interactive and batch requests are dispatched freely. When saturation reaches 1.0, head-of-line blocking pauses dispatch; interactive requests resume first, and batch requests wait in the batch band until their TTL expires or the band's capacity is exhausted. With `enableEviction` enabled (the recommended setting), a batch request that is already in flight is also revoked so the engine stops working on it while interactive traffic is waiting.
 
 This is configured through three components:
 
 1. **EndpointPickerConfig** in the LLMInferenceService CR (`spec.router.scheduler.config.inline`) enables the `flowControl` feature gate and defines priority bands, fairness policies, and saturation detection thresholds.
-2. **InferenceObjective CRDs** map objective names to priority levels. The batch processor sends the `x-gateway-inference-objective: batch-sheddable` header, which EPP resolves to priority -1.
+2. **InferenceObjective CRDs** map objective names to priority levels. The batch processor sends the `x-llm-d-inference-objective: batch-sheddable` header, which EPP resolves to priority -1. Create them in the `llm-d.ai` group (see [3.7](#37-create-inferenceobjective-crds)).
 3. **Batch processor `inferenceObjective` config** sets which `InferenceObjective` name is sent in the header on each inference request.
 
 For full details on flow control configuration, see the [Flow Control Setup Guide](flow-control-setup.md).
@@ -84,6 +84,7 @@ For full details on flow control configuration, see the [Flow Control Setup Guid
 - OpenShift cluster 4.20 or later (required for Distributed Inference with llm-d).
 - OpenShift Service Mesh v2 is not installed in the cluster.
 - CLI tools: `oc`, `helm`, `curl`, `jq`.
+- An `aigateway` operator bundle whose BatchGateway CRD includes the PostgreSQL async transport — i.e. one pinned to an operator commit at or after [llm-d-batch-gateway-operator#124](https://github.com/opendatahub-io/llm-d-batch-gateway-operator/pull/124). [3.10](#310-install-batch-gateway) verifies this on the cluster; a bundle without it needs the Redis/Valkey transport instead.
 
 
 ## 3. Installation Steps
@@ -436,7 +437,7 @@ oc rollout status deployment/rhods-operator -n redhat-ods-operator --timeout=120
 
 ```bash
 oc apply -f - <<'EOF'
-apiVersion: datasciencecluster.opendatahub.io/v2
+apiVersion: datasciencecluster.opendatahub.io/v3
 kind: DataScienceCluster
 metadata:
   name: default-dsc
@@ -445,16 +446,25 @@ spec:
     kserve:
       managementState: Managed
       rawDeploymentServiceConfig: Headed
-      modelsAsService:
-        managementState: Removed
     aigateway:
       managementState: Managed
+      modelsAsAService:
+        managementState: Removed
       batchGateway:
         managementState: Managed
     dashboard:
-      managementState: Removed
+      standard:
+        managementState: Removed
+      maasPortal:
+        managementState: Removed
 EOF
 ```
+
+> **Note**: RHOAI 3.6 serves `datasciencecluster.opendatahub.io/v3` as the storage version; v2 is still accepted but deprecated. Two field changes apply when writing the DSC by hand: `modelsAsService` moved from the `kserve` component to `aigateway` (RHOAI 3.5), and `dashboard` is structural in v3 — its `standard` and `maasPortal` children carry their own `managementState`. Confirm the installed operator serves v3 before applying:
+> ```bash
+> oc get crd datascienceclusters.datasciencecluster.opendatahub.io \
+>   -o jsonpath='{.spec.versions[?(@.served==true)].name}'   # must list v3
+> ```
 </details>
 
 <details>
@@ -513,7 +523,7 @@ spec:
     scheduler:
       config:
         inline:
-          apiVersion: inference.networking.x-k8s.io/v1alpha1
+          apiVersion: llm-d.ai/v1alpha1
           kind: EndpointPickerConfig
           featureGates:
             - "flowControl"
@@ -526,11 +536,12 @@ spec:
                 queueDepthThreshold: 5
                 kvCacheUtilThreshold: 0.8
           schedulingProfiles: []
-          saturationDetector:
-            pluginRef: utilization-detector
           flowControl:
             maxBytes: 4294967296
             defaultRequestTTL: 30s
+            enableEviction: true
+            saturationDetector:
+              pluginRef: utilization-detector
             priorityBands:
               - priority: 100
                 maxBytes: 1073741824
@@ -538,6 +549,7 @@ spec:
                 orderingPolicyRef: fcfs-ordering-policy
               - priority: -1
                 maxBytes: 3221225472
+                defaultRequestTTL: 120s
                 fairnessPolicyRef: global-strict-fairness-policy
                 orderingPolicyRef: slo-deadline-ordering-policy
             defaultPriorityBand:
@@ -587,7 +599,7 @@ oc wait llminferenceservice/${ISVC_NAME} -n ${LLM_NS} \
 ```
 > **Key annotation**: `security.opendatahub.io/enable-auth: "true"` enables the Gateway-level AuthPolicy that uses SubjectAccessReview to check if the user has RBAC permission to `get` the specific `LLMInferenceService` resource.
 
-> **Flow control config**: The `scheduler.config.inline` EndpointPickerConfig enables the `flowControl` feature gate with two priority bands: interactive (priority 100, round-robin fairness, FCFS ordering) and batch (priority -1, sheddable, SLO-deadline ordering). The `saturationDetector` monitors backend queue depth and KV-cache utilization to trigger head-of-line blocking when the system is saturated. See [1.6 Flow Control](#16-flow-control) for details.
+> **Flow control config**: The `scheduler.config.inline` EndpointPickerConfig enables the `flowControl` feature gate with two priority bands: interactive (priority 100, round-robin fairness, FCFS ordering) and batch (priority -1, sheddable, SLO-deadline ordering, longer queue TTL). `enableEviction: true` lets the EPP revoke in-flight batch requests when interactive traffic is blocked, and the `saturationDetector` (nested under `flowControl` since llm-d-router v0.11.0) monitors backend queue depth and KV-cache utilization to trigger head-of-line blocking when the system is saturated. An inline config replaces the platform's default EPPConfig preset rather than merging with it, so it must list every plugin it references. See [1.6 Flow Control](#16-flow-control) and the [Flow Control Setup Guide](flow-control-setup.md) for details.
 </details>
 
 <details>
@@ -623,7 +635,7 @@ facebook-opt-125m-kserve-route               13m
 
 ### 3.7 Create InferenceObjective CRDs
 
-Create `InferenceObjective` resources that map the `x-gateway-inference-objective` header value to a priority band in EPP's flow control. The batch processor sends the `batch-sheddable` objective on each inference request.
+Create `InferenceObjective` resources that map the `x-llm-d-inference-objective` header value to a priority band in EPP's flow control. The batch processor sends the `batch-sheddable` objective on each inference request.
 
 <details>
 <summary>Create InferenceObjective CRDs</summary>
@@ -635,7 +647,7 @@ POOL_NAME=$(oc get inferencepool -n ${LLM_NS} -o json | \
     '.items[] | select(.metadata.ownerReferences[]?.name == $owner) | .metadata.name' | head -1)
 
 oc apply -f - <<EOF
-apiVersion: inference.networking.x-k8s.io/v1alpha2
+apiVersion: llm-d.ai/v1alpha2
 kind: InferenceObjective
 metadata:
   name: interactive-default
@@ -646,7 +658,7 @@ spec:
     group: inference.networking.k8s.io
     name: ${POOL_NAME}
 ---
-apiVersion: inference.networking.x-k8s.io/v1alpha2
+apiVersion: llm-d.ai/v1alpha2
 kind: InferenceObjective
 metadata:
   name: batch-sheddable
@@ -659,9 +671,11 @@ spec:
 EOF
 ```
 
-> **`interactive-default` (priority 100)**: Interactive clients can optionally send `x-gateway-inference-objective: interactive-default` to get the highest priority. Without this header, requests default to priority 0, which still outranks batch.
+> **Use the `llm-d.ai` group.** RHOAI installs both the `llm-d.ai` and the legacy `inference.networking.x-k8s.io` InferenceObjective CRDs. When both are present the EPP prefers `llm-d.ai` and **ignores** resources in the legacy group (it logs a warning), so objectives created as `inference.networking.x-k8s.io/v1alpha2` are silently unused. The EPP ServiceAccount already has `get`/`list`/`watch` on `inferenceobjectives` in both groups.
 
-> **`batch-sheddable` (priority -1)**: Negative priority means sheddable — when the backend is saturated, these requests are rejected immediately instead of queued. The batch processor handles retries with exponential backoff.
+> **`interactive-default` (priority 100)**: Interactive clients can optionally send `x-llm-d-inference-objective: interactive-default` to get the highest priority. Without this header, requests default to priority 0, which still outranks batch.
+
+> **`batch-sheddable` (priority -1)**: Negative priority means sheddable, so batch yields to interactive traffic. With the `flowControl` feature gate enabled, these requests buffer in the batch band and are shed with HTTP 429 when the queue TTL expires or the band's capacity fills; in-flight requests can also be revoked when `enableEviction` is set. llm-d-async retries 429s with backoff in async dispatch mode. See [Flow Control Setup](flow-control-setup.md) for the timeout constraints that govern whether TTL shedding is observable.
 
 </details>
 
@@ -706,7 +720,7 @@ oc wait tokenratelimitpolicy/inference-token-limit \
 
 ### 3.9 Batch Gateway Dependencies
 
-The batch processor routes inference requests through a separate, ClusterIP-only Internal Gateway to bypass the TokenRateLimitPolicy on the external Gateway while still enforcing model-level authorization (AuthPolicy).
+The async-processor routes inference requests through a separate, ClusterIP-only Internal Gateway to bypass the TokenRateLimitPolicy on the external Gateway while still enforcing model-level authorization (AuthPolicy).
 
 Set the variables used throughout this section (re-set them if starting a new shell):
 ```bash
@@ -789,7 +803,7 @@ spec:
           type: ReplacePrefixMatch
           replacePrefixMatch: /v1/completions
     backendRefs:
-    - group: inference.networking.x-k8s.io
+    - group: inference.networking.k8s.io
       kind: InferencePool
       name: ${POOL_NAME}
   - matches:
@@ -803,15 +817,17 @@ spec:
           type: ReplacePrefixMatch
           replacePrefixMatch: /v1/chat/completions
     backendRefs:
-    - group: inference.networking.x-k8s.io
+    - group: inference.networking.k8s.io
       kind: InferencePool
       name: ${POOL_NAME}
 EOF
 ```
 
-> **Same path pattern**: The batch-llm-route uses the same `/{namespace}/{isvc-name}/v1/*` path pattern as the auto-generated LLM route on the external Gateway. This allows the processor to use the same URL format.
+> **Same path pattern**: The batch-llm-route uses the same `/{namespace}/{isvc-name}/v1/*` path pattern as the auto-generated LLM route on the external Gateway. This allows the async-processor to use the same URL format.
 
 > **URL rewrite**: Each rule strips the `/{namespace}/{isvc-name}` prefix before forwarding to the InferencePool, matching the rewrite behavior of the auto-generated LLM route.
+
+> **InferencePool API group**: `InferencePool` was promoted to the `inference.networking.k8s.io` group (v1) by the Gateway API Inference Extension. Routes referencing the pre-promotion `inference.networking.x-k8s.io` group are accepted by the Gateway but never resolve — the route reports `ResolvedRefs=False` ("referencing unsupported backendRef") and inference requests fail — on current Gateway implementations. Use `inference.networking.k8s.io` unless your cluster predates the promotion.
 
 </details>
 
@@ -863,7 +879,7 @@ EOF
 
 </details>
 
-Deploy batch-gateway dependencies (Redis, PostgreSQL, MinIO) and create the application secret:
+Deploy batch-gateway dependencies (PostgreSQL, MinIO) and create the application secret:
 
 <details>
 <summary>Create namespace and install dependencies</summary>
@@ -872,23 +888,7 @@ Deploy batch-gateway dependencies (Redis, PostgreSQL, MinIO) and create the appl
 oc create namespace "${BATCH_NS}" 2>/dev/null || true
 oc label namespace "${BATCH_NS}" llm-d.ai/gateway-route=true --overwrite
 
-# Install Redis (or Valkey — see alternative below)
-helm upgrade --install redis oci://registry-1.docker.io/bitnamicharts/redis \
-    --namespace ${BATCH_NS} --create-namespace \
-    --set architecture=standalone \
-    --set auth.enabled=false
-oc rollout status statefulset/redis-master -n ${BATCH_NS} --timeout=120s
-
-# Alternative: Install Valkey (wire-protocol compatible with Redis)
-# helm upgrade --install redis oci://registry-1.docker.io/bitnamicharts/valkey \
-#     --namespace ${BATCH_NS} --create-namespace \
-#     --set architecture=standalone \
-#     --set auth.enabled=false
-# oc rollout status statefulset/redis-valkey-primary -n ${BATCH_NS} --timeout=120s
-# Note: when using Valkey, update the redis-url secret below to use:
-#   redis://redis-valkey-primary.${BATCH_NS}.svc.cluster.local:6379/0
-
-# Install PostgreSQL
+# Install PostgreSQL (batch job state and the async SQL dispatch queues)
 PG_PASSWORD="<your-password>"   # set once, referenced below
 helm upgrade --install postgresql oci://registry-1.docker.io/bitnamicharts/postgresql \
     --namespace ${BATCH_NS} --create-namespace \
@@ -966,13 +966,12 @@ oc rollout status deployment/minio -n ${BATCH_NS} --timeout=180s
 # Create application secret
 oc create secret generic batch-gateway-secrets \
     --namespace ${BATCH_NS} \
-    --from-literal=redis-url="redis://redis-master.${BATCH_NS}.svc.cluster.local:6379/0" \
     --from-literal=postgresql-url="postgresql://postgres:${PG_PASSWORD}@postgresql.${BATCH_NS}.svc.cluster.local:5432/batch?sslmode=disable" \
     --from-literal=s3-secret-access-key="${MINIO_PASSWORD}" \
     --dry-run=client -o yaml | oc apply -f -
 ```
 
-> **Note**: Redis auth is disabled for demo purposes. For production, enable Redis authentication.
+> **Note**: `redis-url` is only required by the `redis-sortedset` async transport (see [3.10](#310-install-batch-gateway)); the SQL transport used there reuses `postgresql-url`, so this guide needs no Redis instance.
 
 </details>
 
@@ -980,74 +979,30 @@ oc create secret generic batch-gateway-secrets \
 
 The batch-gateway is deployed via the `LLMBatchGateway` CR, which is managed by the batch-gateway-operator (deployed automatically when `aigateway.batchGateway.managementState: Managed` is set in the DataScienceCluster).
 
-Choose **one** of the two dispatch modes below (sync or async).
+batch-gateway dispatches every batch inference request asynchronously: the processor writes each request to an async dispatch queue, and the async-processor sends it to the model server through the Internal Gateway. The CR below omits `dispatchMode` on purpose — releases that still accept the field default it to `async`, and releases after [llm-d-batch-gateway-operator#125](https://github.com/opendatahub-io/llm-d-batch-gateway-operator/pull/125) deprecate it and always dispatch asynchronously, with `spec.processor.asyncConfig` required. This guide uses the PostgreSQL (`sql`) queue transport, which reuses the Secret's `postgresql-url` — PostgreSQL is the only stateful dependency.
 
-#### 3.10.1 Option 1: Sync dispatch (default)
+> **Check the installed CRD first**: the SQL transport needs an operator build whose CRD includes it. Verify before you deploy, and on the RHOAI path confirm the promoted `aigateway` bundle carries it:
+>
+> ```bash
+> $ kubectl explain llmbatchgateway.spec.processor.asyncConfig.sql
+> GROUP:      batch.llm-d.ai
+> KIND:       LLMBatchGateway
+> VERSION:    v1alpha1
+>
+> FIELD: sql <Object>
+> ```
+>
+> `Error from server (NotFound)` means the installed operator predates SQL support: upgrade the operator, or follow the Redis/Valkey transport alternative at the end of this section — it works on every release.
 
-<details>
-<summary>Create LLMBatchGateway CR (sync)</summary>
+Dispatching is driven by [llm-d-async](https://github.com/llm-d/llm-d-async): the async-processor uses a dispatch gate to control when requests are sent to the model server. This example uses the `prometheus-budget` gate, which requires Prometheus scraping EPP and vLLM metrics (deployed below). See [llm-d-async dispatch gates](https://github.com/llm-d/llm-d-async#per-queue-dispatch-gates) for other gate types.
 
-The processor sends inference requests directly to the Internal Gateway via HTTP.
-
-```bash
-# Get model URL from the Internal Gateway service
-INTERNAL_GW_SVC=$(oc get svc -n openshift-ingress \
-    -l "gateway.networking.k8s.io/gateway-name=batch-internal-gateway" \
-    -o jsonpath='{.items[0].metadata.name}')
-MODEL_URL="http://${INTERNAL_GW_SVC}.openshift-ingress.svc.cluster.local/${LLM_NS}/${ISVC_NAME}"
-
-oc apply -f - <<EOF
-apiVersion: batch.llm-d.ai/v1alpha1
-kind: LLMBatchGateway
-metadata:
-  name: batch-gateway
-  namespace: ${BATCH_NS}
-spec:
-  secretRef:
-    name: batch-gateway-secrets
-  dbBackend: postgresql
-  fileStorage:
-    s3:
-      region: us-east-1
-      endpoint: http://minio.${BATCH_NS}.svc.cluster.local:9000
-      accessKeyId: ${MINIO_USER}
-      prefix: ${MINIO_BUCKET}
-      usePathStyle: true
-      autoCreateBucket: true
-  apiServer:
-    replicas: 1
-  processor:
-    replicas: 1
-    modelGateways:
-      ${MODEL_NAME}:
-        url: ${MODEL_URL}
-        requestTimeout: 5m
-        maxRetries: 3
-        initialBackoff: 1s
-        maxBackoff: 60s
-        inferenceObjective: batch-sheddable
-  gc:
-    interval: 30m
-  tls:
-    enabled: true
-    certManager:
-      issuerName: selfsigned-issuer
-      issuerKind: ClusterIssuer
-      dnsNames:
-      - batch-gateway-apiserver
-      - batch-gateway-apiserver.${BATCH_NS}.svc.cluster.local
-      - localhost
-EOF
-
-# Wait for the batch gateway to be ready
-oc wait llmbatchgateway/batch-gateway -n ${BATCH_NS} \
-    --for=condition=Ready --timeout=300s
-```
-
-> - **`modelGateways.<model>.url`**: Points to the Internal Gateway's model endpoint. The Internal Gateway enforces AuthPolicy (model access check) but not TokenRateLimitPolicy.
-> - **`modelGateways.<model>.inferenceObjective`**: The `InferenceObjective` CRD name sent as the `x-gateway-inference-objective` header. EPP uses this to assign the request to the batch priority band (priority -1, sheddable).
+> - **`modelGateways.<model>.inferencePoolName`**: The InferencePool whose queue feeds this model. The processor requires one consumer per pool, so each model gateway entry needs its own pool.
+> - **`modelGateways.<model>.inferenceObjective`**: The `InferenceObjective` CRD name sent as the `x-llm-d-inference-objective` header (deprecated alias: `x-gateway-inference-objective`). EPP uses this to assign the request to the batch priority band (priority -1, sheddable). It must reference an `InferenceObjective` in the `llm-d.ai` group; see [3.7](#37-create-inferenceobjective-crds).
+> - **`asyncConfig`**: Required for async dispatch (CRD-required after operator #125). The operator always deploys an async-processor component and configures the queues, worker pools, Prometheus URL, and dispatch gates from this block. `asyncConfig.sql` selects the PostgreSQL transport; `asyncConfig.redis` (Redis/Valkey sorted sets) is the alternative.
+> - **`igwBaseURL`**: The async-processor sends inference requests through the Internal Gateway. Pass-through headers (including Authorization) are forwarded, so AuthPolicy works.
+> - **`gate_type: prometheus-budget`**: Computes a dispatch budget from EPP flow control metrics (primary) with vLLM metrics fallback. Requires `prometheusURL` and `gate_params.pool`.
 > - **`tls.certManager`**: Enables TLS for the batch API server using cert-manager. In this demo the DestinationRule (see [3.11](#311-configure-httproute-and-policies-for-batch-gateway)) uses `insecureSkipVerify: true` because we use a self-signed certificate; in production, configure a trusted CA.
-> - **Images**: The operator pins component images (apiserver, processor, gc) from its deployment configuration. You do not set image references in the CR.
+> - **Images**: The operator pins component images (apiserver, processor, async-processor, gc) from its deployment configuration. You do not set image references in the CR.
 > - **File storage**: This example uses S3-compatible storage (MinIO). To use a PVC instead, replace `fileStorage.s3` with:
 >   ```yaml
 >   fileStorage:
@@ -1057,28 +1012,12 @@ oc wait llmbatchgateway/batch-gateway -n ${BATCH_NS} \
 >   ```
 >   The PVC must have `ReadWriteMany` access mode (requires NFS, CephFS, or similar).
 
-</details>
-
-#### 3.10.2 Option 2: Async dispatch
-
-Uses [llm-d-async](https://github.com/llm-d/llm-d-async). The async-processor uses a dispatch gate to control when requests are sent to the model server. This example uses the `prometheus-budget` gate, which requires Prometheus scraping EPP and vLLM metrics. See [llm-d-async dispatch gates](https://github.com/llm-d/llm-d-async#per-queue-dispatch-gates) for other gate types.
-
-> - **`dispatchMode: async`** + **`inferencePoolName`**: The processor sends requests to Redis queues instead of making direct HTTP calls. This replaces `modelGateways.<model>.url`/`requestTimeout`/`maxRetries`/etc.
-> - **`asyncConfig`**: The operator deploys an async-processor component automatically. The `asyncConfig` block configures Redis queues, worker pools, Prometheus URL, and dispatch gates.
-> - **`igwBaseURL`**: The async-processor sends inference requests through the Internal Gateway (same path as sync). Pass-through headers (including Authorization) are forwarded, so AuthPolicy works.
-> - **`gate_type: prometheus-budget`**: Computes a dispatch budget from EPP flow control metrics (primary) with vLLM metrics fallback. Requires `prometheusURL` and `gate_params.pool`.
-
 <details>
 <summary>Deploy Prometheus (required for prometheus-budget gate)</summary>
 
-Deploy a minimal Prometheus instance scraping EPP and vLLM metrics. On RHOAI, the EPP endpoint requires SA token auth and vLLM pods serve metrics over HTTPS.
+Deploy a minimal Prometheus instance scraping EPP and vLLM metrics. On RHOAI, the EPP endpoint requires SA token auth and serves metrics over HTTPS using the KServe serving certificate, and vLLM pods also serve metrics over HTTPS.
 
 ```bash
-# Discover the InferencePool name
-POOL_NAME=$(oc get inferencepool -n ${LLM_NS} -o json | \
-    jq -r --arg owner "${ISVC_NAME}" \
-    '.items[] | select(.metadata.ownerReferences[]?.name == $owner) | .metadata.name' | head -1)
-
 oc apply -n "${LLM_NS}" -f - <<EOF
 apiVersion: v1
 kind: ConfigMap
@@ -1090,11 +1029,16 @@ data:
       scrape_interval: 5s
     scrape_configs:
     - job_name: 'epp'
+      scheme: https
+      tls_config:
+        insecure_skip_verify: true
       metrics_path: /metrics
       authorization:
         credentials_file: /var/run/secrets/kubernetes.io/serviceaccount/token
       static_configs:
       - targets: ['${ISVC_NAME}-epp-service.${LLM_NS}.svc.cluster.local:9090']
+        labels:
+          namespace: ${LLM_NS}
     - job_name: 'vllm'
       scheme: https
       tls_config:
@@ -1111,9 +1055,12 @@ data:
       - source_labels: [__meta_kubernetes_pod_ip]
         target_label: __address__
         replacement: '\${1}:8000'
-      metric_relabel_configs:
-      - target_label: inference_pool
-        replacement: '${POOL_NAME}'
+      - source_labels: [__meta_kubernetes_namespace]
+        target_label: namespace
+      - source_labels: [__meta_kubernetes_pod_label_app_kubernetes_io_name]
+        regex: '(.+)'
+        target_label: inference_pool
+        replacement: '\${1}-inference-pool'
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -1191,18 +1138,23 @@ EOF
 oc rollout status deployment/prometheus -n ${LLM_NS} --timeout=120s
 ```
 
-> **RHOAI-specific scrape config**: EPP requires SA token auth (`authorization.credentials_file`). vLLM pods serve metrics over HTTPS with self-signed certs (`insecure_skip_verify: true`). The `metric_relabel_configs` inject the `inference_pool` label that vLLM does not emit natively.
+> **RHOAI-specific scrape config**: EPP requires SA token auth (`authorization.credentials_file`). vLLM pods serve metrics over HTTPS with self-signed certs (`insecure_skip_verify: true`). The `inference_pool` label is derived per pod from the `app.kubernetes.io/name` label (`<name>-inference-pool`, the standard pool naming) — vLLM does not emit the label natively, and deriving it per pod keeps it correct when multiple models are deployed in the namespace; a static replacement only works for a single-model deployment. Both jobs also attach the `namespace` label: the `prometheus-budget` gate builds its metric queries from `gate_params.namespace` and filters every source on it, and neither static targets nor pod-discovered targets carry the label automatically — without it, all gate metric sources fail to match and the gate silently dispatches on its fallback value.
 
 </details>
 
 <details>
-<summary>Create LLMBatchGateway CR (async)</summary>
+<summary>Create LLMBatchGateway CR</summary>
 
 ```bash
 INTERNAL_GW_SVC=$(oc get svc -n openshift-ingress \
     -l "gateway.networking.k8s.io/gateway-name=batch-internal-gateway" \
     -o jsonpath='{.items[0].metadata.name}')
 MODEL_URL="http://${INTERNAL_GW_SVC}.openshift-ingress.svc.cluster.local/${LLM_NS}/${ISVC_NAME}"
+
+# Discover the InferencePool name
+POOL_NAME=$(oc get inferencepool -n ${LLM_NS} -o json | \
+    jq -r --arg owner "${ISVC_NAME}" \
+    '.items[] | select(.metadata.ownerReferences[]?.name == $owner) | .metadata.name' | head -1)
 
 oc apply -f - <<EOF
 apiVersion: batch.llm-d.ai/v1alpha1
@@ -1216,17 +1168,16 @@ spec:
   dbBackend: postgresql
   fileStorage:
     s3:
+      bucket: ${MINIO_BUCKET}
       region: us-east-1
       endpoint: http://minio.${BATCH_NS}.svc.cluster.local:9000
       accessKeyId: ${MINIO_USER}
-      prefix: ${MINIO_BUCKET}
       usePathStyle: true
       autoCreateBucket: true
   apiServer:
     replicas: 1
   processor:
     replicas: 1
-    dispatchMode: async
     modelGateways:
       ${MODEL_NAME}:
         inferencePoolName: ${POOL_NAME}
@@ -1238,8 +1189,8 @@ spec:
       resultPollTimeout: 30s
       prometheusURL: http://prometheus.${LLM_NS}.svc.cluster.local:9090
       prometheusCacheTTL: "0s"
-      redis:
-        requestPathURL: /v1/chat/completions
+      sql:
+        maxConnections: 8
         pollIntervalMs: 500
         batchSize: 10
         queuesConfig:
@@ -1278,7 +1229,72 @@ oc wait llmbatchgateway/batch-gateway -n ${BATCH_NS} \
 ```
 
 > - The `asyncConfig` block is operator-managed: the operator deploys an `async-processor` Deployment automatically based on this configuration. You do not deploy the async-processor separately (unlike the Helm-based K8s path).
+> - **`modelGateways` keys**: A key must exactly match the `model` field in batch request bodies — the processor rejects requests for unregistered models at ingestion. It must also be a name the model server accepts: the simulated model used above takes any name, but a real vLLM deployment requires the served model ID (for example `meta-llama/Llama-3.1-8B-Instruct`), which can differ from the `LLMInferenceService` name used in gateway URL paths. Requests naming anything else pass routing but fail with a 404 from the model server.
 > - **`workerPools`**: Each worker pool has its own gate. The `local-max-concurrency` gate on `default-workers` limits concurrent in-flight requests per worker, while the `prometheus-budget` gate on the queue controls overall dispatch rate based on cluster capacity.
+> - **`asyncConfig.sql`**: The PostgreSQL dispatch transport. The processor and the async-processor both use the Secret's `postgresql-url`. `maxConnections` caps the processor's SQL pool per replica (default 8) — budget `processor replicas × maxConnections` plus the async-processor's own pool against PostgreSQL `max_connections`. With SQL, each model gateway entry must resolve to its own result queue (default `llm-d-async:results:<inferencePoolName>`) and use a distinct `inferencePoolName`, because results are read destructively per model. To keep the queues in Redis/Valkey instead of PostgreSQL, see the alternative at the end of this section.
+
+</details>
+
+<details>
+<summary>Alternative: Redis/Valkey queue transport</summary>
+
+Instead of PostgreSQL, the queues can live in Redis — selected with `asyncConfig.redis` (`redis-sortedset` transport). Everything above still applies: the same queues, worker pools, gates and Internal Gateway URL, and PostgreSQL is still required for batch job state. The differences are one extra workload and a `redis-url` key in the Secret.
+
+```bash
+# Install Redis (or Valkey — wire-protocol compatible)
+helm upgrade --install redis oci://registry-1.docker.io/bitnamicharts/redis \
+    --namespace ${BATCH_NS} --create-namespace \
+    --set architecture=standalone \
+    --set auth.enabled=false
+oc rollout status statefulset/redis-master -n ${BATCH_NS} --timeout=120s
+
+# Alternative: Valkey
+# helm upgrade --install redis oci://registry-1.docker.io/bitnamicharts/valkey \
+#     --namespace ${BATCH_NS} --create-namespace \
+#     --set architecture=standalone \
+#     --set auth.enabled=false
+# oc rollout status statefulset/redis-valkey-primary -n ${BATCH_NS} --timeout=120s
+# Note: when using Valkey, use redis://redis-valkey-primary.${BATCH_NS}.svc.cluster.local:6379/0 below
+
+# Add the queue URL to the existing application secret
+REDIS_URL="redis://redis-master.${BATCH_NS}.svc.cluster.local:6379/0"
+oc patch secret batch-gateway-secrets -n ${BATCH_NS} --type merge \
+    -p "{\"data\":{\"redis-url\":\"$(printf %s "${REDIS_URL}" | base64 -w0)\"}}"
+```
+
+> **Note**: Redis auth is disabled for demo purposes. For production, enable authentication and use a `rediss://` URL.
+
+Then replace the `sql:` block of the CR with the Redis one (`maxConnections` does not apply):
+
+```yaml
+      redis:
+        pollIntervalMs: 500
+        batchSize: 10
+        queuesConfig:
+        - name: "llm-d-async:requests:${POOL_NAME}"
+          requestPathURL: /v1/chat/completions
+          igwBaseURL: ${MODEL_URL}
+          gateType: prometheus-budget
+          gateParams:
+            pool: "${POOL_NAME}"
+            namespace: "${LLM_NS}"
+            max_concurrency: "100"
+            baseline: "0.05"
+            fallback: "1.0"
+          workerPoolID: default-workers
+```
+
+and re-apply the CR with `asyncConfig.redis` in place of `asyncConfig.sql`, keeping the same `modelGateways`, `workerPools`, `tls` and `gc` sections:
+
+```bash
+oc apply -f llmbatchgateway.yaml
+oc wait llmbatchgateway/batch-gateway -n ${BATCH_NS} \
+    --for=condition=Ready --timeout=300s
+```
+
+> - **Gates**: most gates are transport-independent, but `redis`, `redis-leased-rate` and `redis-quota` require this transport — on SQL, use `sql-quota` in place of `redis-quota`.
+> - **Result queues**: each model still needs its own `inferencePoolName`; the processor appends its replica identity to `llm-d-async:results:<inferencePoolName>`.
+> - **Switching transports on an existing deployment**: drain or cancel in-flight batches first — queued requests are not migrated between the two backends.
 
 </details>
 
@@ -1508,6 +1524,8 @@ done
 sleep 60
 ```
 
+> **Note**: This test only produces a 429 when the TokenRateLimitPolicy from [3.8 Configure TokenRateLimitPolicy for LLMInferenceService](#38-configure-tokenratelimitpolicy-for-llminferenceservice) has been applied. On clusters with the Models as a Service (MaaS) component enabled, the pre-existing MaaS TokenRateLimitPolicies only apply to subscription-key traffic — plain Kubernetes SA-token users are not rate limited through the `openshift-ai-inference` Gateway, so without the section 3.8 policy this test completes without ever hitting 429.
+
 ### 4.5 Batch Authentication
 
 ```bash
@@ -1523,7 +1541,7 @@ curl -sk -o /dev/null -w "%{http_code}\n" \
 
 ```bash
 # Unauthorized user creates a batch — batch is accepted (batch route has no authz),
-# but the processor forwards requests to the batch-llm-route (Internal Gateway)
+# but the async-processor forwards requests to the batch-llm-route (Internal Gateway)
 # with the unauthorized token, and its AuthPolicy rejects with 403.
 
 # Create input file
