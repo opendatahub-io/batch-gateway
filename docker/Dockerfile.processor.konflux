@@ -1,4 +1,4 @@
-FROM registry.access.redhat.com/ubi9/go-toolset:1.27.3-1795278056@sha256:2cac9704c8182ea8cf34a3cb8db3870f993446a0eb98d4068ac26e19e1900f41 as builder
+FROM registry.access.redhat.com/ubi10/go-toolset:1.27.4-1795471060@sha256:2067cf54243dbc9fe0c017c531e31ddd191af203f930fc7fce59ab2b8bb85449 as builder
 ARG TARGETOS=linux
 ARG TARGETARCH
 ARG CGO_ENABLED=1
