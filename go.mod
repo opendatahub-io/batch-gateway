@@ -10,7 +10,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/credentials v1.21.3
 	github.com/aws/aws-sdk-go-v2/feature/s3/manager v1.23.28
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.116.0
-	github.com/aws/smithy-go v1.28.9
+	github.com/aws/smithy-go v1.28.10
 	github.com/cenkalti/backoff/v5 v5.0.3
 	github.com/exaring/otelpgx v0.13.0
 	github.com/go-logr/logr v1.4.4
